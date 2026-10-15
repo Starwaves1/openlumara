@@ -18,6 +18,28 @@ once_cell.workspace = true
 regex.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+md-5.workspace = true
+base64.workspace = true
+shlex.workspace = true
+url.workspace = true
+reqwest.workspace = true
+libc = "0.2"
+fancy-regex = "0.16"
+# syntax checking / outlines (python: tree_sitter_language_pack)
+tree-sitter = "0.26"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-css = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-bash = "0.25"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true

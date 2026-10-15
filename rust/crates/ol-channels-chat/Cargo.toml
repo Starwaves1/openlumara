@@ -3,6 +3,7 @@ name = "ol-channels-chat"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "OpenLumara chat-service channels: telegram, discord_bot, matrix"
 
 [dependencies]
 ol-core.workspace = true
@@ -18,6 +19,10 @@ once_cell.workspace = true
 regex.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+reqwest.workspace = true
+percent-encoding.workspace = true
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }

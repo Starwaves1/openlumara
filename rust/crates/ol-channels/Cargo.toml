@@ -18,6 +18,16 @@ once_cell.workspace = true
 regex.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
+tower-http = { version = "0.6", features = ["cors"] }
+minijinja = "2"
+uuid = { version = "1", features = ["v4"] }
+rustyline = { version = "17", features = ["case_insensitive_history_search"] }
+terminal_size = "0.4"
+url.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,0 +1,224 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ channel_name }} WebUI</title>
+    {% if processing %}
+    <meta http-equiv="refresh" content="1">
+    {% endif %}
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: var(--font), Verdana, sans-serif;
+            background: #000000;
+            color: var(--primary-color);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        p {
+            margin-bottom: 8px;
+        }
+        a, a:hover, a:active, a:visited {
+            color: var(--secondary-color);
+        }
+        hr {
+            margin-top: 8px;
+            border-color: var(--secondary-color);
+            margin-bottom: 8px;
+        }
+        header {
+            background: #001100;
+            padding: 10px 15px;
+            border-bottom: 2px solid var(--primary-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        header h1 {
+            font-size: 1.1em;
+            color: var(--primary-color);
+        }
+        header a {
+            color: var(--primary-color);
+            text-decoration: none;
+            font-size: 0.8em;
+            padding: 4px 10px;
+            border: 1px solid var(--primary-color);
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        #chat-container {
+            padding: 10px;
+            flex-grow: 1;
+            height: 0;
+            overflow-y: auto;
+            max-width: 800px;
+            width: 100%;
+            margin: 0 auto;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 0px;
+            word-wrap: break-word;
+        }
+        .message.user {
+            background: #000000;
+            border-left: 3px solid var(--primary-color);
+        }
+        .message.user .label {
+            color: var(--primary-color);
+        }
+        .message.assistant {
+            background: #000000;
+            border-left: 3px solid var(--secondary-color);
+            color: var(--secondary-color);
+        }
+        .message.assistant .label {
+            color: var(--secondary-color);
+        }
+        .label {
+            font-weight: bold;
+            font-size: 0.75em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 5px;
+            display: block;
+        }
+        .message .content {
+            font-size: 0.9em;
+            white-space: pre-wrap;
+        }
+        #input-container {
+            background: #000000;
+            padding: 10px 15px;
+            border-top: 2px solid var(--primary-color);
+        }
+        #input-container form {
+            max-width: 800px;
+            margin: 0 auto;
+            display: flex;
+            gap: 8px;
+        }
+        #input-container input {
+            flex: 1;
+            padding: 8px 10px;
+            border: 2px solid var(--primary-color);
+            border-radius: 6px;
+            background: #000000;
+            color: var(--primary-color);
+            font-family: inherit;
+            font-size: 0.9em;
+        }
+        #input-container input::placeholder {
+            color: var(--secondary-color);
+        }
+        #input-container input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+        #input-container button {
+            padding: 8px 18px;
+            background: #000000;
+            color: var(--primary-color);
+            border: 1px solid var(--primary-color);
+            border-radius: 6px;
+            font-size: 0.9em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: background 0.2s;
+            align-self: flex-end;
+            height: 40px;
+        }
+        #input-container button:hover {
+            background: var(--primary-color);
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--secondary-color);
+        }
+        .empty-state h1, h2, h3, h4, h5, h6 {
+            color: var(--primary-color);
+            margin-bottom: 8px;
+        }
+        .processing {
+            text-align: center;
+            padding: 30px;
+            color: var(--primary-color);
+            font-style: italic;
+        }
+
+        /* Webkit browsers (Chrome, Safari, Edge) */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary-color);
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary-color);
+        }
+
+        ::-webkit-scrollbar-corner {
+            background: transparent;
+        }
+
+        /* Firefox */
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--primary-color) transparent;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>{{ channel_name }}</h1>
+        <a href="{{ url_for('clear_chat') }}">Clear Chat</a>
+    </header>
+
+    <div id="chat-container">
+        {% if processing %}
+            <div class="processing">
+                Processing your message... (page will auto-refresh)
+            </div>
+        {% endif %}
+
+        {% if messages %}
+            {% for msg in messages|reverse %}
+            <div class="message {{ msg.role }}">
+                <span class="label">{{ msg.role }}</span>
+                <div class="content">{{ msg.content }}</div>
+            </div>
+            {% endfor %}
+
+        {% elif not processing %}
+            <div class="empty-state">
+                <<welcome_message>>
+            </div>
+        {% endif %}
+    </div>
+
+    <div id="input-container">
+        <form method="POST" action="{{ url_for('index') }}">
+            <input type="text" name="message" placeholder="Type your message...">{{ last_user_message }}</input>
+            <button type="submit">Send</button>
+        </form>
+    </div>
+</body>
+</html>

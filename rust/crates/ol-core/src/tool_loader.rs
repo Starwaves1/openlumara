@@ -204,6 +204,30 @@ impl ToolLoader {
         }
     }
 
+    /// insert (or replace) a raw catalog entry built at runtime (python modules that write
+    /// `loader.catalog[name] = {...}` directly, e.g. mcp). With `activate`, the tool is also
+    /// appended to the active set unless it is already active.
+    pub fn insert_catalog_entry(&self, name: &str, entry: CatalogEntry, activate: bool) {
+        let mut s = self.state.lock();
+        let tool = entry.tool.clone();
+        s.catalog.insert(name.to_string(), entry);
+        if activate && !s.active_names.iter().any(|n| n == name) {
+            s.active_tools.push(tool);
+            s.active_names.push(name.to_string());
+        }
+    }
+
+    /// remove catalog entries and active tools by exact tool name
+    pub fn remove_tools(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut s = self.state.lock();
+        s.catalog.retain(|k, _| !names.contains(k));
+        s.active_tools.retain(|t| !names.iter().any(|n| n == tool_name_of(t)));
+        s.active_names.retain(|n| !names.contains(n));
+    }
+
     /// remove all catalog entries and active tools for a module
     pub fn unregister_module(&self, module_name: &str) {
         let prefix = format!("{}_", module_name);
