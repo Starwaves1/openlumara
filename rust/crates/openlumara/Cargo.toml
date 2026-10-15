@@ -1,0 +1,19 @@
+[package]
+name = "openlumara"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenLumara - a modular, token-efficient AI agent framework (Rust port)"
+
+[[bin]]
+name = "openlumara"
+path = "src/main.rs"
+
+[dependencies]
+ol-core.workspace = true
+ol-modules.workspace = true
+ol-channels.workspace = true
+ol-webui.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
