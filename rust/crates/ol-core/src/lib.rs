@@ -19,6 +19,7 @@
 //! - core/module_manager.py -> [`module_manager`]
 
 pub mod api;
+pub mod app;
 pub mod channel;
 pub mod chat;
 pub mod commands;

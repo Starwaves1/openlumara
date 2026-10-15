@@ -5,7 +5,7 @@
 //! overriding the live config for this run without saving it. Lists take comma
 //! separated values, booleans accept yes/true/t/y/1 and no/false/f/n/0.
 
-use ol_core::manager::Args;
+use crate::manager::Args;
 use serde_json::{Map, Value};
 
 pub struct PreArgs {
@@ -77,7 +77,7 @@ fn schema_leaves() -> Vec<(String, Value)> {
         }
     }
     let mut out = Vec::new();
-    walk("", &ol_core::config::get_schema(), &mut out);
+    walk("", &crate::config::get_schema(), &mut out);
     out
 }
 
@@ -168,7 +168,7 @@ fn convert(current: &Value, raw: &str) -> anyhow::Result<Value> {
 pub fn override_config_with_args(settings: &[(String, String)]) {
     for (key, raw) in settings {
         let parts: Vec<&str> = key.split('.').collect();
-        let mut root = Value::Object(ol_core::config::snapshot());
+        let mut root = Value::Object(crate::config::snapshot());
         let pointer: String = parts.iter().map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect();
         let parent_ptr: String = parts[..parts.len() - 1].iter().map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect();
         let last = parts[parts.len() - 1];
@@ -181,9 +181,9 @@ pub fn override_config_with_args(settings: &[(String, String)]) {
             Ok(v) => {
                 *root.pointer_mut(&pointer).unwrap() = v;
                 if let Value::Object(m) = root {
-                    ol_core::config::replace_in_memory(m);
+                    crate::config::replace_in_memory(m);
                 }
-                ol_core::log("core", &format!("overrode setting {} with: {}", last, raw));
+                crate::log("core", &format!("overrode setting {} with: {}", last, raw));
             }
             Err(e) => {
                 eprintln!("error: argument --{}: {}", key, e);
@@ -219,7 +219,7 @@ pub fn help_text() -> String {
             Value::Array(_) => "<multiple,values>".to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Null => "<value>".to_string(),
-            other => ol_core::pyjson::py_str(&other),
+            other => crate::pyjson::py_str(&other),
         };
         out.push_str(&format!("  --{} {}\n", k, meta));
     }
