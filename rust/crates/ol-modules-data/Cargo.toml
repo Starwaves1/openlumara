@@ -18,6 +18,11 @@ once_cell.workspace = true
 regex.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+base64 = "0.22"
+tokio-util = "0.7"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2.4"
+flate2 = "1.0"
 
 [dev-dependencies]
 tempfile.workspace = true
