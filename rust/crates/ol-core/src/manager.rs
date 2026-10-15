@@ -529,6 +529,17 @@ impl Manager {
             .collect()
     }
 
+    /// insert an already constructed module (tests / embedding); registers its tools
+    pub fn insert_module(&self, module: Arc<dyn Module>) {
+        self.register_module_tools(&module);
+        self.modules.write().insert(module.name().to_string(), module);
+    }
+
+    /// insert an already constructed channel (tests / embedding)
+    pub fn insert_channel(&self, ch: Arc<Channel>) {
+        self.channels.write().insert(ch.name.clone(), ch);
+    }
+
     pub fn register_module_tools(&self, module: &Arc<dyn Module>) {
         for ch in self.channels().values() {
             ch.tool_loader.register_module(module);

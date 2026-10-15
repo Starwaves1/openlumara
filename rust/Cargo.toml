@@ -3,7 +3,11 @@ resolver = "2"
 members = [
     "crates/ol-core",
     "crates/ol-modules",
+    "crates/ol-modules-data",
+    "crates/ol-modules-web",
+    "crates/ol-modules-dev",
     "crates/ol-channels",
+    "crates/ol-channels-chat",
     "crates/ol-webui",
     "crates/openlumara",
 ]
@@ -17,6 +21,10 @@ license = "GPL-2.0-or-later"
 ol-core = { path = "crates/ol-core" }
 ol-modules = { path = "crates/ol-modules" }
 ol-channels = { path = "crates/ol-channels" }
+ol-modules-data = { path = "crates/ol-modules-data" }
+ol-modules-web = { path = "crates/ol-modules-web" }
+ol-modules-dev = { path = "crates/ol-modules-dev" }
+ol-channels-chat = { path = "crates/ol-channels-chat" }
 ol-webui = { path = "crates/ol-webui" }
 
 tokio = { version = "1", features = ["full"] }

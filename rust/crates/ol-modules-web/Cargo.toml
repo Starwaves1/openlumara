@@ -1,0 +1,23 @@
+[package]
+name = "ol-modules-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ol-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

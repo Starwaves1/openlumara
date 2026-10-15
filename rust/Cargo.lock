@@ -966,8 +966,40 @@ dependencies = [
 name = "ol-channels"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
  "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ol-channels-chat"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
+ "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1007,16 +1039,100 @@ dependencies = [
 name = "ol-modules"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
  "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ol-modules-data"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
+ "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ol-modules-dev"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
+ "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "ol-modules-web"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
+ "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
 name = "ol-webui"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "indexmap",
  "ol-core",
+ "once_cell",
+ "parking_lot",
+ "regex",
+ "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1031,8 +1147,12 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "ol-channels",
+ "ol-channels-chat",
  "ol-core",
  "ol-modules",
+ "ol-modules-data",
+ "ol-modules-dev",
+ "ol-modules-web",
  "ol-webui",
  "serde_json",
  "tokio",

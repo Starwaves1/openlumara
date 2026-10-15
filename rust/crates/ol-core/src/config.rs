@@ -861,3 +861,10 @@ mod tests {
         assert_eq!(m.category, "tools");
     }
 }
+
+/// replace the live config without saving it (command line overrides)
+pub fn replace_in_memory(data: Map<String, Value>) {
+    if let Some(c) = CONFIG.lock().as_mut() {
+        c.data = data;
+    }
+}
