@@ -59,7 +59,7 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
     ]
 
     settings = {
-        # AI Written: Claude Opus 5.5: network descriptions and the short descriptions below
+        # AI Written: Claude Opus 5.5: network descriptions
         "network_mode": {
             "description": "Who can open the WebUI: local (only this computer), internet (any device that can reach this one, so turn on require_login), or custom (the custom_host below).",
             "type": "select",
@@ -89,7 +89,6 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
             "depends": "enable_chat_header"
         },
         "title": {
-            "description": "The text shown in the header.",
             "default": "OpenLumara",
             "depends": {"enable_chat_header": True, "enable_title": True}
         },
@@ -137,12 +136,10 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
             "default": False
         },
         "username": {
-            "description": "The username for logging in.",
             "default": "admin",
             "depends": "require_login"
         },
         "password": {
-            "description": "The password for logging in; change it from admin before letting other devices in.",
             "default": "admin",
             "depends": "require_login"
         },

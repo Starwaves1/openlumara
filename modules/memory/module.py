@@ -14,8 +14,7 @@ class Memory(core.module.Module):
     settings = {
         "insert_nudge_prompt": {
             "default": False,
-            # AI Written: Claude Opus 5.5: split into two sentences so the config.yml comment fits in two lines
-            "description": "Whether to put extra instructions in the end prompt (after message history) to help the AI use its memory on its own. That way it remembers things without you having to explicitly ask it to."
+            "description": "Whether to put extra instructions in the end prompt (after message history) to help the AI autonomously use its memory system, so that it remembers things without you having to explicitely ask it to."
         },
         "put_pinned_memories_in_system_prompt": {
             "description": "Whether to put the AI's pinned memories in the system prompt. Pinned memories are memories that you or the AI has decided it needs to remember at all times. You can pin a memory by asking your AI to pin it, or sometimes it'll decide to pin by itself if it has decided a memory is important enough. You can always ask it to unpin a memory you don't want pinned!",
