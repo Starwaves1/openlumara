@@ -133,7 +133,7 @@ class ToolcallManager:
             tool_args = json_repair.loads(tool_call_dict['function']['arguments'])
 
             # check for meta tools (like tools_load) if dynamic tool loading is enabled
-            dynamic_loading = core.config.get("model", "dynamic_tool_loading", default=True)
+            dynamic_loading = core.config.get("model", "dynamic_tool_loading", default=False)  # AI Written: Claude Opus 5.5: match the schema default
             if tool_name in tool_loader.meta_tool_names:
                 if not dynamic_loading:
                     rejected_msg = json.dumps({

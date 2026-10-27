@@ -262,7 +262,7 @@ class Manager:
         # Build each channel's active tools array now that the catalogs are
         # complete: dynamic loading on -> meta tools + preloaded modules;
         # off -> every loadable tool natively.
-        if not core.config.get("model", "dynamic_tool_loading", default=True):
+        if not core.config.get("model", "dynamic_tool_loading", default=False):  # AI Written: Claude Opus 5.5: match the schema default
             self.log("core", "Dynamic tool loading is disabled. Loading all tools at startup.")
         for channel in self.channels.values():
             channel.tool_loader.refresh()
