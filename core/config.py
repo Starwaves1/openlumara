@@ -2,6 +2,7 @@ import os
 import ast
 import copy
 import core
+import core.storage
 import modules
 import user_modules
 import channels
@@ -9,6 +10,9 @@ import user_channels
 import hashlib
 import json
 import inspect
+import re
+import textwrap
+import yaml
 
 config = None
 _registry_cache = None
@@ -1079,6 +1083,87 @@ def sync_module_settings(config_dict, instances, section_key, available_names):
     # Note: If a module is in available_names but NOT in instances,
     # it is disabled and we leave its settings in 'settings' untouched.
 
+# AI Written: Claude Opus 5.5:
+CONFIG_HEADER = (
+    "# OpenLumara settings. Restart OpenLumara after editing this file.\n"
+    "# Comments are regenerated on save, so notes you add here won't be kept.\n"
+)
+
+SECTION_NOTES = {
+    "channels": "Ways to talk to OpenLumara. Move a name from disabled to enabled to turn it on.",
+    "modules": "Abilities the AI can use. Move a name from disabled to enabled to turn it on.",
+    "user_channels": "Channels you installed yourself. Turn them on the same way.",
+    "user_modules": "Modules you installed yourself. Turn them on the same way.",
+}
+
+def _short_note(text, options=None):
+    """first sentence of a description, plus the choices of a select setting"""
+    # markdown links become their url, bold is dropped, newlines are squashed
+    text = re.sub(r"\[[^\]]*\]\(([^)]*)\)", r"\1", " ".join(str(text or "").split())).replace("**", "")
+    # end at the first ". " (but not at "e.g." or "i.e.")
+    match = re.match(r"(.+?(?<!e\.g)(?<!i\.e)[.!?])(?=\s|$)", text)
+    note = match.group(1) if match else text
+
+    # list the choices, unless the sentence already names them all
+    if options and not all(re.search(rf"\b{re.escape(str(option))}\b", note) for option in options):
+        if note and note[-1] not in ".!?":
+            note += "."
+        note = f"{note} Options: {', '.join(map(str, options))}.".strip()
+    return note or None
+
+def _setting_notes(schema):
+    """turns a settings schema into {key: (note, child notes)}"""
+    notes = {}
+    for key, field in schema.items():
+        if not isinstance(field, dict):
+            continue
+        if "default" in field:
+            notes[key] = (_short_note(field.get("description"), field.get("options")), {})
+        else:
+            notes[key] = (None, _setting_notes(field))
+    return notes
+
+def _config_notes():
+    """a comment for every known setting, mirroring the shape of the config file"""
+    notes = {section: (None, _setting_notes(fields)) for section, fields in core_settings_schema.items()}
+
+    cache = _get_module_schema_cache()
+    for section in CACHE_SECTIONS:
+        settings = {
+            name: (_short_note(data["metadata"].get("docstring")), _setting_notes(data["schema"]))
+            for name, data in cache.get(section, {}).items()
+        }
+        section_notes = notes.get(section, (None, {}))[1]
+        notes[section] = (SECTION_NOTES.get(section), {**section_notes, "settings": (None, settings)})
+    return notes
+
+def _dump_with_notes(data, notes, indent=0):
+    """yaml.safe_dump, with each key's note as a comment (max two lines) above it"""
+    pad = " " * indent
+    lines = []
+    for key, value in data.items():
+        note, child_notes = notes.get(key, (None, {}))
+        if note:
+            width = max(40, 100 - indent)
+            lines += [f"{pad}# {line}" for line in textwrap.wrap(note, width, max_lines=2, placeholder=" ...")]
+
+        chunk = yaml.safe_dump({key: value}, default_flow_style=False, sort_keys=False, allow_unicode=True).splitlines()
+        if isinstance(value, dict) and value and child_notes and chunk[0].endswith(":"):
+            # a section: write its header, then its keys with their own comments
+            lines.append(pad + chunk[0])
+            lines.append(_dump_with_notes(value, child_notes, indent + 2))
+        else:
+            lines += [pad + line for line in chunk]
+    return "\n".join(lines)
+
+class ConfigFile(core.storage.StorageDict):
+    """the config file. plain yaml, with a short comment above each setting"""
+    # built once by load(), so saving never has to scan modules
+    notes = {}
+
+    def dump_yaml(self):
+        return CONFIG_HEADER + _dump_with_notes(dict(self), self.notes) + "\n"
+
 
 def load(file_path=None):
     """
@@ -1098,7 +1183,7 @@ def load(file_path=None):
     _registry_cache = None
 
     # file_mode 0o600, in other words chmod 600... readable only by the user, no other groups or other users
-    config = core.storage.StorageDict(filename, "yaml", path=dirname, override_temporary=True, file_mode=0o600)
+    config = ConfigFile(filename, "yaml", path=dirname, override_temporary=True, file_mode=0o600)
     if not config:
         new_config = True
 
@@ -1138,6 +1223,13 @@ def load(file_path=None):
         )
         target[item['section_key']]['enabled'] = state['enabled']
         target[item['section_key']]['disabled'] = state['disabled']
+
+    # AI Written: Claude Opus 5.5:
+    try:
+        config.notes = _config_notes()
+    except Exception as e:
+        # never let a broken module schema stop the config from saving
+        core.log("error", f"could not build config comments: {core.detail_error(e)}")
 
     config.load(target)
     config.save()

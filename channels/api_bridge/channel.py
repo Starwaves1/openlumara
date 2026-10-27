@@ -19,11 +19,13 @@ class ApiBridge(core.channel.Channel):
     """
 
     settings = {
+        # AI Written: Claude Opus 5.5: network descriptions
         "network_mode": {
+            "description": "Who can use the API bridge: local (only this computer), internet (any device that can reach this one, so turn on api_key_required), or custom (the custom_host below).",
             "type": "select",
             "options": {
-                "local": "Allows only the device OpenLumara is running on to access the API bridge (sets hostname to `localhost`)",
-                "internet": "Allows any device to access the API bridge (sets hostname to `0.0.0.0`)",
+                "local": "Allows only the device OpenLumara is running on to access the API bridge (listens on `127.0.0.1`)",
+                "internet": "Allows any device that can reach this one to access the API bridge: your home network, or the whole internet if you forward the port (listens on `0.0.0.0`)",
                 "custom": "Use the custom hostname defined below"
             },
             "default": "local"
