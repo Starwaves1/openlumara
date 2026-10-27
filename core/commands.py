@@ -691,7 +691,7 @@ class Commands:
         if not core.config.get("model").get("use_tools", False):
             return "Tools are turned off globally."
 
-        dynamic_loading = core.config.get("model", "dynamic_tool_loading", default=True)
+        dynamic_loading = core.config.get("model", "dynamic_tool_loading", default=False)  # AI Written: Claude Opus 5.5: match the schema default
         
         if args:
             subcmd = args[0].lower()

@@ -306,7 +306,7 @@ class ToolLoader:
 
     def register_meta_tools(self):
         """Build the meta tool + bridge defs when dynamic loading is enabled."""
-        if not core.config.get("model", "dynamic_tool_loading", default=True):
+        if not core.config.get("model", "dynamic_tool_loading", default=False):  # AI Written: Claude Opus 5.5: match the schema default
             return
         if self._meta_def:
             return
