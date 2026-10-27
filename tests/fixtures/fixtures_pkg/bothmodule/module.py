@@ -1,1 +1,1 @@
-MARKER = "module-entry"
+MARKER = "module"

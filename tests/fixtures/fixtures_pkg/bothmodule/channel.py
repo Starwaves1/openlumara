@@ -1,1 +1,1 @@
-MARKER = "channel-entry-should-lose"
+MARKER = "channel"

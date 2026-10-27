@@ -29,7 +29,3 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 migrate_to_folders.py
-.pytest_cache/
-.coverage
-htmlcov/
-reports/

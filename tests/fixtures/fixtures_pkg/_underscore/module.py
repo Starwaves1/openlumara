@@ -1,1 +1,1 @@
-MARKER = "underscore-prefixed-should-be-skipped"
+MARKER = "skipped"

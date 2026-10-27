@@ -1,40 +1,34 @@
-# -- AI GENERATED CODE (Claude) :: (2026-10-25) harness:openlumara status:unreviewed
-"""
-modules/calculator - thin simpleeval wrapper.
-
-simpleeval is an auto-installed runtime dependency; the whole file is
-skipped when it is not present in the environment under test.
-"""
+# AI Written: Claude Opus 5.5
 
 import pytest
 
-pytest.importorskip("simpleeval", reason="calculator's auto-installed dependency")
-
-from harness import apply_config  # noqa: E402
-from modules.calculator.module import Calculator  # noqa: E402
+from modules.calculator.module import Calculator
 
 
 @pytest.fixture
-def calc(fake_manager):
-    apply_config(
-        core={"cmd_prefix": "/"},
-        modules={"disabled_prompts": []},
-    )
-    return Calculator(fake_manager)
+def calc(manager):
+    return Calculator(manager)
 
 
-async def test_calculator_evaluates_expression(calc):
-    res = await calc.calculate("2+2")
+@pytest.mark.parametrize("expr, expected", [
+    ("2 + 2", 4),
+    ("(3 + 4) * 2", 14),
+    ("2 ** 10", 1024),
+    ("7 / 2", 3.5),
+])
+async def test_evaluates_arithmetic(calc, expr, expected):
+    res = await calc.calculate(expr)
     assert res["status"] == "success"
-    assert res["content"] == 4
+    assert res["content"] == expected
 
 
-async def test_calculator_error_envelope(calc):
-    res = await calc.calculate("1/0")
-    assert res["status"] == "error"
-
-
-async def test_calculator_rejects_names_outside_grammar(calc):
-    # simpleeval's sandbox must not expose python builtins/names
-    res = await calc.calculate("__import__('os')")
-    assert res["status"] == "error"
+@pytest.mark.parametrize("expr", [
+    "1 / 0",
+    "__import__('os').system('true')",
+    "open('/etc/passwd').read()",
+    "(1).__class__.__bases__",
+    "().__class__.__base__.__subclasses__()",
+    "os",
+])
+async def test_rejects_unsafe_or_invalid(calc, expr):
+    assert (await calc.calculate(expr))["status"] == "error"

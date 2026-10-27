@@ -1,1 +1,1 @@
-MARKER = "channel-entry"
+MARKER = "channel"

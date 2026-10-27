@@ -1,1 +1,1 @@
-raise RuntimeError("boom during import")
+raise RuntimeError("boom")

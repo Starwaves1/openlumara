@@ -1,1 +1,1 @@
-MARKER = "dot-prefixed-should-be-skipped"
+MARKER = "skipped"

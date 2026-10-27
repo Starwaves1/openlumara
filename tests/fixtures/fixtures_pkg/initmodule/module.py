@@ -1,1 +1,1 @@
-MARKER = "init-module-should-be-skipped"
+MARKER = "skipped"

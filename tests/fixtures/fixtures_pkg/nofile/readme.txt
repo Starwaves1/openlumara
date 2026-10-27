@@ -1,1 +1,1 @@
-not a module entry file
+not a module

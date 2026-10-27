@@ -1,89 +1,133 @@
-# -- AI GENERATED CODE (Claude) :: (2026-10-25) harness:openlumara status:unreviewed
-"""
-shared test fixtures.
+# AI Written: Claude Opus 5.5
+"""Shared fixtures. Every test gets its own data folder and config inside tmp_path."""
 
-the important one is `isolate_lumara_paths` (autouse): it guarantees the test
-suite never writes to a live install's real data/, config.yml, or
-.module_cache.json.
-
-background: importing core is side-effect-light (it creates user_modules/,
-user_channels/ and the data/firstrun marker if missing - all already present
-in any install that has been started at least once). the real danger is what
-happens AFTER import:
-  - core.get_data_path() resolves the data folder at CALL time from
-    core.config.get("core", "data_folder"), falling back to ./data when no
-    config is loaded.
-  - core.config._get_module_schema_cache() writes SCHEMA_CACHE_FILE to the
-    project root.
-both are redirected to tmp_path below. note that core.config.config must be a
-StorageDict (or something with .load()/.save()), because ConfigManager.get()
-reloads from disk on every call - a plain dict would blow up.
-"""
-
+import copy
 import pathlib
-import sys
+import shutil
+import tempfile
 
 import pytest
 
-# make the repo root importable even when pytest is invoked from a subdir
-# (pytest.ini also sets pythonpath, this is just belt & suspenders)
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO = pathlib.Path(__file__).resolve().parent.parent
 
-import core  # noqa: E402  (import on purpose at conftest import time)
+# importing core creates these in the checkout. remember which ones it made so we can remove them again.
+_IMPORT_ARTIFACTS = ["data/firstrun", "data", "user_modules", "user_channels"]
+_created_by_import = [p for p in _IMPORT_ARTIFACTS if not (REPO / p).exists()]
 
-from harness import FakeAPI, FakeChannel, FakeManager, repo_state  # noqa: E402
+import core  # noqa: E402
+
+# some modules scan the schema in their class body, so the cache can be written at collection time
+_session_tmp = tempfile.mkdtemp(prefix="openlumara-tests-")
+core.config.SCHEMA_CACHE_FILE = str(pathlib.Path(_session_tmp) / "module_cache.json")
+
+
+def pytest_sessionfinish(session):
+    shutil.rmtree(_session_tmp, ignore_errors=True)
+    for name in _created_by_import:
+        path = REPO / name
+        try:
+            # rmdir only removes empty dirs, so nothing a user put there is lost
+            path.unlink() if path.is_file() else path.rmdir()
+        except OSError:
+            pass
 
 
 @pytest.fixture(autouse=True)
-def isolate_lumara_paths(tmp_path, monkeypatch):
-    """
-    redirect the data folder, the global config file and the module schema
-    cache into tmp_path for every test. yields the tmp data directory.
-    """
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
+def isolated(tmp_path, monkeypatch):
+    """point the data folder, config file and module schema cache at tmp_path"""
+    config = core.storage.StorageDict("config", "yaml", path=str(tmp_path), override_temporary=True)
+    defaults = copy.deepcopy(core.config.default_config)
+    defaults["core"]["data_folder"] = str(tmp_path / "data")
+    config.load(defaults)
+    config.save()
 
-    # a real StorageDict in tmp, so ConfigManager's load()/save() round-trips
-    # behave exactly like production - just pointed at a throwaway file.
-    test_config = core.storage.StorageDict(
-        "config", "yaml", path=str(tmp_path), override_temporary=True
-    )
-    test_config.load({"core": {"data_folder": str(data_dir)}})
-
-    monkeypatch.setattr(core.config, "config", test_config)
-
-    # get_path() returns absolute paths unchanged, so this keeps the module
-    # schema cache out of the repo root.
-    monkeypatch.setattr(
-        core.config, "SCHEMA_CACHE_FILE", str(tmp_path / "module_cache.json")
-    )
-
-    # make sure global runtime state can't leak between tests
+    monkeypatch.setattr(core.config, "config", config)
+    monkeypatch.setattr(core.config, "SCHEMA_CACHE_FILE", str(tmp_path / "module_cache.json"))
     monkeypatch.setattr(core.config, "_registry_cache", None)
     monkeypatch.setattr(core.storage, "TEMPORARY", False)
     monkeypatch.setattr(core.manager, "global_instance", None)
-
-    yield data_dir
-
-
-@pytest.fixture
-def repo_snapshot():
-    """state of the real data/, config.yml and .module_cache.json, pre-test."""
-    return repo_state()
+    return tmp_path / "data"
 
 
 @pytest.fixture
-def fake_api():
-    return FakeAPI()
+def set_config():
+    """merge sections into the test config, e.g. set_config(model={"use_tools": True})"""
+    def _set(**sections):
+        for key, value in sections.items():
+            core.config.config.setdefault(key, {}).update(value)
+        core.config.config.save()
+    return _set
+
+
+class FakeAPI:
+    """scripted stand-in for core.api.APIClient. queue replies, then inspect .sent"""
+
+    def __init__(self):
+        self.connected = True
+        self.supports_developer_role = False
+        self.cancel_request = False
+        self.sent = []
+        self.replies = []  # dicts for send(), token lists for send_stream()
+
+    async def connect(self, silent=False):
+        return True
+
+    async def attempt_connect(self):
+        return True
+
+    async def send(self, context, **kwargs):
+        self.sent.append({"context": context, **kwargs})
+        return self.replies.pop(0) if self.replies else {"role": "assistant", "content": ""}
+
+    async def send_stream(self, context, **kwargs):
+        self.sent.append({"context": context, **kwargs})
+        for token in (self.replies.pop(0) if self.replies else []):
+            yield token
+
+
+class FakeManager:
+    """the few manager attributes channels and modules touch"""
+
+    def __init__(self):
+        self.API = FakeAPI()
+        self.modules = {}
+        self.channels = {}
+        self.channel = None
+        self.tools = []
+        self.pure_mode = False
+        self.broken_modules = []
+        self.savedata = {}
+        self._async_tasks = set()
+        self.logs = []
+
+    def log(self, category, message):
+        self.logs.append((category, message))
+
+    def log_error(self, message, e):
+        self.logs.append(("error", f"{message}: {e}"))
+
+    def _remove_async_task(self, task):
+        self._async_tasks.discard(task)
+
+
+class TestChannel(core.channel.Channel):
+    __module__ = "channels.test"  # get_name() derives the channel name from this
+
+    async def on_push(self, message):
+        self.pushed.append(message)
 
 
 @pytest.fixture
-def fake_manager(fake_api):
-    return FakeManager(api=fake_api)
+def manager():
+    return FakeManager()
 
 
 @pytest.fixture
-def fake_channel(fake_manager):
-    return FakeChannel(manager=fake_manager)
+async def channel(manager):
+    """a real Channel (with real Context, Chat and Messages) on a fake manager"""
+    ch = TestChannel(manager)
+    ch.pushed = []
+    manager.channel = ch  # skips _set_as_active_channel, which wants a real savedata
+    await ch.init()
+    yield ch
+    await ch._shutdown()

@@ -1,55 +1,26 @@
-# -- AI GENERATED CODE (Qwen3.8 Flash Next) :: (2026-10-25) harness:openlumara status:unreviewed
-"""
-modules/shell - sandbox container command construction.
-
-Recent dev change (40f1e4a): the Dockerfile is no longer bind-mounted into the
-running sandbox container. The Dockerfile may still be used to build the image,
-but the `docker run` command must not carry it as a volume.
-"""
+# AI Written: Claude Opus 5.5
+"""The sandbox container's run command, built without touching docker."""
 
 import pytest
 
-from harness import apply_config
 from modules.shell.module import Shell
 
 
-BASE = {
-    "api": {"max_context": 1000},
-    "model": {"name": "test-model", "use_tools": False, "dynamic_tool_loading": False},
-    "core": {"cmd_prefix": "/"},
-}
-
-
-def configure_shell(**settings):
-    apply_config(
-        modules={"disabled_prompts": [], "settings": {"shell": settings}},
-        **BASE,
-    )
-
-
-@pytest.fixture
-def shell(fake_manager, tmp_path):
-    configure_shell(
-        method="dockerfile",
-        dockerfile_path=str(tmp_path / "Dockerfile"),
-        image="debian:stable-slim",
-        persistent_data=False,
-        temporary_filesystem_size_limit="128m",
-    )
-
-    mod = Shell(fake_manager)
-    mod.runtime = "docker"
-    mod.container_name = "openlumara_test_shell"
-    mod.host_workspace = str(tmp_path / "workspace")
-    mod.host_user_uid = 1000
-    mod.host_user_gid = 1000
-    mod.use_gvisor = False
-    mod.image_hash_path = str(tmp_path / "image_hash")
-    return mod
-
-
-async def test_dockerfile_method_does_not_bind_mount_dockerfile(shell, tmp_path, monkeypatch):
-    (tmp_path / "Dockerfile").write_text("FROM debian:stable-slim\n")
+@pytest.mark.parametrize("persistent", [True, False])
+async def test_container_is_locked_down(manager, tmp_path, monkeypatch, set_config, persistent):
+    set_config(modules={"settings": {"shell": {
+        "method": "dockerfile",
+        "dockerfile_path": str(tmp_path / "Dockerfile"),
+        "persistent_data": persistent,
+        "temporary_filesystem_size_limit": "128m",
+    }}})
+    shell = Shell(manager)
+    # what on_ready would detect
+    shell.runtime = "docker"
+    shell.container_name = "openlumara_test_shell"
+    shell.host_workspace = str(tmp_path / "workspace")
+    shell.host_user_uid = shell.host_user_gid = 1000
+    shell.use_gvisor = False
 
     calls = []
 
@@ -65,10 +36,16 @@ async def test_dockerfile_method_does_not_bind_mount_dockerfile(shell, tmp_path,
 
     await shell._start_container()
 
-    run_cmd = next(cmd for cmd in calls if len(cmd) > 1 and cmd[1] == "run")
-
-    assert run_cmd[-1] == "custom:sandbox"
-    assert not any("Dockerfile" in arg for arg in run_cmd)
-    assert "-v" not in run_cmd
-    assert "--tmpfs" in run_cmd
-    assert "/home/lumara:size=128m" in run_cmd
+    run = next(cmd for cmd in calls if cmd[1] == "run")
+    assert run[-1] == "custom:sandbox"
+    assert ["--network", "none"] == run[run.index("--network"):run.index("--network") + 2]
+    assert ["--cap-drop", "ALL"] == run[run.index("--cap-drop"):run.index("--cap-drop") + 2]
+    assert "--read-only" in run
+    # only the workspace may be mounted, never the Dockerfile
+    assert not any("Dockerfile" in arg for arg in run)
+    mounts = [run[i + 1] for i, arg in enumerate(run) if arg == "-v"]
+    if persistent:
+        assert len(mounts) == 1 and mounts[0].startswith(shell.host_workspace + ":/home/lumara")
+    else:
+        assert mounts == []
+        assert "/home/lumara:size=128m" in run
