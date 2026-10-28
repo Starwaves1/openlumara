@@ -344,6 +344,11 @@ class StorageDict(dict):
         if isinstance(current, dict) and parts[-1] in current:
             del current[parts[-1]]
 
+    # AI Written: Claude Opus 5.5:
+    def dump_yaml(self):
+        """the text written for yaml storage. subclasses can override this (core.config adds comments)"""
+        return yaml.safe_dump(dict(self), default_flow_style=False, sort_keys=False, allow_unicode=True)
+
     def save(self):
         """save content to file"""
         if TEMPORARY and not self.override_temporary:
@@ -353,7 +358,7 @@ class StorageDict(dict):
             case "json":
                 self._write(json.dumps(dict(self), indent=2))
             case "yaml":
-                self._write(yaml.safe_dump(dict(self), default_flow_style=False, sort_keys=False, allow_unicode=True))
+                self._write(self.dump_yaml())
             case "markdown":
                 # NOTE to readers: i suck at recursive programming, so this is where i heavily use AI assistance. ~Rose22
 

@@ -2,6 +2,7 @@ import os
 import ast
 import copy
 import core
+import core.storage
 import modules
 import user_modules
 import channels
@@ -9,6 +10,8 @@ import user_channels
 import hashlib
 import json
 import inspect
+import textwrap
+import yaml
 
 config = None
 _registry_cache = None
@@ -1079,6 +1082,66 @@ def sync_module_settings(config_dict, instances, section_key, available_names):
     # Note: If a module is in available_names but NOT in instances,
     # it is disabled and we leave its settings in 'settings' untouched.
 
+# AI Written: Claude Opus 5.5, trimmed by Claude Fable 5.1:
+CONFIG_HEADER = (
+    "# OpenLumara settings. Restart OpenLumara after editing this file.\n"
+    "# Comments are regenerated on save, so notes you add here won't be kept.\n"
+)
+
+# comments for the settings that aren't obvious from their name, keyed by their path in the file
+COMMENTS = {
+    "core.tool_timeout": "Seconds a tool may run before it's killed.",
+    "core.module_libraries": "Git repos to install modules and skills from.",
+    "api.evict_block": "Messages dropped at once when over max_messages.",
+    "api.use_developer_role": "Label OpenLumara's instructions as developer instead of system/user. Some models error on it.",
+    "model.dynamic_tool_loading": "Load tools on demand instead of all at startup.",
+    "model.context_compression_threshold": "Compress when the context is this full (0.7 = 70%).",
+    "model.only_preserve_reasoning_for_current_agentic_loop": "Drop reasoning once the AI has finished answering.",
+    "model.reasoning_effort": "none, low, medium, high, xhigh or max.",
+    "channels": "Move a name from disabled to enabled to turn it on.",
+    "channels.settings.api_bridge.network_mode": "local, internet (turn on api_key_required) or custom.",
+    "channels.settings.webui.network_mode": "local, internet (turn on require_login) or custom.",
+    "channels.settings.webui.show_unsafe_settings": "Show modules with host access in the settings page.",
+    "channels.settings.webui.login_lifetime": "Days before you have to log in again.",
+    "modules": "Move a name from disabled to enabled to turn it on.",
+    "modules.settings.calendar.range": "Days around today the AI can see events for.",
+    "modules.settings.calendar.notification_window": "Minutes before an event to notify you.",
+    "modules.settings.memory.insert_nudge_prompt": "Remind the AI to use its memory on its own.",
+    "modules.settings.scheduler.prompt_strategy": "What a job's AI sees: system prompt + instruction, full context or instruction only.",
+    "modules.settings.shell.persistent_data": "Keep the sandbox home folder on disk at sandbox_path.",
+    "modules.settings.shell.execution_timeout": "Seconds a command may run.",
+    "modules.settings.shell.output_limit": "Characters of output the AI gets to see.",
+    "modules.settings.shell.cpu_limit": "CPU cores the sandbox may use (0.5 = half a core).",
+    "modules.settings.shell.method": "dockerfile or image.",
+    "modules.settings.time.method": "message injection or end prompt.",
+    "modules.settings.time.timezone": "local, or a name like Europe/Amsterdam.",
+    "modules.settings.time.date_format": "strftime format, e.g. %Y-%m-%d %H:%M.",
+    "modules.settings.token_threshold.warning_threshold": "Warn when the context is this full (0.8 = 80%).",
+}
+
+def _dump_with_comments(data, path="", indent=0):
+    """yaml.safe_dump, with a comment above every key listed in COMMENTS"""
+    pad = " " * indent
+    lines = []
+    for key, value in data.items():
+        key_path = f"{path}.{key}" if path else str(key)
+        if comment := COMMENTS.get(key_path):
+            lines += [f"{pad}# {line}" for line in textwrap.wrap(comment, 100 - indent)]
+
+        chunk = yaml.safe_dump({key: value}, default_flow_style=False, sort_keys=False, allow_unicode=True).splitlines()
+        if isinstance(value, dict) and value and chunk[0].endswith(":") and any(k.startswith(key_path + ".") for k in COMMENTS):
+            # a section with commented keys inside: write its header, then recurse
+            lines.append(pad + chunk[0])
+            lines.append(_dump_with_comments(value, key_path, indent + 2))
+        else:
+            lines += [pad + line for line in chunk]
+    return "\n".join(lines)
+
+class ConfigFile(core.storage.StorageDict):
+    """the config file: plain yaml, with a short comment above the settings that need one"""
+
+    def dump_yaml(self):
+        return CONFIG_HEADER + _dump_with_comments(dict(self)) + "\n"
 
 def load(file_path=None):
     """
@@ -1098,7 +1161,7 @@ def load(file_path=None):
     _registry_cache = None
 
     # file_mode 0o600, in other words chmod 600... readable only by the user, no other groups or other users
-    config = core.storage.StorageDict(filename, "yaml", path=dirname, override_temporary=True, file_mode=0o600)
+    config = ConfigFile(filename, "yaml", path=dirname, override_temporary=True, file_mode=0o600)
     if not config:
         new_config = True
 

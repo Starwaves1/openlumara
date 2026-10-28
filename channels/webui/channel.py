@@ -59,16 +59,19 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
     ]
 
     settings = {
+        # AI Written: Claude Opus 5.5: network descriptions
         "network_mode": {
+            "description": "Who can open the WebUI: local (only this computer), internet (any device that can reach this one, so turn on require_login), or custom (the custom_host below).",
             "type": "select",
             "options": {
-                "local": "Allows only the device OpenLumara is running on to access the WebUI (sets hostname to `localhost`)",
-                "internet": "Allows any device to access the WebUI (sets hostname to `0.0.0.0`)",
-                "custom": "Use the custom hostname defined below"
+                "local": "Allows only the device OpenLumara is running on to access the WebUI (listens on `127.0.0.1`)",
+                "internet": "Allows any device that can reach this one to access the WebUI: your home network, or the whole internet if you forward the port (listens on `0.0.0.0`)",
+                "custom": "Listen on the address in custom_host below"
             },
             "default": "local"
         },
         "custom_host": {
+            "description": "The address to listen on when network_mode is custom, e.g. 0.0.0.0 for every network or 192.168.1.5 for just one.",
             "default": None,
             "depends": {"network_mode": "custom"}
         },
