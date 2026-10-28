@@ -1093,7 +1093,7 @@ COMMENTS = {
     "core.tool_timeout": "Seconds a tool may run before it's killed.",
     "core.module_libraries": "Git repos to install modules and skills from.",
     "api.evict_block": "Messages dropped at once when over max_messages.",
-    "api.use_developer_role": "Send the system prompt as OpenAI's developer role. Not every model supports it.",
+    "api.use_developer_role": "Label OpenLumara's instructions as developer instead of system/user. Some models error on it.",
     "model.dynamic_tool_loading": "Load tools on demand instead of all at startup.",
     "model.context_compression_threshold": "Compress when the context is this full (0.7 = 70%).",
     "model.only_preserve_reasoning_for_current_agentic_loop": "Drop reasoning once the AI has finished answering.",
