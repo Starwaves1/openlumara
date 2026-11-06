@@ -1,6 +1,7 @@
 //! (being ported - see rust/PORTING.md)
 
 pub mod identity;
+pub mod replacer;
 pub mod token_threshold;
 pub mod tutorial;
 pub mod util;
@@ -45,5 +46,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: token_threshold::meta::UNSAFE,
         category: token_threshold::meta::CATEGORY,
         factory: token_threshold::TokenThreshold::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "replacer",
+        class_name: replacer::meta::CLASS_NAME,
+        doc: replacer::meta::DOC,
+        settings: replacer::meta::settings,
+        unsafe_: replacer::meta::UNSAFE,
+        category: replacer::meta::CATEGORY,
+        factory: replacer::Replacer::factory,
     });
 }
