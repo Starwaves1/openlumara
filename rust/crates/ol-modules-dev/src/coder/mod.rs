@@ -9,6 +9,7 @@ use crate::pyos;
 use anyhow::anyhow;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, truthy};
+use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::ops::ControlFlow;
@@ -43,6 +44,32 @@ fn sget(m: &Map<String, Value>, key: &str) -> String {
 /// python truthiness of a str-or-other value fetched with a "" default
 fn present(m: &Map<String, Value>, key: &str) -> bool {
     m.get(key).map(truthy).unwrap_or(false)
+}
+
+/// python `base64.b64decode`: standard alphabet, and non-zero trailing bits are accepted
+const PY_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::general_purpose::PAD.with_decode_allow_trailing_bits(true),
+);
+
+const PARSE_FAILED_MSG: &str = "Failed to parse the file for syntax errors. For safety, the file was not written to disk.";
+
+/// python `_check_syntax`: the errors that block a write (empty = the write may go ahead).
+/// Languages whose grammar is not compiled in pass, see `syntax.rs`.
+fn check_syntax(code: &str, file_path: &str) -> Vec<String> {
+    let Some(lang) = syntax::detect_language_from_path(file_path) else { return Vec::new() };
+    if matches!(lang, "vimdoc" | "html" | "htm") || !syntax::is_supported(lang) {
+        return Vec::new();
+    }
+    gate_errors(syntax::diagnostics(code, lang))
+}
+
+/// python: a falsy tree-sitter result is reported as the single parse-failure error
+fn gate_errors(diags: Option<Vec<syntax::Diagnostic>>) -> Vec<String> {
+    match diags {
+        None => vec![PARSE_FAILED_MSG.to_string()],
+        Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
+    }
 }
 
 /// compile a user regex like python's `regex.compile(pattern, flags)`
@@ -373,17 +400,6 @@ impl Coder {
 
     // ---------------- treesitter helpers
 
-    fn check_syntax(&self, code: &str, file_path: &str) -> Vec<String> {
-        let Some(lang) = syntax::detect_language_from_path(file_path) else { return Vec::new() };
-        if matches!(lang, "vimdoc" | "html" | "htm") {
-            return Vec::new();
-        }
-        match syntax::diagnostics(code, lang) {
-            // language not compiled in: like an unsupported language in python, pass
-            None => Vec::new(),
-            Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
-        }
-    }
 
     // ---------------- template helpers
 
@@ -397,19 +413,17 @@ impl Coder {
 
     /// python _get_templates (on a listdir error python returns a result dict, whose keys
     /// then get listed by the system prompt - replicated)
-    fn get_templates(&self) -> Vec<String> {
+    fn get_templates(&self) -> R<Vec<String>> {
         let mut all = Vec::new();
         for folder in self.get_template_folders() {
-            let path = match ol_core::paths::get_path(&folder) {
-                Ok(p) => p,
-                Err(_) => return vec!["status".into(), "content".into()],
-            };
+            // python calls core.get_path outside its try: an error there propagates
+            let path = ol_core::paths::get_path(&folder).map_err(|e| e.to_string())?;
             match pyos::listdir(&path) {
                 Ok(t) => all.extend(t),
-                Err(_) => return vec!["status".into(), "content".into()],
+                Err(_) => return Ok(vec!["status".into(), "content".into()]),
             }
         }
-        all
+        Ok(all)
     }
 
     // ---------------- tools
@@ -544,7 +558,7 @@ impl Coder {
         let path = a.str_or("path", "");
         let content = a.str_or("content", "");
         let target = self.get_sandbox_subpath(&sandbox, &path).map_err(err)?;
-        let errors = self.check_syntax(&content, &target);
+        let errors = check_syntax(&content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -743,7 +757,7 @@ impl Coder {
         if new_content == content {
             return Ok(self.result("Failed to match your original code string against the file contents. Try again!", false));
         }
-        let errors = self.check_syntax(&new_content, &target);
+        let errors = check_syntax(&new_content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -870,7 +884,7 @@ impl Coder {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
-        let errors = self.check_syntax(&content, &target);
+        let errors = check_syntax(&content, &target);
         if !errors.is_empty() {
             return self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false);
         }
@@ -1061,10 +1075,11 @@ impl Coder {
                     Ok(_) => {}
                     Err(_) => continue,
                 }
-                let Ok(content) = pyos::read_text(&fpath) else { continue };
+                // python streams the file: lines completed before a bad utf-8 chunk still count
+                let Ok((lines, _decode_err)) = pyos::stream_lines(&fpath) else { continue };
                 // python only breaks the line loop here: the file loop has no truncated
                 // check, so later files can still append (and the walk stops per folder)
-                for (i, line) in pyos::readlines(&content).iter().enumerate() {
+                for (i, line) in lines.iter().enumerate() {
                     let hit = match &pattern {
                         Some(p) => match re_search(p, line) {
                             Ok(h) => h,
@@ -1624,7 +1639,6 @@ impl Coder {
     }
 
     fn route_upload(&self, b: &Map<String, Value>) -> Value {
-        use base64::Engine;
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
@@ -1646,7 +1660,7 @@ impl Coder {
         }
         // python b64decode (non-validating): drop characters outside the alphabet
         let cleaned: String = content_b64.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
-        let raw = match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+        let raw = match PY_B64.decode(cleaned.as_bytes()) {
             Ok(r) => r,
             Err(_) => return self.result("invalid base64 content", false),
         };
@@ -1709,7 +1723,7 @@ impl Module for Coder {
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
         let mut out: Vec<String> = Vec::new();
-        let templates = self.get_templates();
+        let templates = self.get_templates().map_err(err)?;
         if !templates.is_empty() {
             let list: Vec<String> = templates.iter().map(|t| format!("- {}", t)).collect();
             out.push(format!("## Templates you can read using read_template:\n{}", list.join("\n")));
@@ -1865,6 +1879,31 @@ mod tests {
     fn call(rt: &tokio::runtime::Runtime, c: &Coder, method: &str, args: Value) -> Value {
         let map = args.as_object().cloned().unwrap_or_default();
         rt.block_on(c.call_tool(method, ToolArgs::new(map))).unwrap()
+    }
+
+    #[test]
+    fn syntax_gate_matches_python_blocking_rules() {
+        // valid code passes, broken code is reported with python's "Line N, Col M:" prefix
+        assert!(check_syntax("x = 1\n", "a.py").is_empty());
+        let errs = check_syntax("def f(:\n    return 1\n", "a.py");
+        assert!(!errs.is_empty());
+        assert!(errs[0].starts_with("Line 1, Col "), "{:?}", errs);
+        // html and plaintext are never checked; neither is a language whose grammar is not compiled in
+        assert!(check_syntax("<div>", "a.html").is_empty());
+        assert!(check_syntax("notes", "a.txt").is_empty());
+        assert!(check_syntax("puts 'x'", "a.rb").is_empty());
+        // python's falsy-result branch: the single parse-failure error, verbatim
+        assert_eq!(
+            gate_errors(None),
+            vec!["Failed to parse the file for syntax errors. For safety, the file was not written to disk.".to_string()]
+        );
+    }
+
+    #[test]
+    fn upload_base64_is_python_lenient() {
+        // python b64decode ignores non-zero trailing bits; the strict engine rejects "QR=="
+        assert_eq!(PY_B64.decode("QR==").unwrap(), b"A");
+        assert_eq!(PY_B64.decode("aGk=").unwrap(), b"hi");
     }
 
     /// one test owns the process-wide config (set_for_tests), so every tool check lives here
