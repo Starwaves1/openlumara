@@ -5,7 +5,7 @@
 //! (`WebReader`, `WebSearch`), which reuse it by composition.
 
 use crate::netpolicy::ip_str_is_blocked;
-use crate::pytext::{py_len, py_prefix, urlencode, urlsplit};
+use crate::pytext::{py_len, py_prefix, urlencode, urljoin, urlsplit};
 use crate::sanitize::{py_list_repr, ContentSanitizer, PromptInjectionDetector};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -132,32 +132,57 @@ fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-/// requests' `get_encoding_from_headers`
-fn encoding_from_content_type(ct: Option<&str>) -> Option<String> {
-    let ct = ct?;
+/// requests' `get_encoding_from_headers` (`_parse_content_type_header`: every parameter goes into a dict,
+/// so the last `charset` wins). A bare `charset` parameter stores `True` there, and `.strip()` on it
+/// raises AttributeError; that error is the Err.
+fn encoding_from_content_type(ct: Option<&str>) -> Result<Option<String>, String> {
+    let Some(ct) = ct.filter(|c| !c.is_empty()) else { return Ok(None) };
     let mut tokens = ct.split(';');
     let content_type = tokens.next().unwrap_or("").trim().to_string();
     let strip: &[char] = &['"', '\'', ' '];
+    // None = no charset parameter; Some(None) = a bare `charset` (python's True); Some(Some(v)) = a value
+    let mut charset: Option<Option<String>> = None;
     for param in tokens {
         let param = param.trim();
         if param.is_empty() {
             continue;
         }
-        if let Some(i) = param.find('=') {
-            let key = param[..i].trim_matches(strip).to_lowercase();
-            let value = param[i + 1..].trim_matches(strip);
-            if key == "charset" {
-                return Some(value.trim_matches(|c| c == '\'' || c == '"').to_string());
+        match param.find('=') {
+            Some(i) => {
+                if param[..i].trim_matches(strip).to_lowercase() == "charset" {
+                    charset = Some(Some(param[i + 1..].trim_matches(strip).to_string()));
+                }
+            }
+            None => {
+                if param.to_lowercase() == "charset" {
+                    charset = Some(None);
+                }
             }
         }
     }
-    if content_type.contains("text") {
-        return Some("ISO-8859-1".into());
+    match charset {
+        Some(Some(v)) => Ok(Some(v.trim_matches(|c| c == '\'' || c == '"').to_string())),
+        Some(None) => Err("'bool' object has no attribute 'strip'".into()),
+        None if content_type.contains("text") => Ok(Some("ISO-8859-1".into())),
+        None if content_type.contains("application/json") => Ok(Some("utf-8".into())),
+        None => Ok(None),
     }
-    if content_type.contains("application/json") {
-        return Some("utf-8".into());
+}
+
+/// python's cp1252 codec with `errors="replace"`: the five byte values the codec leaves undefined
+/// each become U+FFFD (encoding_rs maps them to C1 controls instead, per WHATWG).
+fn decode_cp1252(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(b, 0x81 | 0x8D | 0x8F | 0x90 | 0x9D) {
+            out.push_str(&encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes[start..i]).0);
+            out.push('\u{FFFD}');
+            start = i + 1;
+        }
     }
-    None
+    out.push_str(&encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes[start..]).0);
+    out
 }
 
 /// `bytes.decode(encoding, errors="replace")`; Err = python LookupError message
@@ -182,6 +207,7 @@ fn decode_bytes(bytes: &[u8], encoding: &str) -> Result<String, String> {
             Ok(enc.decode_without_bom_handling(rest).0.into_owned())
         }
         _ => match encoding_rs::Encoding::for_label(norm.as_bytes()) {
+            Some(enc) if enc == encoding_rs::WINDOWS_1252 => Ok(decode_cp1252(bytes)),
             Some(enc) => Ok(enc.decode_without_bom_handling(bytes).0.into_owned()),
             None => Err(format!("unknown encoding: {}", encoding)),
         },
@@ -206,6 +232,118 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| b as char).collect()
 }
 
+/// why `is_safe_url` refused a URL: python's `(False, message)` policy result, or an exception that
+/// escapes the check (python's generic "unexpected error" path)
+#[derive(Debug)]
+pub enum UrlCheck {
+    Blocked(String),
+    Unexpected(String),
+}
+
+/// the hostname as python sees it: the URL parser gives punycode, python keeps the unicode form
+fn unicode_host(host: &str) -> String {
+    idna::domain_to_unicode(host).0
+}
+
+/// python's `socket.getaddrinfo` runs the host through the idna codec first. An empty label (other than a
+/// trailing one) or a label over 63 bytes raises UnicodeEncodeError, which is not a gaierror.
+fn idna_label_error(hostname: &str) -> Option<&'static str> {
+    let labels: Vec<&str> = hostname.split('.').collect();
+    for (i, label) in labels.iter().enumerate() {
+        if label.is_empty() {
+            if i + 1 != labels.len() {
+                return Some("label empty");
+            }
+        } else if label.len() > 63 {
+            return Some("label too long");
+        }
+    }
+    None
+}
+
+/// all values of a header joined with ", " (urllib3 `headers[name]`), latin-1 decoded like requests
+fn joined_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    let vals: Vec<String> = headers.get_all(name).iter().map(|v| latin1(v.as_bytes())).collect();
+    if vals.is_empty() {
+        None
+    } else {
+        Some(vals.join(", "))
+    }
+}
+
+/// urllib3's body decoding for `Content-Encoding` (requests' iter_content decodes it): gzip and deflate.
+/// Other codings pass through unchanged. brotli and zstd are only decoded by requests when their optional
+/// packages are installed, which is not the default install this port mirrors.
+enum BodyDecoder {
+    Plain,
+    Gzip(flate2::write::MultiGzDecoder<Vec<u8>>),
+    /// urllib3's deflate decoder reads zlib-wrapped data and falls back to a raw deflate stream
+    Deflate(Option<DeflateStream>),
+}
+
+enum DeflateStream {
+    Zlib(flate2::write::ZlibDecoder<Vec<u8>>),
+    Raw(flate2::write::DeflateDecoder<Vec<u8>>),
+}
+
+impl BodyDecoder {
+    /// `coding` is the lower-cased Content-Encoding value
+    fn for_coding(coding: &str) -> Self {
+        match coding {
+            "gzip" | "x-gzip" => BodyDecoder::Gzip(flate2::write::MultiGzDecoder::new(Vec::new())),
+            "deflate" => BodyDecoder::Deflate(None),
+            _ => BodyDecoder::Plain,
+        }
+    }
+
+    /// the decoded bytes that `chunk` produces
+    fn feed(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::io::Write;
+        match self {
+            BodyDecoder::Plain => Ok(chunk.to_vec()),
+            BodyDecoder::Gzip(d) => {
+                d.write_all(chunk)?;
+                Ok(std::mem::take(d.get_mut()))
+            }
+            BodyDecoder::Deflate(slot) => {
+                let stream = slot.get_or_insert_with(|| {
+                    let zlib_header = match chunk {
+                        [a, b, ..] => (a & 0x0f) == 8 && ((u16::from(*a) << 8) | u16::from(*b)) % 31 == 0,
+                        [a] => (a & 0x0f) == 8,
+                        [] => true,
+                    };
+                    if zlib_header {
+                        DeflateStream::Zlib(flate2::write::ZlibDecoder::new(Vec::new()))
+                    } else {
+                        DeflateStream::Raw(flate2::write::DeflateDecoder::new(Vec::new()))
+                    }
+                });
+                match stream {
+                    DeflateStream::Zlib(d) => {
+                        d.write_all(chunk)?;
+                        Ok(std::mem::take(d.get_mut()))
+                    }
+                    DeflateStream::Raw(d) => {
+                        d.write_all(chunk)?;
+                        Ok(std::mem::take(d.get_mut()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// the decoder's end-of-stream output
+    fn finish(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            BodyDecoder::Plain | BodyDecoder::Deflate(None) => Ok(Vec::new()),
+            BodyDecoder::Gzip(d) => d.finish(),
+            BodyDecoder::Deflate(Some(DeflateStream::Zlib(d))) => d.finish(),
+            BodyDecoder::Deflate(Some(DeflateStream::Raw(d))) => d.finish(),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum Fail {
     Timeout,
     Ssl(String),
@@ -322,7 +460,18 @@ struct ParsedCookie {
     value: Option<String>,
     /// explicit Domain attribute, lower-cased (None when absent)
     domain: Option<String>,
+    /// explicit Path attribute (None when absent)
+    path: Option<String>,
     expires: Option<i64>,
+}
+
+enum CookieAttr {
+    Cookie(ParsedCookie),
+    /// cookiejar drops just this cookie (empty name, bad Domain/Path, non-integer Max-Age)
+    Drop,
+    /// a bare Max-Age makes `int(None)` raise TypeError; cookiejar's make_cookies does not catch it
+    /// per cookie, so the response's whole Set-Cookie batch is lost
+    BatchFail,
 }
 
 /// the date formats http.cookiejar's `http2time` accepts most often (GMT is implied)
@@ -344,8 +493,9 @@ fn parse_cookie_expires(text: &str) -> Option<i64> {
     FORMATS.iter().find_map(|f| chrono::NaiveDateTime::parse_from_str(t, f).ok()).map(|n| n.and_utc().timestamp())
 }
 
-/// `None` = the cookie is dropped (empty name, or a bad attribute value that cookiejar rejects)
-fn parse_set_cookie(raw: &str, now: i64) -> Option<ParsedCookie> {
+/// one Set-Cookie header. Attribute rules follow `_normalized_cookie_tuples`: the first Domain, Path and
+/// Expires are significant, Max-Age overrides Expires, and processing stops at the first bad attribute.
+fn parse_set_cookie(raw: &str, now: i64) -> CookieAttr {
     let mut parts = raw.split(';');
     let first = parts.next().unwrap_or("").trim();
     let (name, value) = match first.split_once('=') {
@@ -353,13 +503,16 @@ fn parse_set_cookie(raw: &str, now: i64) -> Option<ParsedCookie> {
         None => (first, None),
     };
     if name.is_empty() {
-        return None;
+        return CookieAttr::Drop;
     }
     let mut domain: Option<String> = None;
     let mut domain_seen = false;
+    let mut path: Option<String> = None;
     let mut path_seen = false;
-    let mut expires: Option<i64> = None;
+    let mut max_age_seen = false;
     let mut max_age: Option<i64> = None;
+    let mut expires_seen = false;
+    let mut expires: Option<i64> = None;
     for param in parts {
         let param = param.trim();
         let (key, val) = match param.split_once('=') {
@@ -371,33 +524,42 @@ fn parse_set_cookie(raw: &str, now: i64) -> Option<ParsedCookie> {
         }
         match key.to_lowercase().as_str() {
             "max-age" => {
-                // a non-integer Max-Age makes cookiejar drop the whole cookie; the last one wins
-                let n = val.and_then(|v| v.parse::<i64>().ok())?;
-                max_age = Some(now.saturating_add(n));
+                max_age_seen = true;
+                let Some(v) = val else { return CookieAttr::BatchFail };
+                match v.parse::<i64>() {
+                    Ok(n) => max_age = Some(now.saturating_add(n)),
+                    Err(_) => return CookieAttr::Drop,
+                }
             }
             "expires" => {
-                if expires.is_none() {
-                    expires = val.and_then(|v| parse_cookie_expires(v.trim_matches('"')));
+                if max_age_seen {
+                    continue;
+                }
+                // a bare Expires is ignored (session cookie); the first valued one is significant
+                let Some(v) = val else { continue };
+                if !expires_seen {
+                    expires_seen = true;
+                    expires = parse_cookie_expires(v.trim_matches('"'));
                 }
             }
             "domain" => {
                 if !domain_seen {
                     domain_seen = true;
-                    domain = Some(val?.to_lowercase());
+                    let Some(v) = val else { return CookieAttr::Drop };
+                    domain = Some(v.to_lowercase());
                 }
             }
             "path" => {
                 if !path_seen {
                     path_seen = true;
-                    if val.is_none() {
-                        return None;
-                    }
+                    let Some(v) = val else { return CookieAttr::Drop };
+                    path = Some(v.to_string());
                 }
             }
             _ => {}
         }
     }
-    Some(ParsedCookie { name: name.to_string(), value, domain, expires: max_age.or(expires) })
+    CookieAttr::Cookie(ParsedCookie { name: name.to_string(), value, domain, path, expires: max_age.or(expires) })
 }
 
 /// `http.cookiejar.DefaultCookiePolicy.set_ok_domain` for version-0 cookies, with the dot prefix that
@@ -410,38 +572,79 @@ fn cookie_domain_ok(domain: &str, erhn: &str) -> bool {
     erhn.ends_with(domain) || erhn.ends_with(&format!("{}.local", undotted)) || format!(".{}", erhn).ends_with(domain)
 }
 
-/// requests' `dict(resp.cookies)`: the cookie jar that requests builds from one response's Set-Cookie
-/// headers. Expired cookies delete a same-named cookie instead of being stored, cookies whose Domain
-/// does not match the request host are rejected, and a bare name is kept with a None value.
-/// RFC 2965 (version > 0) rules are not modelled.
-fn cookie_jar_dict(set_cookies: &[String], request_host: &str, now: i64) -> Map<String, Value> {
+/// the default cookie path for a request path (`_cookie_from_cookie_tuple`, version 0)
+fn default_cookie_path(request_path: &str) -> String {
+    let path = match request_path.rfind('/') {
+        Some(i) => &request_path[..i],
+        None => request_path,
+    };
+    if path.is_empty() {
+        "/".into()
+    } else {
+        path.into()
+    }
+}
+
+/// requests' `dict(resp.cookies)`: the jar requests builds from one response's Set-Cookie headers.
+/// cookiejar stores cookies keyed by (domain, path, name); expired cookies are never stored, cookies whose
+/// Domain does not match the request host are rejected, and a bare Max-Age loses the whole batch. Then
+/// `dict()` looks each name up: a name held by several cookies raises CookieConflictError, and a name
+/// whose value is None or "" raises KeyError (`if toReturn:` in `_find_no_duplicates`). Either makes the
+/// request fail. RFC 2965 (version > 0) rules are not modelled.
+fn cookie_jar_dict(set_cookies: &[String], request_host: &str, request_path: &str, now: i64) -> Result<Map<String, Value>, Fail> {
+    let mut parsed = Vec::new();
+    for raw in set_cookies {
+        match parse_set_cookie(raw, now) {
+            CookieAttr::Cookie(c) => parsed.push(c),
+            CookieAttr::Drop => {}
+            CookieAttr::BatchFail => return Ok(Map::new()),
+        }
+    }
     let host = request_host.to_lowercase();
     let erhn = if host.contains('.') { host } else { format!("{}.local", host) };
-    // (name, domain, value); a cookie is replaced by one with the same name and domain
-    let mut jar: Vec<(String, String, Option<String>)> = Vec::new();
-    for raw in set_cookies {
-        let Some(c) = parse_set_cookie(raw, now) else { continue };
+    let default_path = default_cookie_path(request_path);
+    // (domain, path, name, value)
+    let mut jar: Vec<(String, String, String, Option<String>)> = Vec::new();
+    for c in parsed {
+        if c.expires.is_some_and(|t| t <= now) {
+            continue;
+        }
         let domain_specified = c.domain.is_some();
         let domain = match c.domain {
             Some(d) if d.starts_with('.') => d,
             Some(d) => format!(".{}", d),
             None => erhn.clone(),
         };
-        let same = |n: &String, d: &String| *n == c.name && *d == domain;
-        jar.retain(|(n, d, _)| !same(n, d));
-        if c.expires.is_some_and(|t| t <= now) {
-            continue;
-        }
         if domain_specified && !cookie_domain_ok(&domain, &erhn) {
             continue;
         }
-        jar.push((c.name, domain, c.value));
+        let path = c.path.unwrap_or_else(|| default_path.clone());
+        jar.retain(|(d, p, n, _)| !(*d == domain && *p == path && *n == c.name));
+        jar.push((domain, path, c.name, c.value));
     }
+    // `dict()` visits the jar in cookiejar's order (sorted by domain, then path, then name)
+    jar.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
     let mut out = Map::new();
-    for (name, _, value) in jar {
-        out.insert(name, value.map(Value::String).unwrap_or(Value::Null));
+    let mut i = 0;
+    while i < jar.len() {
+        let name = jar[i].2.clone();
+        let mut j = i;
+        while j < jar.len() && jar[j].2 == name {
+            j += 1;
+        }
+        let (last, earlier) = jar[i..j].split_last().expect("non-empty group");
+        if earlier.iter().any(|e| e.3.is_some()) {
+            return Err(Fail::Unexpected(format!("There are multiple cookies with name, {}", py_repr(&json!(name)))));
+        }
+        match &last.3 {
+            Some(v) if !v.is_empty() => {
+                out.insert(name, Value::String(v.clone()));
+            }
+            _ => return Err(Fail::Unexpected(format!("KeyError: \"name={}, domain=None, path=None\"", py_repr(&json!(name))))),
+        }
+        i = j;
     }
-    out
+    Ok(out)
 }
 
 impl HttpCore {
@@ -551,17 +754,20 @@ impl HttpCore {
 
     // ==================== SSRF Protection ====================
 
+    /// python matches the unicode hostname against the config entries as typed; the URL parser hands us
+    /// punycode, so both sides are compared in unicode form.
     fn config_list(&self, key: &str) -> Vec<String> {
-        match self.config.get1(key) {
+        let entries: Vec<String> = match self.config.get1(key) {
             Some(Value::Array(a)) => a.iter().map(|v| py_str(v).to_lowercase()).collect(),
             Some(Value::String(s)) => s.chars().map(|c| c.to_lowercase().to_string()).collect(),
             _ => vec![],
-        }
+        };
+        entries.iter().map(|e| unicode_host(e)).collect()
     }
 
     /// Whitelist / blacklist / metadata-hostname checks (no DNS).
     pub fn check_domain_policy(&self, hostname: &str) -> Result<(), String> {
-        let hostname = hostname.to_lowercase();
+        let hostname = unicode_host(&hostname.to_lowercase());
         let whitelist = self.config_list("domain_whitelist");
         let blacklist = self.config_list("domain_blacklist");
         for blocked in &blacklist {
@@ -578,26 +784,30 @@ impl HttpCore {
         Ok(())
     }
 
-    /// Resolve a hostname and validate ALL resolved addresses.
-    pub async fn resolve_and_validate(&self, hostname: &str) -> Result<(), String> {
+    /// Resolve a hostname and validate ALL resolved addresses. Only a resolver failure that python reports
+    /// as socket.gaierror is a policy rejection; python's other exceptions from getaddrinfo are not.
+    pub async fn resolve_and_validate(&self, hostname: &str) -> Result<(), UrlCheck> {
         if !self.config.get_bool("block_local_network_access") {
             return Ok(());
+        }
+        if let Some(why) = idna_label_error(hostname) {
+            return Err(UrlCheck::Unexpected(format!("UnicodeEncodeError: 'idna' codec can't encode: {}", why)));
         }
         let infos = match tokio::net::lookup_host((hostname, 0u16)).await {
             Ok(i) => i.collect::<Vec<_>>(),
             Err(e) => {
                 self.log(&format!("DNS resolution failed for {}: {}", hostname, e));
-                return Err("DNS resolution failed".into());
+                return Err(UrlCheck::Blocked("DNS resolution failed".into()));
             }
         };
         if infos.is_empty() {
-            return Err("Hostname did not resolve to any address".into());
+            return Err(UrlCheck::Blocked("Hostname did not resolve to any address".into()));
         }
         for addr in infos {
             let ip = addr.ip().to_string();
             if ip_str_is_blocked(&ip) {
                 self.log(&format!("Blocked resolved internal IP {} for {}", ip, hostname));
-                return Err("URL resolves to a blocked (internal) address".into());
+                return Err(UrlCheck::Blocked("URL resolves to a blocked (internal) address".into()));
             }
         }
         Ok(())
@@ -607,27 +817,26 @@ impl HttpCore {
     /// request is sent to, so the checks and the connection share one parser. (python's urlparse
     /// and the WHATWG parser disagree on `\` in the authority: `http://127.0.0.1\@evil.com/` would
     /// validate as evil.com while connecting to 127.0.0.1.)
-    /// Err = policy rejection with python's message.
-    pub async fn is_safe_url(&self, url: &reqwest::Url) -> Result<(), String> {
+    pub async fn is_safe_url(&self, url: &reqwest::Url) -> Result<(), UrlCheck> {
         let scheme = url.scheme();
         if !ALLOWED_SCHEMES.contains(&scheme) {
-            return Err(format!("Scheme not allowed: {}", scheme));
+            return Err(UrlCheck::Blocked(format!("Scheme not allowed: {}", scheme)));
         }
         if self.config.get_bool("https_only") && scheme != "https" {
-            return Err("HTTPS-only mode is enabled".into());
+            return Err(UrlCheck::Blocked("HTTPS-only mode is enabled".into()));
         }
         // host_str() is lower-cased and punycode-encoded (so IDN hosts resolve); IPv6 keeps brackets
         let Some(hostname) = url.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']')).filter(|h| !h.is_empty()) else {
-            return Err("URL has no hostname".into());
+            return Err(UrlCheck::Blocked("URL has no hostname".into()));
         };
         if let Some(p) = url.port() {
             if p != 0 && DANGEROUS_PORTS.contains(&(p as u32)) {
-                return Err(format!("Port {} is blocked", p));
+                return Err(UrlCheck::Blocked(format!("Port {} is blocked", p)));
             }
         }
-        self.check_domain_policy(hostname)?;
+        self.check_domain_policy(hostname).map_err(UrlCheck::Blocked)?;
         if self.config.get_bool("block_local_network_access") && (hostname == "localhost" || hostname == "0.0.0.0") {
-            return Err("Blocked localhost access".into());
+            return Err(UrlCheck::Blocked("Blocked localhost access".into()));
         }
         self.resolve_and_validate(hostname).await
     }
@@ -780,9 +989,13 @@ impl HttpCore {
         Ok(out)
     }
 
+    /// reqwest's own decompression would strip Content-Encoding and Content-Length from the response
+    /// headers that python's dict(resp.headers) keeps, so the body is decoded in `BodyDecoder` instead.
     fn client() -> Result<reqwest::Client, reqwest::Error> {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_deflate()
             .connect_timeout(Duration::from_secs(REQUEST_TIMEOUT))
             .read_timeout(Duration::from_secs(REQUEST_TIMEOUT))
             .http1_only()
@@ -859,9 +1072,13 @@ impl HttpCore {
         for _hop in 0..=MAX_REDIRECTS {
             // one parse per hop: the Url that is validated is the Url that is sent
             let mut full = reqwest::Url::parse(&current_url).map_err(|e| Fail::Request(format!("Invalid URL {}: {}", py_repr(&json!(current_url)), e)))?;
-            if let Err(err) = self.is_safe_url(&full).await {
-                self.log(&format!("Blocked URL ({}): {}", current_url, err));
-                return Ok(ol_core::module::tool_result(json!("URL blocked by security policy"), false));
+            match self.is_safe_url(&full).await {
+                Ok(()) => {}
+                Err(UrlCheck::Blocked(err)) => {
+                    self.log(&format!("Blocked URL ({}): {}", current_url, err));
+                    return Ok(ol_core::module::tool_result(json!("URL blocked by security policy"), false));
+                }
+                Err(UrlCheck::Unexpected(err)) => return Err(Fail::Unexpected(err)),
             }
 
             // requests validates the headers when it prepares the request, after the URL check
@@ -894,28 +1111,28 @@ impl HttpCore {
             }
             let resp = req.send().await.map_err(|e| classify(&e))?;
 
+            // requests derives resp.encoding for every response, before any redirect handling
+            let declared_encoding = encoding_from_content_type(joined_header(resp.headers(), "content-type").as_deref()).map_err(Fail::Unexpected)?;
+
             let status = resp.status().as_u16();
             if REDIRECT_STATI.contains(&status) {
-                if let Some(loc) = resp.headers().get("location") {
-                    let location = latin1(loc.as_bytes());
+                if let Some(location) = joined_header(resp.headers(), "location") {
                     drop(resp);
                     if location.is_empty() {
                         return Ok(ol_core::module::tool_result(json!("Redirect with no Location header"), false));
                     }
-                    current_url = match reqwest::Url::parse(&current_url).and_then(|b| b.join(&location)) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => location,
-                    };
+                    // requests.compat.urljoin, i.e. urllib.parse.urljoin
+                    current_url = urljoin(&current_url, &location).map_err(Fail::Unexpected)?;
                     continue;
                 }
             }
-            return self.build_response(resp, include_content).await;
+            return self.build_response(resp, include_content, declared_encoding).await;
         }
         self.log(&format!("Too many redirects starting from {}", url));
         Ok(ol_core::module::tool_result(json!(format!("Too many redirects (maximum: {})", MAX_REDIRECTS)), false))
     }
 
-    async fn build_response(&self, resp: reqwest::Response, include_content: bool) -> Result<Value, Fail> {
+    async fn build_response(&self, resp: reqwest::Response, include_content: bool, declared_encoding: Option<String>) -> Result<Value, Fail> {
         let status = resp.status();
         let reason = resp
             .extensions()
@@ -924,16 +1141,20 @@ impl HttpCore {
             .unwrap_or_else(|| status.canonical_reason().unwrap_or("").to_string());
         let final_url = resp.url().to_string();
 
-        // dict(resp.headers): duplicates joined with ", "
+        // dict(resp.headers): one entry per header name, duplicates joined with ", ", in first-seen order
         let mut headers = Map::new();
-        for name in resp.headers().keys() {
-            let vals: Vec<String> = resp.headers().get_all(name).iter().map(|v| latin1(v.as_bytes())).collect();
-            headers.insert(title_case_header(name.as_str()), Value::String(vals.join(", ")));
+        for (name, _) in resp.headers().iter() {
+            let key = title_case_header(name.as_str());
+            if !headers.contains_key(&key) {
+                let joined = joined_header(resp.headers(), name.as_str()).unwrap_or_default();
+                headers.insert(key, Value::String(joined));
+            }
         }
         // dict(resp.cookies): cookiejar policy applied to this hop's Set-Cookie headers
         let set_cookies: Vec<String> = resp.headers().get_all("set-cookie").iter().map(|v| latin1(v.as_bytes())).collect();
-        let cookies = cookie_jar_dict(&set_cookies, resp.url().host_str().unwrap_or(""), now_secs() as i64);
-        let content_type_raw = resp.headers().get("content-type").map(|v| latin1(v.as_bytes()));
+        let cookies = cookie_jar_dict(&set_cookies, resp.url().host_str().unwrap_or(""), resp.url().path(), now_secs() as i64)?;
+        let content_type_raw = joined_header(resp.headers(), "content-type");
+        let content_encoding = joined_header(resp.headers(), "content-encoding").unwrap_or_default().to_lowercase();
 
         let mut response = Map::new();
         response.insert("status".into(), json!(format!("{} {}", status.as_u16(), reason)));
@@ -943,26 +1164,46 @@ impl HttpCore {
 
         if include_content {
             let mut body: Vec<u8> = Vec::new();
+            let mut decoder = BodyDecoder::for_coding(&content_encoding);
             let mut stream = resp.bytes_stream();
-            'read: while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(c) => {
-                        for piece in c.chunks(DOWNLOAD_CHUNK) {
-                            body.extend_from_slice(piece);
-                            if body.len() > MAX_CONTENT_SIZE {
-                                response.insert("content_truncated".into(), json!(true));
-                                break 'read;
-                            }
+            // set when the read stopped early (truncated or failed), so the decoder is not flushed
+            let mut stopped = false;
+            while let Some(chunk) = stream.next().await {
+                let piece = match chunk {
+                    Ok(c) => decoder.feed(&c).map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                match piece {
+                    Ok(bytes) => {
+                        body.extend_from_slice(&bytes);
+                        if body.len() > MAX_CONTENT_SIZE {
+                            response.insert("content_truncated".into(), json!(true));
+                            stopped = true;
+                            break;
                         }
                     }
                     Err(e) => {
-                        response.insert("content_error".into(), json!(e.to_string()));
+                        response.insert("content_error".into(), json!(e));
+                        stopped = true;
                         break;
                     }
                 }
             }
-            let encoding = encoding_from_content_type(content_type_raw.as_deref()).unwrap_or_else(|| "utf-8".into());
-            let encoding = if encoding.is_empty() { "utf-8".to_string() } else { encoding };
+            if !stopped {
+                match decoder.finish() {
+                    Ok(rest) => {
+                        body.extend_from_slice(&rest);
+                        if body.len() > MAX_CONTENT_SIZE {
+                            response.insert("content_truncated".into(), json!(true));
+                        }
+                    }
+                    Err(e) => {
+                        response.insert("content_error".into(), json!(e.to_string()));
+                    }
+                }
+            }
+            // requests: `resp.encoding or "utf-8"`
+            let encoding = declared_encoding.filter(|e| !e.is_empty()).unwrap_or_else(|| "utf-8".into());
             let raw_content = decode_bytes(&body[..body.len().min(MAX_CONTENT_SIZE)], &encoding).map_err(Fail::Unexpected)?;
             let raw_len = py_len(&raw_content);
             self.log(&format!("Raw content received: {} bytes", raw_len));
@@ -1153,10 +1394,14 @@ mod tests {
 
     #[test]
     fn encodings() {
-        assert_eq!(encoding_from_content_type(Some("text/html")).as_deref(), Some("ISO-8859-1"));
-        assert_eq!(encoding_from_content_type(Some("text/html; charset=\"UTF-8\"")).as_deref(), Some("UTF-8"));
-        assert_eq!(encoding_from_content_type(Some("application/json")).as_deref(), Some("utf-8"));
-        assert_eq!(encoding_from_content_type(Some("image/png")), None);
+        let enc = |ct: &str| encoding_from_content_type(Some(ct));
+        assert_eq!(enc("text/html").unwrap().as_deref(), Some("ISO-8859-1"));
+        assert_eq!(enc("text/html; charset=\"UTF-8\"").unwrap().as_deref(), Some("UTF-8"));
+        assert_eq!(enc("application/json").unwrap().as_deref(), Some("utf-8"));
+        assert_eq!(enc("image/png").unwrap(), None);
+        // requests keeps the last charset parameter; a bare charset makes `.strip()` raise
+        assert_eq!(enc("text/html; charset=utf-8; charset=latin-1").unwrap().as_deref(), Some("latin-1"));
+        assert!(enc("text/html; charset").is_err());
         assert_eq!(decode_bytes("é".as_bytes(), "ISO-8859-1").unwrap(), "Ã©");
         assert_eq!(decode_bytes(b"\xe9", "windows-1252").unwrap(), "é");
         assert_eq!(decode_bytes(b"x", "bogus").unwrap_err(), "unknown encoding: bogus");
@@ -1200,15 +1445,83 @@ mod tests {
             "gone=1; Max-Age=0".to_string(),
             "keep=2".to_string(),
             "bad=3; Domain=other.org".to_string(),
-            "bare".to_string(),
             "ok=4; Domain=example.com; Path=/".to_string(),
             "old=5; Expires=Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         ];
-        let jar = cookie_jar_dict(&set, "api.example.com", now);
-        assert_eq!(serde_json::to_string(&jar).unwrap(), r#"{"keep":"2","bare":null,"ok":"4"}"#);
-        // an expiring Set-Cookie deletes the same-named cookie from the same response
-        let jar = cookie_jar_dict(&["a=1".to_string(), "a=2; Max-Age=0".to_string()], "api.example.com", now);
-        assert!(jar.is_empty());
+        // jar order is sorted by domain: ".example.com" before "api.example.com"
+        let jar = cookie_jar_dict(&set, "api.example.com", "/x/y", now).unwrap();
+        assert_eq!(serde_json::to_string(&jar).unwrap(), r#"{"ok":"4","keep":"2"}"#);
+        // an expiring Set-Cookie is never stored, so it cannot remove an earlier cookie of the same response
+        let jar = cookie_jar_dict(&["a=1".to_string(), "a=2; Max-Age=0".to_string()], "api.example.com", "/", now).unwrap();
+        assert_eq!(serde_json::to_string(&jar).unwrap(), r#"{"a":"1"}"#);
+        let jar = cookie_jar_dict(&["a=1; Max-Age=0".to_string(), "a=2".to_string()], "api.example.com", "/", now).unwrap();
+        assert_eq!(serde_json::to_string(&jar).unwrap(), r#"{"a":"2"}"#);
+    }
+
+    #[test]
+    fn cookie_dict_failures_match_requests() {
+        let now = 1_900_000_000;
+        let host = "api.example.com";
+        // a bare name or an empty value: `_find_no_duplicates` treats the falsy value as missing (KeyError)
+        assert!(cookie_jar_dict(&["bare".to_string()], host, "/", now).is_err());
+        assert!(cookie_jar_dict(&["a=".to_string()], host, "/", now).is_err());
+        // the same name under two domains or paths: CookieConflictError
+        let two_domains = ["a=1; Domain=api.example.com".to_string(), "a=2; Domain=.example.com".to_string()];
+        assert!(cookie_jar_dict(&two_domains, host, "/", now).is_err());
+        let two_paths = ["a=1; Path=/p".to_string(), "a=2; Path=/q".to_string()];
+        assert!(cookie_jar_dict(&two_paths, host, "/", now).is_err());
+        // the default path comes from the request: /x/y gives /x, so Path=/x/y is a different key (conflict),
+        // while Path=/x is the same key and simply replaces the cookie
+        assert!(cookie_jar_dict(&["a=1".to_string(), "a=2; Path=/x/y".to_string()], host, "/x/y", now).is_err());
+        assert_eq!(serde_json::to_string(&cookie_jar_dict(&["a=1".to_string(), "a=2; Path=/x".to_string()], host, "/x/y", now).unwrap()).unwrap(), r#"{"a":"2"}"#);
+        // a bare Max-Age makes cookiejar lose the whole Set-Cookie batch, without an error
+        let batch = ["x=1".to_string(), "a=1; Max-Age".to_string()];
+        assert!(cookie_jar_dict(&batch, host, "/", now).unwrap().is_empty());
+        // a non-integer Max-Age only drops its own cookie
+        let one = ["x=1".to_string(), "a=1; Max-Age=abc".to_string()];
+        assert_eq!(serde_json::to_string(&cookie_jar_dict(&one, host, "/", now).unwrap()).unwrap(), r#"{"x":"1"}"#);
+    }
+
+    #[test]
+    fn cp1252_undefined_bytes_are_replacement_characters() {
+        assert_eq!(decode_bytes(b"a\x81b\x9d", "windows-1252").unwrap(), "a\u{FFFD}b\u{FFFD}");
+        assert_eq!(decode_bytes(b"\x80", "cp1252").unwrap(), "\u{20AC}");
+    }
+
+    #[test]
+    fn gzip_body_is_decoded_and_headers_are_left_alone() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello gzip").unwrap();
+        let gz = enc.finish().unwrap();
+        let mut dec = BodyDecoder::for_coding("gzip");
+        let mut out = dec.feed(&gz[..5]).unwrap();
+        out.extend(dec.feed(&gz[5..]).unwrap());
+        out.extend(dec.finish().unwrap());
+        assert_eq!(out, b"hello gzip");
+        // a coding python does not decode passes through
+        let mut plain = BodyDecoder::for_coding("br");
+        assert_eq!(plain.feed(b"raw").unwrap(), b"raw");
+    }
+
+    #[test]
+    fn idna_labels_and_unicode_hosts() {
+        assert_eq!(idna_label_error(&format!("{}.com", "a".repeat(70))), Some("label too long"));
+        assert_eq!(idna_label_error("a..b.com"), Some("label empty"));
+        assert_eq!(idna_label_error("a.b."), None);
+        assert_eq!(unicode_host("xn--bcher-kva.de"), "b\u{fc}cher.de");
+    }
+
+    #[test]
+    fn redirect_locations_join_like_python() {
+        let j = |b: &str, u: &str| crate::pytext::urljoin(b, u).unwrap();
+        assert_eq!(j("https://a.com/b/c/", "../../../d?q#f"), "https://a.com/d?q#f");
+        assert_eq!(j("http://a.com", "b"), "http://a.com/b");
+        assert_eq!(j("http://a.com/x", "//b.com/y"), "http://b.com/y");
+        assert_eq!(j("http://a.com/x", "mailto:x"), "mailto:x");
+        assert_eq!(j("http://a.com/x/", "./"), "http://a.com/x/");
+        assert_eq!(j("http://a.com/a/b/c", "d/../.."), "http://a.com/a/");
+        assert_eq!(j("http://a.com/x/y", "..\\evil.com"), "http://a.com/x/..\\evil.com");
     }
 
     #[test]
@@ -1232,9 +1545,9 @@ mod tests {
         let core = HttpCore::new(ModuleConfig::new(ol_core::config::ConfigView::new(&["modules", "settings", "http"])));
         // WHATWG reads `\` as the end of the authority, so the host is metadata.internal
         let url = reqwest::Url::parse("http://metadata.internal\\@evil.example/").unwrap();
-        assert_eq!(core.is_safe_url(&url).await.unwrap_err(), "Blocked metadata endpoint");
+        assert!(matches!(core.is_safe_url(&url).await, Err(UrlCheck::Blocked(m)) if m == "Blocked metadata endpoint"));
         let ftp = reqwest::Url::parse("ftp://x.example/").unwrap();
-        assert_eq!(core.is_safe_url(&ftp).await.unwrap_err(), "Scheme not allowed: ftp");
+        assert!(matches!(core.is_safe_url(&ftp).await, Err(UrlCheck::Blocked(m)) if m == "Scheme not allowed: ftp"));
     }
 
     #[test]
