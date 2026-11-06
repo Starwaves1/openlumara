@@ -280,6 +280,20 @@ fn incomparable_limit_error(type_name: &str) -> String {
     format!("'>=' not supported between instances of 'int' and '{}'", type_name)
 }
 
+/// the command as python's exec call takes it: only a str is accepted, anything else is
+/// `Err(type name)`
+fn command_arg(command: &Value) -> Result<&str, &'static str> {
+    match command {
+        Value::String(s) => Ok(s.as_str()),
+        other => Err(py_type_name(other)),
+    }
+}
+
+/// the text of python's TypeError from create_subprocess_exec given a non-str argument
+fn exec_arg_error(type_name: &str) -> String {
+    format!("expected str, bytes or os.PathLike object, not {}", type_name)
+}
+
 /// how long readers may keep draining once the child has exited (only matters when a background
 /// grandchild still holds the pipes; a normal command reaches EOF at exit)
 const DRAIN_GRACE: Duration = Duration::from_millis(100);
@@ -534,9 +548,15 @@ impl Shell {
 
     // ---------------- image build
 
+    /// `_load_image_hash`: an OSError (missing, unreadable) reads as no stored hash, but bytes that
+    /// are not UTF-8 raise python's UnicodeDecodeError, which escapes the caller
     fn load_image_hash(&self) -> anyhow::Result<Option<String>> {
         let path = self.image_hash_path()?;
-        Ok(std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string()))
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(None);
+        };
+        let text = pyos::decode_utf8(&bytes).map_err(|e| anyhow!(e))?;
+        Ok(Some(text.trim().to_string()))
     }
 
     /// `_save_image_hash`: IO errors are logged, not raised
@@ -798,10 +818,14 @@ impl Shell {
     // ---------------- running commands
 
     /// `_run_passthrough`: run directly on the host when openlumara is already in a container
-    async fn run_passthrough(&self, command: &str) -> anyhow::Result<Value> {
+    async fn run_passthrough(&self, command: &Value) -> anyhow::Result<Value> {
         let timeout_val = self.cfg("execution_timeout", json!(10));
         let limit = self.output_limit();
         let safety = Self::safety_timeout(&timeout_val)?;
+        let command = match command_arg(command) {
+            Ok(c) => c,
+            Err(t) => return Ok(self.base.result(format!("Error while running passthrough shell command: {}", exec_arg_error(t)), false)),
+        };
         let reader = match &limit {
             Ok(l) => l.clone(),
             Err(t) => OutputLimit::incomparable(t),
@@ -818,8 +842,14 @@ impl Shell {
         }
     }
 
-    /// `run`: execute a command in the persistent sandbox container
+    /// `run` with a str command
     pub async fn run(&self, command: &str) -> anyhow::Result<Value> {
+        self.run_raw(&Value::String(command.to_string())).await
+    }
+
+    /// `run` with python's raw argument. A non-str command is not coerced: python hands it to
+    /// create_subprocess_exec, which raises TypeError inside run()'s try and becomes the error result.
+    pub async fn run_raw(&self, command: &Value) -> anyhow::Result<Value> {
         if self.passthrough()? {
             return self.run_passthrough(command).await;
         }
@@ -843,6 +873,10 @@ impl Shell {
         let timeout_val = self.cfg("execution_timeout", json!(10));
         let limit = self.output_limit();
         let safety = Self::safety_timeout(&timeout_val)?;
+        let command = match command_arg(command) {
+            Ok(c) => c,
+            Err(t) => return Ok(self.base.result(format!("Error while running sandboxed shell command: {}", exec_arg_error(t)), false)),
+        };
         let timeout_str = py_str(&timeout_val);
         let args = [
             runtime.as_str(),
@@ -969,7 +1003,7 @@ impl Module for Shell {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "run" => self.run(&args.str_or("command", "")).await,
+            "run" => self.run_raw(args.0.get("command").unwrap_or(&Value::Null)).await,
             _ => anyhow::bail!("'Shell' object has no attribute '{}'", method),
         }
     }
@@ -1246,6 +1280,39 @@ mod tests {
         assert_eq!(err, "can only concatenate str (not \"int\") to str");
         let err = Shell::safety_timeout(&Value::Null).unwrap_err().to_string();
         assert_eq!(err, "unsupported operand type(s) for +: 'NoneType' and 'int'");
+    }
+
+    #[test]
+    fn run_tool_passes_non_str_command_through_to_exec_error() {
+        // python: run(5) reaches create_subprocess_exec, which raises inside run()'s try
+        let shell = Shell::new(ModuleBase::detached("shell"));
+        *shell.state.lock() = Some(State { passthrough: true, ..State::default() });
+        let args = ToolArgs::new(json!({"command": 5}).as_object().unwrap().clone());
+        let result = rt().block_on(shell.call_tool("run", args)).unwrap();
+        assert_eq!(result["status"], json!("error"));
+        assert_eq!(result["content"], json!("Error while running passthrough shell command: expected str, bytes or os.PathLike object, not int"));
+
+        let args = ToolArgs::new(json!({"command": null}).as_object().unwrap().clone());
+        let result = rt().block_on(shell.call_tool("run", args)).unwrap();
+        assert_eq!(result["content"], json!("Error while running passthrough shell command: expected str, bytes or os.PathLike object, not NoneType"));
+    }
+
+    #[test]
+    fn image_hash_read_treats_missing_file_as_none_and_bad_utf8_as_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = Shell::new(ModuleBase::detached("shell"));
+        let path = dir.path().join("docker_image_hash");
+        *shell.state.lock() = Some(State { image_hash_path: Some(path.to_string_lossy().to_string()), ..State::default() });
+        assert_eq!(shell.load_image_hash().unwrap(), None);
+
+        std::fs::write(&path, b"abc123\n").unwrap();
+        assert_eq!(shell.load_image_hash().unwrap(), Some("abc123".to_string()));
+
+        std::fs::write(&path, b"ab\xff").unwrap();
+        assert_eq!(
+            shell.load_image_hash().unwrap_err().to_string(),
+            "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte"
+        );
     }
 
     #[test]
