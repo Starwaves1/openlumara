@@ -100,7 +100,18 @@ pub fn expanduser(p: &str) -> String {
     let rest_start = p.find('/').unwrap_or(p.len());
     let user = &p[1..rest_start];
     let home = if user.is_empty() {
-        std::env::var("HOME").ok()
+        match std::env::var("HOME") {
+            Ok(h) => Some(h),
+            // posixpath: no $HOME -> pwd.getpwuid(os.getuid()).pw_dir
+            Err(_) => unsafe {
+                let pw = libc::getpwuid(libc::getuid());
+                if pw.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().to_string())
+                }
+            },
+        }
     } else {
         // ~user: look up the passwd database
         let cuser = std::ffi::CString::new(user).ok();
@@ -115,7 +126,8 @@ pub fn expanduser(p: &str) -> String {
     };
     match home {
         Some(h) => {
-            let h = if h.len() > 1 { h.trim_end_matches('/').to_string() } else { h };
+            // posixpath: userhome.rstrip(sep)
+            let h = h.trim_end_matches('/').to_string();
             let joined = format!("{}{}", h, &p[rest_start..]);
             if joined.is_empty() {
                 "/".into()
@@ -255,7 +267,8 @@ pub fn lexists(p: &str) -> bool {
 
 /// os.listdir (python error messages)
 pub fn listdir(p: &str) -> Result<Vec<String>, String> {
-    let rd = std::fs::read_dir(if p.is_empty() { "." } else { p }).map_err(|e| os_err(&e, p))?;
+    // os.listdir('') raises ENOENT (unlike glob, which maps '' to curdir)
+    let rd = std::fs::read_dir(p).map_err(|e| os_err(&e, p))?;
     Ok(rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
 }
 
@@ -266,7 +279,8 @@ pub fn which(cmd: &str) -> Option<String> {
     if cmd.contains('/') {
         return check(Path::new(cmd)).then(|| cmd.to_string());
     }
-    let path = std::env::var("PATH").unwrap_or_default();
+    // shutil.which: PATH unset -> os.defpath / confstr CS_PATH
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".to_string());
     for dir in path.split(':') {
         let dir = if dir.is_empty() { "." } else { dir };
         let candidate = Path::new(dir).join(cmd);
@@ -375,6 +389,10 @@ pub fn fnmatch_translate(pat: &str) -> String {
                             esc.push('\\');
                         }
                         esc.push(ch);
+                    }
+                    // only '!' negates in fnmatch; a leading '^' is a literal (python escapes it)
+                    if !negate && esc.starts_with('^') {
+                        esc.insert(0, '\\');
                     }
                     res.push('[');
                     if negate {
@@ -555,6 +573,10 @@ pub fn copytree(src: &str, dst: &str) -> Result<(), String> {
 
 /// shutil.rmtree
 pub fn rmtree(p: &str) -> Result<(), String> {
+    // shutil.rmtree refuses symlinks instead of unlinking them
+    if std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        return Err("Cannot call rmtree on a symbolic link".to_string());
+    }
     std::fs::remove_dir_all(p).map_err(|e| os_err(&e, p))
 }
 
@@ -580,10 +602,10 @@ pub fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
                 std::os::unix::fs::symlink(target, &real_dst).map_err(|e| os_err(&e, &real_dst))?;
                 std::fs::remove_file(src).map_err(|e| os_err(&e, src))
             } else if src_path.is_dir() {
-                let a = abspath(src);
-                let b = abspath(&real_dst);
-                if b.starts_with(&format!("{}/", a.trim_end_matches('/'))) {
-                    return Err(format!("Cannot move a directory '{}' into itself '{}'.", src, real_dst));
+                // shutil._destinsrc(src, dst): both sides get a trailing sep, then startswith
+                let with_sep = |p: String| if p.ends_with('/') { p } else { format!("{}/", p) };
+                if with_sep(abspath(dst)).starts_with(&with_sep(abspath(src))) {
+                    return Err(format!("Cannot move a directory '{}' into itself '{}'.", src, dst));
                 }
                 copytree(src, &real_dst)?;
                 rmtree(src)
@@ -681,6 +703,40 @@ mod tests {
         assert_eq!(r, vec!["a.py"]);
         let r: Vec<String> = glob(&join(&root, "src/b.py"), true).iter().map(|m| relpath(m, &root)).collect();
         assert_eq!(r, vec!["src/b.py"]);
+    }
+
+    #[test]
+    fn python_error_strings() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let missing = join(&root, "nope.txt");
+        assert_eq!(read_text(&missing).unwrap_err(), format!("[Errno 2] No such file or directory: {}", py_quote(&missing)));
+        assert_eq!(copy2(&missing, &join(&root, "x")).unwrap_err(), format!("[Errno 2] No such file or directory: {}", py_quote(&missing)));
+        assert_eq!(listdir("").unwrap_err(), "[Errno 2] No such file or directory: ''");
+        makedirs(&root, true).unwrap();
+        assert_eq!(makedirs(&root, false).unwrap_err(), format!("[Errno 17] File exists: {}", py_quote(&root)));
+        let f = join(&root, "a.txt");
+        create_new(&f, b"hi").unwrap();
+        assert_eq!(create_new(&f, b"x").unwrap_err(), format!("[Errno 17] File exists: {}", py_quote(&f)));
+        assert_eq!(read_text(&f).unwrap(), "hi");
+    }
+
+    #[test]
+    fn move_into_self_and_fnmatch_caret() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let src = join(&root, "dir");
+        makedirs(&join(&src, "inner"), false).unwrap();
+        let dst = join(&src, "inner");
+        assert_eq!(
+            shutil_move(&src, &dst).unwrap_err(),
+            format!("Cannot move a directory '{}' into itself '{}'.", src, dst)
+        );
+        // only '!' negates in fnmatch; '^' is a literal inside brackets
+        assert!(fnmatch("^", "[^a]"));
+        assert!(fnmatch("a", "[^a]"));
+        assert!(!fnmatch("b", "[^a]"));
+        assert!(fnmatch("b", "[!a]"));
     }
 
     #[test]

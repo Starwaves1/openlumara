@@ -1,2 +1,6 @@
 //! Port of modules/{shell,coder,mcp}.
-pub fn register(_r: &mut ol_core::registry::Registry) {}
+pub mod pyos;
+
+pub fn register(r: &mut ol_core::registry::Registry) {
+    let _ = r;
+}
