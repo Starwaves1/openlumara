@@ -6,6 +6,7 @@ mod netpolicy;
 mod patterns;
 pub mod pytext;
 pub mod sanitize;
+mod util;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
 

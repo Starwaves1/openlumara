@@ -5,7 +5,8 @@
 //! (`WebReader`, `WebSearch`), which reuse it by composition.
 
 use crate::netpolicy::ip_str_is_blocked;
-use crate::pytext::{py_len, py_prefix, urlencode, urljoin, urlsplit};
+use crate::pytext::{py_len, py_prefix, urlencode, urlsplit};
+use crate::util::{json_dumps, json_loads, sanitize_json, urljoin};
 use crate::sanitize::{py_list_repr, ContentSanitizer, PromptInjectionDetector};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -246,17 +247,21 @@ fn unicode_host(host: &str) -> String {
 }
 
 /// python's `socket.getaddrinfo` runs the host through the idna codec first. An empty label (other than a
-/// trailing one) or a label over 63 bytes raises UnicodeEncodeError, which is not a gaierror.
-fn idna_label_error(hostname: &str) -> Option<&'static str> {
+/// trailing one) or a label over 63 characters raises UnicodeEncodeError, which is not a gaierror. Returns
+/// that exception's text: the position is the character offset (the dot ending an empty label, or the span
+/// of a long label).
+fn idna_label_error(hostname: &str) -> Option<String> {
     let labels: Vec<&str> = hostname.split('.').collect();
+    let mut start = 0usize;
     for (i, label) in labels.iter().enumerate() {
-        if label.is_empty() {
-            if i + 1 != labels.len() {
-                return Some("label empty");
-            }
-        } else if label.len() > 63 {
-            return Some("label too long");
+        let len = label.chars().count();
+        if len == 0 && i + 1 != labels.len() {
+            return Some(format!("'idna' codec can't encode character '\\x2e' in position {}: label empty", start));
         }
+        if len > 63 {
+            return Some(format!("'idna' codec can't encode characters in position {}-{}: label too long", start, start + len - 1));
+        }
+        start += len + 1;
     }
     None
 }
@@ -791,7 +796,7 @@ impl HttpCore {
             return Ok(());
         }
         if let Some(why) = idna_label_error(hostname) {
-            return Err(UrlCheck::Unexpected(format!("UnicodeEncodeError: 'idna' codec can't encode: {}", why)));
+            return Err(UrlCheck::Unexpected(why));
         }
         let infos = match tokio::net::lookup_host((hostname, 0u16)).await {
             Ok(i) => i.collect::<Vec<_>>(),
@@ -839,6 +844,33 @@ impl HttpCore {
             return Err(UrlCheck::Blocked("Blocked localhost access".into()));
         }
         self.resolve_and_validate(hostname).await
+    }
+
+    /// python's `_is_safe_url` on the `urlparse` view of a URL that WHATWG parsing rejects. Same checks in
+    /// the same order; nothing is sent, so a URL that fails them is reported as python reports it.
+    async fn is_safe_url_urlsplit(&self, url: &str) -> Result<(), UrlCheck> {
+        let parsed = urlsplit(url).map_err(|e| UrlCheck::Blocked(format!("URL parse error: {}", e)))?;
+        if !ALLOWED_SCHEMES.contains(&parsed.scheme.as_str()) {
+            return Err(UrlCheck::Blocked(format!("Scheme not allowed: {}", parsed.scheme)));
+        }
+        if self.config.get_bool("https_only") && parsed.scheme != "https" {
+            return Err(UrlCheck::Blocked("HTTPS-only mode is enabled".into()));
+        }
+        let Some(hostname) = parsed.hostname() else {
+            return Err(UrlCheck::Blocked("URL has no hostname".into()));
+        };
+        // python's `parsed.port` raises ValueError here, outside every handler
+        let port = parsed.port().map_err(UrlCheck::Unexpected)?;
+        if let Some(p) = port {
+            if p != 0 && DANGEROUS_PORTS.contains(&p) {
+                return Err(UrlCheck::Blocked(format!("Port {} is blocked", p)));
+            }
+        }
+        self.check_domain_policy(&hostname).map_err(UrlCheck::Blocked)?;
+        if self.config.get_bool("block_local_network_access") && (hostname == "localhost" || hostname == "0.0.0.0") {
+            return Err(UrlCheck::Blocked("Blocked localhost access".into()));
+        }
+        self.resolve_and_validate(&hostname).await
     }
 
     /// Validate URL format, scheme, and port.
@@ -1070,9 +1102,14 @@ impl HttpCore {
 
         let mut current_url = url.to_string();
         for _hop in 0..=MAX_REDIRECTS {
-            // one parse per hop: the Url that is validated is the Url that is sent
-            let mut full = reqwest::Url::parse(&current_url).map_err(|e| Fail::Request(format!("Invalid URL {}: {}", py_repr(&json!(current_url)), e)))?;
-            match self.is_safe_url(&full).await {
+            // one parse per hop: the Url that is validated is the Url that is sent. A URL WHATWG rejects is
+            // still judged by python's check first (python's urlparse accepts it).
+            let parsed = reqwest::Url::parse(&current_url);
+            let check = match &parsed {
+                Ok(u) => self.is_safe_url(u).await,
+                Err(_) => self.is_safe_url_urlsplit(&current_url).await,
+            };
+            match check {
                 Ok(()) => {}
                 Err(UrlCheck::Blocked(err)) => {
                     self.log(&format!("Blocked URL ({}): {}", current_url, err));
@@ -1080,6 +1117,7 @@ impl HttpCore {
                 }
                 Err(UrlCheck::Unexpected(err)) => return Err(Fail::Unexpected(err)),
             }
+            let mut full = parsed.map_err(|e| Fail::Request(format!("Invalid URL {}: {}", py_repr(&json!(current_url)), e)))?;
 
             // requests validates the headers when it prepares the request, after the URL check
             let header_map = build_header_map(headers)?;
@@ -1212,12 +1250,9 @@ impl HttpCore {
             let (content, ctype) = if content_type_header.contains("html") || content_type_header.contains("xml") {
                 (ContentSanitizer::sanitize_html_content(&raw_content), "html_xml")
             } else if content_type_header.contains("json") {
-                match serde_json::from_str::<Value>(&raw_content) {
-                    Ok(parsed) => {
-                        let sanitized = sanitize_json_recursive(&parsed);
-                        (pyjson::dumps_opts(&sanitized, pyjson::DumpOpts { ensure_ascii: false, ..Default::default() }), "json")
-                    }
-                    Err(_) => (ContentSanitizer::sanitize(&raw_content), "text"),
+                match json_loads(&raw_content) {
+                    Some(parsed) => (json_dumps(&sanitize_json(&parsed)), "json"),
+                    None => (ContentSanitizer::sanitize(&raw_content), "text"),
                 }
             } else {
                 (ContentSanitizer::sanitize(&raw_content), "text")
@@ -1286,16 +1321,6 @@ pub fn calculate_instruction_data_ratio(content: &str) -> f64 {
     }
     let count = words.iter().filter(|w| INSTRUCTION_KEYWORDS.contains(w)).count();
     count as f64 / words.len() as f64
-}
-
-/// Recursively sanitize JSON string values.
-pub fn sanitize_json_recursive(v: &Value) -> Value {
-    match v {
-        Value::String(s) => Value::String(ContentSanitizer::sanitize(s)),
-        Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), sanitize_json_recursive(v))).collect()),
-        Value::Array(a) => Value::Array(a.iter().map(sanitize_json_recursive).collect()),
-        other => other.clone(),
-    }
 }
 
 // ============================================================================
@@ -1506,15 +1531,19 @@ mod tests {
 
     #[test]
     fn idna_labels_and_unicode_hosts() {
-        assert_eq!(idna_label_error(&format!("{}.com", "a".repeat(70))), Some("label too long"));
-        assert_eq!(idna_label_error("a..b.com"), Some("label empty"));
+        assert_eq!(
+            idna_label_error(&format!("{}.com", "a".repeat(70))).unwrap(),
+            "'idna' codec can't encode characters in position 0-69: label too long"
+        );
+        assert_eq!(idna_label_error("a..b.com").unwrap(), "'idna' codec can't encode character '\\x2e' in position 2: label empty");
+        assert_eq!(idna_label_error(&format!("ok.{}", "y".repeat(64))).unwrap(), "'idna' codec can't encode characters in position 3-66: label too long");
         assert_eq!(idna_label_error("a.b."), None);
         assert_eq!(unicode_host("xn--bcher-kva.de"), "b\u{fc}cher.de");
     }
 
     #[test]
     fn redirect_locations_join_like_python() {
-        let j = |b: &str, u: &str| crate::pytext::urljoin(b, u).unwrap();
+        let j = |b: &str, u: &str| crate::util::urljoin(b, u).unwrap();
         assert_eq!(j("https://a.com/b/c/", "../../../d?q#f"), "https://a.com/d?q#f");
         assert_eq!(j("http://a.com", "b"), "http://a.com/b");
         assert_eq!(j("http://a.com/x", "//b.com/y"), "http://b.com/y");
@@ -1548,6 +1577,17 @@ mod tests {
         assert!(matches!(core.is_safe_url(&url).await, Err(UrlCheck::Blocked(m)) if m == "Blocked metadata endpoint"));
         let ftp = reqwest::Url::parse("ftp://x.example/").unwrap();
         assert!(matches!(core.is_safe_url(&ftp).await, Err(UrlCheck::Blocked(m)) if m == "Scheme not allowed: ftp"));
+    }
+
+    #[tokio::test]
+    async fn urls_whatwg_rejects_get_python_urlparse_checks() {
+        let core = HttpCore::new(ModuleConfig::new(ol_core::config::ConfigView::new(&["modules", "settings", "http"])));
+        // python's urlparse raises for a malformed IPv6 netloc: a policy result, not an exception
+        assert!(matches!(core.is_safe_url_urlsplit("https://[::1/").await, Err(UrlCheck::Blocked(m)) if m == "URL parse error: Invalid IPv6 URL"));
+        // parsed.port raises ValueError outside any handler: python's generic unexpected-error path
+        assert!(matches!(core.is_safe_url_urlsplit("https://x.com:99999/").await, Err(UrlCheck::Unexpected(m)) if m == "Port out of range 0-65535"));
+        assert!(matches!(core.is_safe_url_urlsplit("https://x.com:abc/").await, Err(UrlCheck::Unexpected(m)) if m == "Port could not be cast to integer value as 'abc'"));
+        assert!(matches!(core.is_safe_url_urlsplit("https://x.com:22/").await, Err(UrlCheck::Blocked(m)) if m == "Port 22 is blocked"));
     }
 
     #[test]
