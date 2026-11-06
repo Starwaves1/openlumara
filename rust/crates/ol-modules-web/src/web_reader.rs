@@ -50,17 +50,22 @@ fn sel(s: &str) -> Selector {
     Selector::parse(s).expect("static CSS selector")
 }
 
-/// bs4 `get_text()`: every descendant text node, except text inside script/style/template
-/// (bs4 gives those their own string types, which `get_text` skips)
+/// bs4 `HTMLTreeBuilder.DEFAULT_STRING_CONTAINERS`: tags whose text gets its own string class
+const STRING_CONTAINERS: &[&str] = &["rt", "rp", "style", "script", "template"];
+
+/// bs4 `get_text()`: a text node belongs to its nearest string-container ancestor (or to plain
+/// text when there is none). `get_text` on a plain element keeps only plain text, while
+/// `get_text` on a container element (e.g. `<rt class="content">`) keeps only its own class.
 fn element_text(el: ElementRef) -> String {
+    let own = STRING_CONTAINERS.iter().copied().find(|s| *s == el.value().name());
     let mut out = String::new();
     for node in el.descendants() {
         if let Node::Text(t) = node.value() {
-            let in_string_container = node.ancestors().any(|a| match a.value() {
-                Node::Element(e) => matches!(e.name(), "script" | "style" | "template"),
-                _ => false,
+            let container = node.ancestors().find_map(|a| match a.value() {
+                Node::Element(e) => STRING_CONTAINERS.iter().copied().find(|s| *s == e.name()),
+                _ => None,
             });
-            if !in_string_container {
+            if container == own {
                 out.push_str(&t.text);
             }
         }
@@ -361,6 +366,22 @@ mod tests {
         let html = r#"<html><body><div class="article-body"><span>Hello world</span></div>
             <div id="main-text">Body</div></body></html>"#;
         assert_eq!(process_webpage(html), json!({"classes": {"text": ["Body"], "article": ["Hello world"]}}));
+    }
+
+    #[test]
+    fn element_text_skips_ruby_annotations_like_bs4() {
+        // bs4 4.15: p.get_text() == '漢x' (rt and rp text is its own string class)
+        assert_eq!(process_webpage("<p>漢<rt>kan</rt><rp>(</rp>x</p>"), json!({"paragraphs": ["漢x"]}));
+        // bs4: div.get_text() == 'A' for the class fallback
+        assert_eq!(process_webpage(r#"<div class="content">A<rt>B</rt></div>"#), json!({"classes": {"content": ["A"]}}));
+    }
+
+    #[test]
+    fn element_text_container_element_keeps_its_own_text() {
+        // bs4: rt.get_text() == 'kan' on a container element, its nested rp text is dropped
+        assert_eq!(process_webpage(r#"<rt class="content">k<rp>(</rp>an</rt>"#), json!({"classes": {"content": ["kan"]}}));
+        // bs4: script.get_text() == 'var a;' on a container element
+        assert_eq!(process_webpage(r#"<script class="content">var a;</script>"#), json!({"classes": {"content": ["var a;"]}}));
     }
 
     #[test]
