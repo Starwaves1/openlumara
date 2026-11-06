@@ -1,6 +1,7 @@
 //! (being ported - see rust/PORTING.md)
 
 pub mod identity;
+pub mod token_threshold;
 pub mod tutorial;
 pub mod util;
 pub mod webui_extension_example;
@@ -35,5 +36,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: webui_extension_example::meta::UNSAFE,
         category: webui_extension_example::meta::CATEGORY,
         factory: webui_extension_example::WebuiExtensionExample::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "token_threshold",
+        class_name: token_threshold::meta::CLASS_NAME,
+        doc: token_threshold::meta::DOC,
+        settings: token_threshold::meta::settings,
+        unsafe_: token_threshold::meta::UNSAFE,
+        category: token_threshold::meta::CATEGORY,
+        factory: token_threshold::TokenThreshold::factory,
     });
 }
