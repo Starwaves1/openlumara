@@ -1,5 +1,6 @@
 //! Port of modules/{shell,coder,mcp}.
 pub mod coder;
+pub mod mcp;
 pub mod pyos;
 pub mod shell;
 
@@ -24,5 +25,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: shell::meta::UNSAFE,
         category: shell::meta::CATEGORY,
         factory: shell::Shell::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "mcp",
+        class_name: mcp::meta::CLASS_NAME,
+        doc: mcp::meta::DOC,
+        settings: mcp::meta::settings,
+        unsafe_: mcp::meta::UNSAFE,
+        category: mcp::meta::CATEGORY,
+        factory: mcp::Mcp::factory,
     });
 }
