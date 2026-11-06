@@ -121,4 +121,15 @@ mod tests {
         );
         assert_eq!(replace_words("nothing here", r).unwrap(), "nothing here");
     }
+
+    #[test]
+    fn word_edges_match_python_regex() {
+        // verified against python regex 2026.11.7: U+0301 (Mn) is \w in both, so "cafe" + combining
+        // acute is one word and the key "cafe" does not match it; '²' (No) is not \w in either,
+        // so it splits "x²y" into two words
+        let r = json!({"cafe": "X", "x": "X"});
+        let r = r.as_object().unwrap();
+        assert_eq!(replace_words("cafe\u{301} x cafe", r).unwrap(), "cafe\u{301} X X");
+        assert_eq!(replace_words("x²y x", r).unwrap(), "X²y X");
+    }
 }
