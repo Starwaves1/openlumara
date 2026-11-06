@@ -9,9 +9,10 @@ use ol_core::storage::{StorageDict, StorageType};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/lists.rs"]
-pub(crate) mod meta;
+pub mod meta;
 
 pub struct Lists {
     base: ModuleBase,
@@ -19,6 +20,10 @@ pub struct Lists {
 }
 
 impl Lists {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, data: Mutex::new(None) }
     }
@@ -178,9 +183,17 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             if !verify_target(data, &category, &list_name) {
                 return ok(NO_LIST);
             }
-            data.data[&category].as_object_mut().unwrap().shift_remove(&list_name);
+            // `del self.data[category][list_name]`: only a dict category supports item deletion
+            let cat = match data.data.get_mut(&category) {
+                Some(Value::Object(m)) => m,
+                Some(Value::Array(_)) => anyhow::bail!("list indices must be integers or slices, not str"),
+                Some(Value::String(_)) => anyhow::bail!("'str' object doesn't support item deletion"),
+                Some(other) => anyhow::bail!("'{}' object doesn't support item deletion", py_type_name(other)),
+                None => anyhow::bail!("{}", crate::util::repr_str(&category)),
+            };
+            cat.shift_remove(&list_name);
             // check if the category still contains any lists. if not, delete the category itself
-            if data.data[&category].as_object().map(|m| m.is_empty()).unwrap_or(false) {
+            if cat.is_empty() {
                 data.data.shift_remove(&category);
             }
             data.save()?;
@@ -204,10 +217,20 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
                 let Value::Object(category) = category else { continue };
                 for (list_name, lst) in category {
                     let Value::Object(lst) = lst else { continue };
-                    let items: Vec<&str> = match lst.get("items") {
-                        Some(Value::Array(a)) => a.iter().filter_map(|i| i.as_str()).filter(|i| !i.trim().is_empty()).collect(),
-                        _ => Vec::new(),
+                    // `[i for i in lst.get("items", []) if isinstance(i, str) and i.strip()]`
+                    let raw_items: Vec<Value> = match lst.get("items") {
+                        None => Vec::new(),
+                        Some(Value::Array(a)) => a.clone(),
+                        Some(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+                        Some(Value::Object(m)) => m.keys().map(|k| Value::String(k.clone())).collect(),
+                        Some(other) => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
                     };
+                    let items: Vec<String> = raw_items
+                        .iter()
+                        .filter_map(|i| i.as_str())
+                        .filter(|i| !i.trim().is_empty())
+                        .map(|i| i.to_string())
+                        .collect();
                     list_entries.push(json!({"name": format!("[{}] {}", category_name, list_name), "items": items.len()}));
                     for item in items {
                         item_entries.push(json!({"category": category_name, "list": list_name, "item": item}));
@@ -373,5 +396,44 @@ mod tests {
         // persisted as yaml
         let text = std::fs::read_to_string(dir.path().join("lists.yml")).unwrap();
         assert!(text.contains("shopping"), "{}", text);
+    }
+
+    #[test]
+    fn prompt_caps_lists_and_skips_empty_ones() {
+        let mut data = Map::new();
+        data.insert("home".into(), json!({
+            "empty": {"items": [], "pinned": true},
+            "shopping": {"items": ["milk"], "pinned": true},
+        }));
+        data.insert("work".into(), json!({
+            "todo": {"items": ["report"], "pinned": false},
+        }));
+        // categories are walked in reverse (work, then home); lists inside a category in order.
+        // work/todo takes slot 1, home/empty takes slot 2 (skipped but counted), home/shopping takes slot 3.
+        let prompt = system_prompt(&data, &json!(3)).unwrap();
+        assert_eq!(prompt, "## home\n### shopping\n- milk\n---\nlists that aren't pinned:\nwork: todo\n");
+        // cap 2 breaks before home/shopping, so the pinned list is cut off and the prompt has no pinned section
+        let prompt = system_prompt(&data, &json!(2)).unwrap();
+        assert_eq!(prompt, "---\nlists that aren't pinned:\nwork: todo\n");
+    }
+
+    #[test]
+    fn missing_and_non_dict_targets_report_python_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        let r = run(&base, &mut d, "search", &args(json!({"query": "zzzqx"}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching 'zzzqx'"}));
+        let r = run(&base, &mut d, "pin", &args(json!({"category": "nope", "list_name": "x"}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "that list doesn't exist"}));
+        // a list-valued category passes the `in` membership check; delete must error, not panic
+        // get() reloads from disk, so the odd category has to be saved to be seen
+        d.data.insert("odd".into(), json!(["todo"]));
+        d.save().unwrap();
+        let err = run(&base, &mut d, "delete", &args(json!({"category": "odd", "list_name": "todo"}))).unwrap_err();
+        assert_eq!(err.to_string(), "list indices must be integers or slices, not str");
+        let err = run(&base, &mut d, "create", &args(json!({"category": "odd", "name": "todo"}))).unwrap_err();
+        assert_eq!(err.to_string(), "'list' object has no attribute 'keys'");
     }
 }
