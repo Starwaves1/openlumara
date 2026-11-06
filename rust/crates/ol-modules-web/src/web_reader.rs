@@ -8,16 +8,18 @@
 #[path = "../../../generated/modules/web_reader.rs"]
 pub mod meta;
 
+mod html_parser;
+
 use crate::http::{HttpCore, Method, RequestOpts};
-use crate::pytext::{py_strip, urlsplit};
+use crate::pytext::{py_split, py_strip, urlsplit};
 use crate::sanitize::ContentSanitizer;
 use crate::util::py_type_name;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
+use html_parser::Document;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::truthy;
 use regex::Regex;
-use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -46,64 +48,38 @@ pub struct WebReader {
     core: HttpCore,
 }
 
-fn sel(s: &str) -> Selector {
-    Selector::parse(s).expect("static CSS selector")
-}
-
-/// bs4 `HTMLTreeBuilder.DEFAULT_STRING_CONTAINERS`: tags whose text gets its own string class
-const STRING_CONTAINERS: &[&str] = &["rt", "rp", "style", "script", "template"];
-
-/// bs4 `get_text()`: a text node belongs to its nearest string-container ancestor (or to plain
-/// text when there is none). `get_text` on a plain element keeps only plain text, while
-/// `get_text` on a container element (e.g. `<rt class="content">`) keeps only its own class.
-fn element_text(el: ElementRef) -> String {
-    let own = STRING_CONTAINERS.iter().copied().find(|s| *s == el.value().name());
-    let mut out = String::new();
-    for node in el.descendants() {
-        if let Node::Text(t) = node.value() {
-            let container = node.ancestors().find_map(|a| match a.value() {
-                Node::Element(e) => STRING_CONTAINERS.iter().copied().find(|s| *s == e.name()),
-                _ => None,
-            });
-            if container == own {
-                out.push_str(&t.text);
-            }
-        }
-    }
-    out
-}
-
 /// python `_remove_duplicates`: keep the first occurrence of each item, in order
 fn dedupe(items: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     items.into_iter().filter(|s| seen.insert(s.clone())).collect()
 }
 
-/// python `find_all(class_=re.compile(...))` and `find_all(id=re.compile(...))` text collection
-fn fallback_classes(doc: &Html) -> Map<String, Value> {
-    let all = sel("*");
+/// python `element.text.strip()` if non-empty, appended to `items`
+fn push_stripped_text(doc: &Document, el: usize, items: &mut Vec<String>) {
+    let text = doc.get_text(el);
+    let stripped = py_strip(&text);
+    if !stripped.is_empty() {
+        items.push(stripped.to_string());
+    }
+}
+
+/// python `_process_webpage` class/id fallback: `{name: [text, ...]}` for names with matches
+fn fallback_classes(doc: &Document) -> Map<String, Value> {
+    let all = doc.elements(|_| true);
     let mut out = Map::new();
     for name in FALLBACK_NAMES {
         let re = Regex::new(&format!(r"\b{}\b", name)).expect("static pattern");
         let mut items: Vec<String> = Vec::new();
-        // class_: bs4 matches each class token of a multi-valued attribute
-        for el in doc.select(&all) {
-            let hit = el.attr("class").map(|c| c.split_whitespace().any(|t| re.is_match(t))).unwrap_or(false);
-            if hit {
-                let text = element_text(el);
-                if !py_strip(&text).is_empty() {
-                    items.push(py_strip(&text).to_string());
-                }
+        // find_all(class_=re): bs4 matches any class token of the multi-valued class attribute
+        for &el in &all {
+            if doc.attr(el, "class").is_some_and(|c| py_split(c).iter().any(|t| re.is_match(t))) {
+                push_stripped_text(doc, el, &mut items);
             }
         }
-        // id: the id string itself
-        for el in doc.select(&all) {
-            let hit = el.attr("id").map(|i| re.is_match(i)).unwrap_or(false);
-            if hit {
-                let text = element_text(el);
-                if !py_strip(&text).is_empty() {
-                    items.push(py_strip(&text).to_string());
-                }
+        // find_all(id=re)
+        for &el in &all {
+            if doc.attr(el, "id").is_some_and(|i| re.is_match(i)) {
+                push_stripped_text(doc, el, &mut items);
             }
         }
         let items = dedupe(items);
@@ -116,26 +92,34 @@ fn fallback_classes(doc: &Html) -> Map<String, Value> {
 }
 
 /// python `_process_webpage(html)`: structured summary of an HTML/XML document
-fn process_webpage(html: &str) -> Value {
-    let doc = Html::parse_document(html);
+fn process_webpage(html: &str) -> anyhow::Result<Value> {
+    let doc = html_parser::parse(html).map_err(|e| anyhow!(e))?;
     let mut output = Map::new();
 
-    if let Some(title) = doc.select(&sel("title")).next() {
-        output.insert("title".into(), json!(py_strip(&element_text(title))));
+    if let Some(&title) = doc.elements(|n| n == "title").first() {
+        output.insert("title".into(), json!(py_strip(&doc.get_text(title))));
     }
 
     let headers = dedupe(
-        doc.select(&sel("h1, h2, h3, h4, h5, h6")).map(|e| py_strip(&element_text(e)).to_string()).collect(),
+        doc.elements(|n| matches!(n, "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
+            .into_iter()
+            .map(|e| py_strip(&doc.get_text(e)).to_string())
+            .collect(),
     );
-    let paragraphs = dedupe(doc.select(&sel("p")).map(|e| py_strip(&element_text(e)).to_string()).collect());
+    let paragraphs = dedupe(
+        doc.elements(|n| n == "p").into_iter().map(|e| py_strip(&doc.get_text(e)).to_string()).collect(),
+    );
     let images = dedupe(
-        doc.select(&sel("img"))
-            .filter_map(|e| e.attr("alt"))
+        doc.elements(|n| n == "img")
+            .into_iter()
+            .filter_map(|e| doc.attr(e, "alt"))
             .filter(|alt| !alt.is_empty())
             .map(|s| s.to_string())
             .collect(),
     );
-    let urls = dedupe(doc.select(&sel("a[href]")).filter_map(|e| e.attr("href")).map(|s| s.to_string()).collect());
+    let urls = dedupe(
+        doc.elements(|n| n == "a").into_iter().filter_map(|e| doc.attr(e, "href")).map(|s| s.to_string()).collect(),
+    );
 
     let sanitize_all = |items: &[String]| -> Value {
         Value::Array(items.iter().map(|s| json!(ContentSanitizer::sanitize_html_content(s))).collect())
@@ -162,7 +146,7 @@ fn process_webpage(html: &str) -> Value {
         }
     }
 
-    Value::Object(output)
+    Ok(Value::Object(output))
 }
 
 /// python `for x in iterable` over a tool argument
@@ -250,7 +234,7 @@ impl WebReader {
         }
 
         let output = if content_type.contains("html") || content_type.contains("xml") {
-            process_webpage(file_content)
+            process_webpage(file_content)?
         } else {
             json!({"text": file_content})
         };
@@ -258,13 +242,13 @@ impl WebReader {
         Ok(self.base.result(wrapped, true))
     }
 
-    /// python `read_multiple(paths)`: results in input order, at most max_concurrent_tasks in flight
+    /// python `read_multiple(paths)`: results in input order, at most max_concurrent_tasks in flight.
+    /// The first error ends the call, as python's `asyncio.gather` does.
     pub async fn read_multiple(&self, paths: &Value) -> anyhow::Result<Value> {
         let permits = self.max_concurrent_tasks()?;
         let items = py_iterate(paths)?;
         let sem = Semaphore::new(permits);
-        let outcomes = futures::future::join_all(items.into_iter().map(|p| self.handle_one(&sem, p))).await;
-        let results = outcomes.into_iter().collect::<anyhow::Result<Vec<Value>>>()?;
+        let results = futures::future::try_join_all(items.into_iter().map(|p| self.handle_one(&sem, p))).await?;
         Ok(self.base.result(Value::Array(results), true))
     }
 
@@ -352,7 +336,7 @@ mod tests {
         let html = r#"<html><head><title> T </title><script>var x=1;</script></head>
             <body><h1>Head</h1><p>Para one</p><p>Para one</p><img alt="pic"><img alt="">
             <a href="/a">a</a><a href="/a">a</a></body></html>"#;
-        let out = process_webpage(html);
+        let out = process_webpage(html).unwrap();
         assert_eq!(
             out,
             json!({"title": "T", "headers": ["Head"], "paragraphs": ["Para one"], "images": ["pic"], "urls": ["/a"]})
@@ -365,27 +349,27 @@ mod tests {
     fn process_webpage_falls_back_to_class_and_id_text() {
         let html = r#"<html><body><div class="article-body"><span>Hello world</span></div>
             <div id="main-text">Body</div></body></html>"#;
-        assert_eq!(process_webpage(html), json!({"classes": {"text": ["Body"], "article": ["Hello world"]}}));
+        assert_eq!(process_webpage(html).unwrap(), json!({"classes": {"text": ["Body"], "article": ["Hello world"]}}));
     }
 
     #[test]
-    fn element_text_skips_ruby_annotations_like_bs4() {
-        // bs4 4.15: p.get_text() == '漢x' (rt and rp text is its own string class)
-        assert_eq!(process_webpage("<p>漢<rt>kan</rt><rp>(</rp>x</p>"), json!({"paragraphs": ["漢x"]}));
-        // bs4: div.get_text() == 'A' for the class fallback
-        assert_eq!(process_webpage(r#"<div class="content">A<rt>B</rt></div>"#), json!({"classes": {"content": ["A"]}}));
+    fn process_webpage_text_follows_bs4_html_parser() {
+        // bs4 with html.parser: ruby annotations are their own string class and are skipped
+        assert_eq!(process_webpage("<p>漢<rt>kan</rt><rp>(</rp>x</p>").unwrap(), json!({"paragraphs": ["漢x"]}));
+        // a container element matched by the fallback keeps its own text
+        assert_eq!(process_webpage(r#"<div class="content">A<rt>B</rt></div>"#).unwrap(), json!({"classes": {"content": ["A"]}}));
+        assert_eq!(process_webpage(r#"<rt class="content">k<rp>(</rp>an</rt>"#).unwrap(), json!({"classes": {"content": ["kan"]}}));
+        assert_eq!(process_webpage(r#"<script class="content">var a;</script>"#).unwrap(), json!({"classes": {"content": ["var a;"]}}));
     }
 
     #[test]
-    fn element_text_container_element_keeps_its_own_text() {
-        // bs4: rt.get_text() == 'kan' on a container element, its nested rp text is dropped
-        assert_eq!(process_webpage(r#"<rt class="content">k<rp>(</rp>an</rt>"#), json!({"classes": {"content": ["kan"]}}));
-        // bs4: script.get_text() == 'var a;' on a container element
-        assert_eq!(process_webpage(r#"<script class="content">var a;</script>"#), json!({"classes": {"content": ["var a;"]}}));
+    fn process_webpage_nested_paragraphs_keep_nesting() {
+        // html.parser does not close the first <p>, so its text includes the nested one
+        assert_eq!(process_webpage("<p>1<p>2</p></p>").unwrap(), json!({"paragraphs": ["12", "2"]}));
     }
 
     #[test]
     fn process_webpage_reports_when_nothing_is_scraped() {
-        assert_eq!(process_webpage("<html><body></body></html>"), json!({"message": "nothing could be scraped from the page!"}));
+        assert_eq!(process_webpage("<html><body></body></html>").unwrap(), json!({"message": "nothing could be scraped from the page!"}));
     }
 }
