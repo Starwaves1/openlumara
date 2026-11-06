@@ -1,6 +1,6 @@
 //! Port of modules/lists/module.py
 
-use crate::util::py_type_name;
+use crate::util::{py_strip, py_type_name, repr_str};
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
@@ -8,6 +8,7 @@ use ol_core::pyjson::{py_str, truthy};
 use ol_core::storage::{StorageDict, StorageType};
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
@@ -35,6 +36,43 @@ fn no_attr(v: &Value, attr: &str) -> anyhow::Error {
     anyhow::anyhow!("'{}' object has no attribute '{}'", py_type_name(v), attr)
 }
 
+/// python's type name for a subscript key: a str key, or None
+fn key_type(key: Option<&str>) -> &'static str {
+    if key.is_some() {
+        "str"
+    } else {
+        "NoneType"
+    }
+}
+
+/// python's TypeError for `container[key]` when the container is not a dict. `set` selects item
+/// assignment (`container[key] = v`) over a read (`container[key]`)
+fn index_err(container: &Value, key: Option<&str>, set: bool) -> anyhow::Error {
+    match container {
+        Value::Array(_) => anyhow::anyhow!("list indices must be integers or slices, not {}", key_type(key)),
+        Value::String(_) if set => anyhow::anyhow!("'str' object does not support item assignment"),
+        Value::String(_) => anyhow::anyhow!("string indices must be integers, not '{}'", key_type(key)),
+        other if set => anyhow::anyhow!("'{}' object does not support item assignment", py_type_name(other)),
+        other => anyhow::anyhow!("'{}' object is not subscriptable", py_type_name(other)),
+    }
+}
+
+/// python's KeyError for a missing key; str(KeyError(None)) is "None"
+fn key_error(key: Option<&str>) -> anyhow::Error {
+    match key {
+        Some(k) => anyhow::anyhow!("{}", repr_str(k)),
+        None => anyhow::anyhow!("None"),
+    }
+}
+
+/// a dict that can be subscripted or item-assigned; anything else raises python's TypeError
+fn dict_mut<'a>(container: &'a mut Value, key: Option<&str>, set: bool) -> anyhow::Result<&'a mut Map<String, Value>> {
+    match container {
+        Value::Object(m) => Ok(m),
+        other => Err(index_err(other, key, set)),
+    }
+}
+
 /// the pinned-lists system prompt (python on_system_prompt body)
 pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::Result<String> {
     let mut output = String::new();
@@ -60,9 +98,11 @@ pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::R
                 continue;
             }
             if lst.get("pinned").map(truthy).unwrap_or(false) {
+                // python joins over the items: a str yields characters, a dict yields its keys
                 let items = match items {
                     Value::Array(a) => a,
                     Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+                    Value::Object(m) => m.keys().map(|k| Value::String(k.clone())).collect(),
                     other => anyhow::bail!("'{}' object is not iterable", py_type_name(&other)),
                 };
                 pinned_by_cat.entry(cat.clone()).or_default().push((name.clone(), items));
@@ -88,81 +128,118 @@ pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::R
     Ok(output)
 }
 
-fn verify_target(data: &mut StorageDict, category: &str, list_name: &str) -> bool {
+/// python `_verify_target`: `category not in self.data`, then `list_name not in self.data.get(category, {})`.
+/// a None category is never a key. `in` on a non-container category raises, as python does.
+fn verify_target(data: &mut StorageDict, category: Option<&str>, list_name: Option<&str>) -> anyhow::Result<bool> {
+    let Some(category) = category else { return Ok(false) };
     if !data.data.contains_key(category) {
-        return false;
+        return Ok(false);
     }
-    // python: `list_name not in self.data.get(category, {})` (StorageDict.get reloads from disk)
-    match data.get(category) {
-        Some(Value::Object(m)) => m.contains_key(list_name),
-        Some(Value::Array(a)) => a.contains(&Value::String(list_name.to_string())),
-        Some(Value::String(s)) => s.contains(list_name),
-        _ => false,
-    }
-}
-
-fn create_if_non_existent(data: &mut StorageDict, category: &str, list_name: &str) -> anyhow::Result<bool> {
-    if !verify_target(data, category, list_name) {
-        if !data.data.contains_key(category) {
-            data.data.insert(category.to_string(), json!({}));
+    // StorageDict.get reloads from disk before the lookup
+    let Some(container) = data.get(category).cloned() else { return Ok(false) };
+    match &container {
+        Value::Object(m) => Ok(list_name.is_some_and(|n| m.contains_key(n))),
+        Value::Array(a) => {
+            let needle = list_name.map(|n| Value::String(n.to_string())).unwrap_or(Value::Null);
+            Ok(a.contains(&needle))
         }
-        let cat = data.data.get_mut(category).unwrap();
-        let cat = match cat {
-            Value::Object(m) => m,
-            other => anyhow::bail!("'{}' object does not support item assignment", py_type_name(other)),
-        };
-        cat.insert(list_name.to_string(), json!({"items": [], "pinned": false}));
-        data.save()?;
-        return Ok(true);
+        Value::String(s) => match list_name {
+            Some(n) => Ok(s.contains(n)),
+            None => anyhow::bail!("'in <string>' requires string as left operand, not NoneType"),
+        },
+        other => anyhow::bail!("argument of type '{}' is not iterable", py_type_name(other)),
     }
-    Ok(false)
 }
 
-fn find_item(items: &[Value], starts_with: &str) -> anyhow::Result<Option<usize>> {
-    let needle = starts_with.trim().to_lowercase();
-    for (index, item) in items.iter().enumerate() {
-        let s = item.as_str().ok_or_else(|| no_attr(item, "strip"))?;
-        if s.trim().to_lowercase().starts_with(&needle) {
+/// python `_create_if_non_existent`: adds an empty list when the target is missing
+fn create_if_non_existent(data: &mut StorageDict, category: &str, list_name: &str) -> anyhow::Result<bool> {
+    if verify_target(data, Some(category), Some(list_name))? {
+        return Ok(false);
+    }
+    let cat = data.data.entry(category.to_string()).or_insert_with(|| json!({}));
+    match cat {
+        Value::Object(m) => {
+            m.insert(list_name.to_string(), json!({"items": [], "pinned": false}));
+        }
+        other => return Err(index_err(other, Some(list_name), true)),
+    }
+    data.save()?;
+    Ok(true)
+}
+
+/// a None category or list name would be stored under a None key, which lists.yml string keys cannot hold
+fn stored_key(key: Option<String>, what: &str) -> anyhow::Result<String> {
+    key.ok_or_else(|| anyhow::anyhow!("unsupported: a null {} cannot be stored in lists.yml (python would use a None key)", what))
+}
+
+/// python `self.data[category][list_name]`: the category is subscripted by name, then the list.
+/// `set` marks the outer read as item assignment, which only matters for error text
+fn entry_mut<'a>(data: &'a mut StorageDict, category: Option<&str>, list_name: Option<&str>, set: bool) -> anyhow::Result<&'a mut Value> {
+    let cat = category.and_then(|c| data.data.get_mut(c)).ok_or_else(|| key_error(category))?;
+    match cat {
+        Value::Object(m) => list_name.and_then(|n| m.get_mut(n)).ok_or_else(|| key_error(list_name)),
+        other => Err(index_err(other, list_name, set)),
+    }
+}
+
+/// python `target_list["items"]`
+fn items_of(target: &mut Value) -> anyhow::Result<&mut Value> {
+    let map = dict_mut(target, Some("items"), false)?;
+    map.get_mut("items").ok_or_else(|| anyhow::anyhow!("'items'"))
+}
+
+fn empty_choice() -> anyhow::Error {
+    anyhow::anyhow!("Cannot choose from an empty sequence")
+}
+
+/// python `_find_item`: the first index whose item, stripped and lowercased, starts with the
+/// stripped, lowercased prefix. enumerate() yields characters for a str and keys for a dict
+fn find_item(items: &Value, starts_with: Option<&str>) -> anyhow::Result<Option<usize>> {
+    let pieces: Vec<Value> = match items {
+        Value::Array(a) => a.clone(),
+        Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+        Value::Object(m) => m.keys().map(|k| Value::String(k.clone())).collect(),
+        other => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
+    };
+    for (index, item) in pieces.iter().enumerate() {
+        let text = item.as_str().ok_or_else(|| no_attr(item, "strip"))?;
+        let prefix = starts_with.ok_or_else(|| anyhow::anyhow!("'NoneType' object has no attribute 'strip'"))?;
+        if py_strip(text).to_lowercase().starts_with(&py_strip(prefix).to_lowercase()) {
             return Ok(Some(index));
         }
     }
     Ok(None)
 }
 
-/// `self.data[category][list_name]` as a mutable dict
-fn target<'a>(data: &'a mut StorageDict, category: &str, list_name: &str) -> anyhow::Result<&'a mut Map<String, Value>> {
-    let lst = data
-        .data
-        .get_mut(category)
-        .and_then(|c| c.as_object_mut())
-        .and_then(|c| c.get_mut(list_name))
-        .ok_or_else(|| anyhow::anyhow!("{}", crate::util::repr_str(list_name)))?;
-    match lst {
-        Value::Object(m) => Ok(m),
-        other => anyhow::bail!("'{}' object is not subscriptable", py_type_name(other)),
-    }
-}
-
-/// `target_list["items"]` as a mutable list
-fn items_mut(lst: &mut Map<String, Value>) -> anyhow::Result<&mut Vec<Value>> {
-    match lst.get_mut("items") {
-        Some(Value::Array(a)) => Ok(a),
-        Some(other) => Err(no_attr(other, "append")),
-        None => anyhow::bail!("'items'"),
+/// python `random.choice(seq)` for any items value
+fn random_choice(items: &Value) -> anyhow::Result<Value> {
+    let mut rng = rand::thread_rng();
+    match items {
+        Value::Array(a) => a.choose(&mut rng).cloned().ok_or_else(empty_choice),
+        Value::String(s) => {
+            let chars: Vec<char> = s.chars().collect();
+            chars.choose(&mut rng).map(|c| Value::String(c.to_string())).ok_or_else(empty_choice)
+        }
+        Value::Object(m) => {
+            if m.is_empty() {
+                return Err(empty_choice());
+            }
+            // python indexes the dict by a random position, which is never a key, so it raises KeyError(position)
+            let position = rng.gen_range(0..m.len());
+            Err(anyhow::anyhow!("{}", position))
+        }
+        other => anyhow::bail!("object of type '{}' has no len()", py_type_name(other)),
     }
 }
 
 /// the lists tools, operating on a storage dict
 pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolArgs) -> anyhow::Result<Value> {
-    let s = |k: &str| args.str(k).unwrap_or_else(|| "None".into());
     let ok = |m: &str| Ok(base.result(json!(m), true));
     match method {
         "create" => {
-            let (category, name) = (s("category"), s("name"));
-            if !data.data.contains_key(&category) {
-                data.data.insert(category.clone(), json!({}));
-            }
-            let cat = match data.data.get_mut(&category).unwrap() {
+            let category = stored_key(args.str("category"), "category")?;
+            let name = stored_key(args.str("name"), "name")?;
+            let cat = match data.data.entry(category).or_insert_with(|| json!({})) {
                 Value::Object(m) => m,
                 other => return Err(no_attr(other, "keys")),
             };
@@ -173,43 +250,50 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
                 Some(v) if truthy(v) => v.clone(),
                 _ => json!([]),
             };
-            let pinned = args.raw("pinned").cloned().unwrap_or(json!(false));
+            // python stores the pinned argument as given, so an explicit null stays null
+            let pinned = args.0.get("pinned").cloned().unwrap_or(json!(false));
             cat.insert(name, json!({"items": items, "pinned": pinned}));
             data.save()?;
             ok("list created!")
         }
         "delete" => {
-            let (category, list_name) = (s("category"), s("list_name"));
-            if !verify_target(data, &category, &list_name) {
+            let category = args.str("category");
+            let list_name = args.str("list_name");
+            if !verify_target(data, category.as_deref(), list_name.as_deref())? {
                 return ok(NO_LIST);
             }
+            // verify_target is false for a None category, so it is Some here
+            let Some(cat_key) = category.as_deref() else { return ok(NO_LIST) };
             // `del self.data[category][list_name]`: only a dict category supports item deletion
-            let cat = match data.data.get_mut(&category) {
+            let cat = match data.data.get_mut(cat_key) {
                 Some(Value::Object(m)) => m,
-                Some(Value::Array(_)) => anyhow::bail!("list indices must be integers or slices, not str"),
+                Some(Value::Array(_)) => anyhow::bail!("list indices must be integers or slices, not {}", key_type(list_name.as_deref())),
                 Some(Value::String(_)) => anyhow::bail!("'str' object doesn't support item deletion"),
                 Some(other) => anyhow::bail!("'{}' object doesn't support item deletion", py_type_name(other)),
-                None => anyhow::bail!("{}", crate::util::repr_str(&category)),
+                None => return Err(key_error(Some(cat_key))),
             };
-            cat.shift_remove(&list_name);
+            let Some(list_name) = list_name.as_deref() else { return Err(key_error(None)) };
+            cat.shift_remove(list_name);
             // check if the category still contains any lists. if not, delete the category itself
             if cat.is_empty() {
-                data.data.shift_remove(&category);
+                data.data.shift_remove(cat_key);
             }
             data.save()?;
             ok("list deleted!")
         }
         "pin" | "unpin" => {
-            let (category, list_name) = (s("category"), s("list_name"));
-            if !verify_target(data, &category, &list_name) {
+            let category = args.str("category");
+            let list_name = args.str("list_name");
+            if !verify_target(data, category.as_deref(), list_name.as_deref())? {
                 return ok(NO_LIST);
             }
-            target(data, &category, &list_name)?.insert("pinned".into(), json!(method == "pin"));
+            let entry = entry_mut(data, category.as_deref(), list_name.as_deref(), false)?;
+            dict_mut(entry, Some("pinned"), true)?.insert("pinned".into(), json!(method == "pin"));
             data.save()?;
             ok(if method == "pin" { "list pinned!" } else { "list unpinned!" })
         }
         "search" => {
-            let query = s("query");
+            let query = args.str_or("query", "None");
             data.load();
             let mut list_entries = Vec::new();
             let mut item_entries = Vec::new();
@@ -228,7 +312,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
                     let items: Vec<String> = raw_items
                         .iter()
                         .filter_map(|i| i.as_str())
-                        .filter(|i| !i.trim().is_empty())
+                        .filter(|i| !py_strip(i).is_empty())
                         .map(|i| i.to_string())
                         .collect();
                     list_entries.push(json!({"name": format!("[{}] {}", category_name, list_name), "items": items.len()}));
@@ -264,55 +348,75 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             ok(&lines.join("\n"))
         }
         "get" => {
-            let (category, list_name) = (s("category"), s("list_name"));
-            if !verify_target(data, &category, &list_name) {
+            let category = args.str("category");
+            let list_name = args.str("list_name");
+            if !verify_target(data, category.as_deref(), list_name.as_deref())? {
                 return ok(NO_LIST);
             }
-            let lst = target(data, &category, &list_name)?;
-            Ok(base.result(lst.get("items").cloned().unwrap_or(Value::Null), true))
+            match entry_mut(data, category.as_deref(), list_name.as_deref(), false)? {
+                Value::Object(m) => Ok(base.result(m.get("items").cloned().unwrap_or(Value::Null), true)),
+                other => Err(no_attr(other, "get")),
+            }
         }
         "add_item" => {
-            let (category, list_name) = (s("category"), s("list_name"));
-            let item = args.raw("item_content").cloned().unwrap_or(Value::Null);
+            let category = stored_key(args.str("category"), "category")?;
+            let list_name = stored_key(args.str("list_name"), "list_name")?;
+            // python stores item_content as given, so a null is appended as null
+            let content = args.0.get("item_content").cloned().unwrap_or(Value::Null);
             create_if_non_existent(data, &category, &list_name)?;
-            items_mut(target(data, &category, &list_name)?)?.push(item);
+            let entry = entry_mut(data, Some(&category), Some(&list_name), false)?;
+            match items_of(entry)? {
+                Value::Array(a) => a.push(content),
+                other => return Err(no_attr(other, "append")),
+            }
             data.save()?;
             ok("list item added!")
         }
         "edit_item" | "delete_item" => {
-            let (category, list_name, starts) = (s("category"), s("list_name"), s("item_starts_with"));
-            if !verify_target(data, &category, &list_name) {
+            let category = args.str("category");
+            let list_name = args.str("list_name");
+            let starts = args.str("item_starts_with");
+            if !verify_target(data, category.as_deref(), list_name.as_deref())? {
                 return ok(NO_LIST);
             }
-            let lst = target(data, &category, &list_name)?;
-            let items = match lst.get_mut("items") {
-                Some(Value::Array(a)) => a,
-                Some(other) => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
-                None => anyhow::bail!("'items'"),
-            };
-            let Some(found) = find_item(items, &starts)? else {
+            let entry = entry_mut(data, category.as_deref(), list_name.as_deref(), false)?;
+            let items = items_of(entry)?;
+            let Some(found) = find_item(&*items, starts.as_deref())? else {
                 return Ok(base.result(json!("could not find that list item"), false));
             };
             if method == "edit_item" {
-                items[found] = args.raw("item_content").cloned().unwrap_or(Value::Null);
+                let content = args.0.get("item_content").cloned().unwrap_or(Value::Null);
+                match items {
+                    Value::Array(a) => a[found] = content,
+                    Value::String(_) => anyhow::bail!("'str' object does not support item assignment"),
+                    _ => anyhow::bail!(
+                        "unsupported: list items is a mapping, so assigning key {} would add a non-string key that lists.yml cannot hold",
+                        found
+                    ),
+                }
+                data.save()?;
+                ok("list item edited!")
             } else {
-                items.remove(found);
+                match items {
+                    Value::Array(a) => {
+                        a.remove(found);
+                    }
+                    Value::String(_) => anyhow::bail!("'str' object has no attribute 'pop'"),
+                    // dict.pop(position) with string keys raises KeyError(position)
+                    _ => return Err(anyhow::anyhow!("{}", found)),
+                }
+                data.save()?;
+                ok("list item deleted!")
             }
-            data.save()?;
-            ok(if method == "edit_item" { "list item edited!" } else { "list item deleted!" })
         }
         "get_random_item" => {
-            let (category, list_name) = (s("category"), s("list_name"));
-            if !verify_target(data, &category, &list_name) {
+            let category = args.str("category");
+            let list_name = args.str("list_name");
+            if !verify_target(data, category.as_deref(), list_name.as_deref())? {
                 return ok(NO_LIST);
             }
-            let lst = target(data, &category, &list_name)?;
-            let items = match lst.get("items") {
-                Some(Value::Array(a)) => a,
-                Some(other) => anyhow::bail!("object of type '{}' has no len()", py_type_name(other)),
-                None => anyhow::bail!("'items'"),
-            };
-            let choice = items.choose(&mut rand::thread_rng()).cloned().ok_or_else(|| anyhow::anyhow!("Cannot choose from an empty sequence"))?;
+            let entry = entry_mut(data, category.as_deref(), list_name.as_deref(), false)?;
+            let choice = random_choice(&*items_of(entry)?)?;
             Ok(base.result(choice, true))
         }
         _ => anyhow::bail!("'Lists' object has no attribute '{}'", method),
@@ -435,5 +539,72 @@ mod tests {
         assert_eq!(err.to_string(), "list indices must be integers or slices, not str");
         let err = run(&base, &mut d, "create", &args(json!({"category": "odd", "name": "todo"}))).unwrap_err();
         assert_eq!(err.to_string(), "'list' object has no attribute 'keys'");
+    }
+
+    #[test]
+    fn non_container_category_raises_like_python_in_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        d.data.insert("bad".into(), json!(5));
+        d.save().unwrap();
+        // python: `list_name not in 5` raises instead of reporting a missing list
+        let err = run(&base, &mut d, "pin", &args(json!({"category": "bad", "list_name": "x"}))).unwrap_err();
+        assert_eq!(err.to_string(), "argument of type 'int' is not iterable");
+        let err = run(&base, &mut d, "get", &args(json!({"category": "bad", "list_name": "x"}))).unwrap_err();
+        assert_eq!(err.to_string(), "argument of type 'int' is not iterable");
+        // a null category is never a key, so the list is simply not found
+        let r = run(&base, &mut d, "get", &args(json!({"category": null, "list_name": "x"}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "that list doesn't exist"}));
+    }
+
+    #[test]
+    fn stored_values_match_python_for_null_pinned_and_string_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        let r = run(&base, &mut d, "create", &args(json!({"category": "home", "name": "shopping", "items": "milk", "pinned": null}))).unwrap();
+        assert_eq!(r["content"], "list created!");
+        // python stores pinned=None as given, and keeps a str items value as a str
+        assert_eq!(d.data["home"]["shopping"], json!({"items": "milk", "pinned": null}));
+        // random.choice on a str returns one character of it
+        let r = run(&base, &mut d, "get_random_item", &args(json!({"category": "home", "list_name": "shopping"}))).unwrap();
+        let c = r["content"].as_str().unwrap();
+        assert!("milk".contains(c) && c.chars().count() == 1, "{}", c);
+        // no matching character: python reports "could not find" without raising
+        let r = run(&base, &mut d, "edit_item", &args(json!({"category": "home", "list_name": "shopping", "item_starts_with": "z", "item_content": "x"}))).unwrap();
+        assert_eq!(r, json!({"status": "error", "content": "could not find that list item"}));
+        // a matching character reaches python's str item assignment and delete errors
+        let err = run(&base, &mut d, "edit_item", &args(json!({"category": "home", "list_name": "shopping", "item_starts_with": "m", "item_content": "x"}))).unwrap_err();
+        assert_eq!(err.to_string(), "'str' object does not support item assignment");
+        let err = run(&base, &mut d, "delete_item", &args(json!({"category": "home", "list_name": "shopping", "item_starts_with": "m"}))).unwrap_err();
+        assert_eq!(err.to_string(), "'str' object has no attribute 'pop'");
+    }
+
+    #[test]
+    fn python_strip_separators_count_as_whitespace_when_matching_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        run(&base, &mut d, "create", &args(json!({"category": "home", "name": "shopping", "items": ["\u{1c}apple"]}))).unwrap();
+        // python: "\x1capple".strip() == "apple", so the prefix matches
+        let r = run(&base, &mut d, "edit_item", &args(json!({"category": "home", "list_name": "shopping", "item_starts_with": "apple", "item_content": "pear"}))).unwrap();
+        assert_eq!(r["content"], "list item edited!");
+        assert_eq!(d.data["home"]["shopping"]["items"], json!(["pear"]));
+    }
+
+    #[test]
+    fn dict_items_render_keys_in_prompt_and_other_types_raise() {
+        let mut data = Map::new();
+        data.insert("home".into(), json!({"shopping": {"items": {"milk": 1, "eggs": 2}, "pinned": true}}));
+        // python iterates a dict's keys when joining a pinned list
+        assert_eq!(system_prompt(&data, &json!(10)).unwrap(), "## home\n### shopping\n- milk\n- eggs\n");
+        let mut bad = Map::new();
+        bad.insert("home".into(), json!({"shopping": {"items": 5, "pinned": true}}));
+        let err = system_prompt(&bad, &json!(10)).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object is not iterable");
     }
 }
