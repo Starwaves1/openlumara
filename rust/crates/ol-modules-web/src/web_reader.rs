@@ -24,6 +24,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 /// python `allowed_text_types`
 const ALLOWED_TEXT_TYPES: &[&str] = &[
@@ -43,9 +44,12 @@ const FALLBACK_NAMES: &[&str] = &["content", "description", "title", "text", "ar
 
 const NOTHING_SCRAPED: &str = "nothing could be scraped from the page!";
 
+/// `Arc` fields so `read_multiple` can hand each item to a detached task (python's `gather` keeps
+/// sibling tasks running after one raises).
+#[derive(Clone)]
 pub struct WebReader {
-    base: ModuleBase,
-    core: HttpCore,
+    base: Arc<ModuleBase>,
+    core: Arc<HttpCore>,
 }
 
 /// python `_remove_duplicates`: keep the first occurrence of each item, in order
@@ -149,6 +153,28 @@ fn process_webpage(html: &str) -> anyhow::Result<Value> {
     Ok(Value::Object(output))
 }
 
+/// python `asyncio.Semaphore(value)`: any non-negative number is accepted, and a fractional value
+/// admits `ceil(value)` holders (asyncio admits a waiter while the value is > 0). Tokio panics above
+/// `Semaphore::MAX_PERMITS`; a semaphore that large never blocks, so capping it changes nothing.
+fn permits_from(v: &Value) -> anyhow::Result<usize> {
+    match v {
+        Value::Bool(b) => Ok(usize::from(*b)),
+        Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                bail!("Semaphore initial value must be >= 0");
+            }
+            let cap = Semaphore::MAX_PERMITS;
+            if f >= cap as f64 {
+                Ok(cap)
+            } else {
+                Ok(f.ceil() as usize)
+            }
+        }
+        other => bail!("'<' not supported between instances of '{}' and 'int'", py_type_name(other)),
+    }
+}
+
 /// python `for x in iterable` over a tool argument
 fn py_iterate(v: &Value) -> anyhow::Result<Vec<Value>> {
     match v {
@@ -166,24 +192,12 @@ impl WebReader {
 
     pub fn new(base: ModuleBase) -> Self {
         let core = HttpCore::new(base.config.clone());
-        Self { base, core }
+        Self { base: Arc::new(base), core: Arc::new(core) }
     }
 
     /// python `asyncio.Semaphore(self.config.get("max_concurrent_tasks", 4))`
     fn max_concurrent_tasks(&self) -> anyhow::Result<usize> {
-        let v = self.base.config.get1("max_concurrent_tasks").unwrap_or(json!(4));
-        match &v {
-            Value::Bool(b) => Ok(usize::from(*b)),
-            Value::Number(n) => {
-                let f = n.as_f64().unwrap_or(0.0);
-                if f < 0.0 {
-                    bail!("Semaphore initial value must be >= 0");
-                }
-                // asyncio admits a waiter while the float value is > 0, so 2.5 allows 3 holders
-                Ok(f.ceil() as usize)
-            }
-            other => bail!("'<' not supported between instances of '{}' and 'int'", py_type_name(other)),
-        }
+        permits_from(&self.base.config.get1("max_concurrent_tasks").unwrap_or(json!(4)))
     }
 
     /// python `read(path)`: every failure is returned as a result, never raised
@@ -243,16 +257,31 @@ impl WebReader {
     }
 
     /// python `read_multiple(paths)`: results in input order, at most max_concurrent_tasks in flight.
-    /// The first error ends the call, as python's `asyncio.gather` does.
+    /// The first error ends the call, as python's `asyncio.gather` does, but the other items keep
+    /// running in the background (dropping a `JoinHandle` detaches the task instead of cancelling it).
     pub async fn read_multiple(&self, paths: &Value) -> anyhow::Result<Value> {
         let permits = self.max_concurrent_tasks()?;
         let items = py_iterate(paths)?;
-        let sem = Semaphore::new(permits);
-        let results = futures::future::try_join_all(items.into_iter().map(|p| self.handle_one(&sem, p))).await?;
+        let sem = Arc::new(Semaphore::new(permits));
+        let handles: Vec<JoinHandle<anyhow::Result<Value>>> = items
+            .into_iter()
+            .map(|p| {
+                let reader = self.clone();
+                let sem = sem.clone();
+                tokio::spawn(async move { reader.handle_one(sem, p).await })
+            })
+            .collect();
+        let results = futures::future::try_join_all(handles.into_iter().map(|h| async move {
+            match h.await {
+                Ok(r) => r,
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        }))
+        .await?;
         Ok(self.base.result(Value::Array(results), true))
     }
 
-    async fn handle_one(&self, sem: &Semaphore, p: Value) -> anyhow::Result<Value> {
+    async fn handle_one(&self, sem: Arc<Semaphore>, p: Value) -> anyhow::Result<Value> {
         let _permit = sem.acquire().await?;
         let path = match &p {
             Value::Object(m) => m.get("path").cloned().ok_or_else(|| anyhow!("'path'"))?,
@@ -366,6 +395,26 @@ mod tests {
     fn process_webpage_nested_paragraphs_keep_nesting() {
         // html.parser does not close the first <p>, so its text includes the nested one
         assert_eq!(process_webpage("<p>1<p>2</p></p>").unwrap(), json!({"paragraphs": ["12", "2"]}));
+    }
+
+    #[test]
+    fn permits_follow_asyncio_semaphore_values() {
+        // asyncio admits ceil(value) holders for a fractional value
+        assert_eq!(permits_from(&json!(2.5)).unwrap(), 3);
+        assert_eq!(permits_from(&json!(true)).unwrap(), 1);
+        assert_eq!(permits_from(&json!(0)).unwrap(), 0);
+        // huge python values must not panic tokio's Semaphore::new
+        assert_eq!(permits_from(&json!(1e30)).unwrap(), Semaphore::MAX_PERMITS);
+        assert_eq!(permits_from(&json!(1e18)).unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(permits_from(&json!(-1)).unwrap_err().to_string(), "Semaphore initial value must be >= 0");
+    }
+
+    #[tokio::test]
+    async fn read_multiple_first_error_ends_the_call_with_python_message() {
+        // python: handle_one's p["path"] raises KeyError('path'), which gather re-raises as "'path'"
+        let r = detached();
+        let err = r.read_multiple(&json!([{"other": 1}, "ftp://a.example"])).await.unwrap_err();
+        assert_eq!(err.to_string(), "'path'");
     }
 
     #[test]
