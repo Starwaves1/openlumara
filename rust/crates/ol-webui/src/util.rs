@@ -185,6 +185,23 @@ pub fn truthy_opt(v: Option<&Value>) -> bool {
     v.map(truthy).unwrap_or(false)
 }
 
+/// python `Webui` start-up: the bind host for `network_mode` (`local` 127.0.0.1, `internet`
+/// 0.0.0.0, `custom` the configured `custom_host`, anything else 127.0.0.1). python's f-string
+/// renders a missing custom host as "None"
+pub fn bind_host(network_mode: Option<&str>, custom_host: Option<&str>) -> String {
+    match network_mode {
+        Some("local") => "127.0.0.1".to_string(),
+        Some("internet") => "0.0.0.0".to_string(),
+        Some("custom") => custom_host.unwrap_or("None").to_string(),
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+/// python `Webui.url`: `http://{host}:{port}`
+pub fn channel_url(host: &str, port: impl std::fmt::Display) -> String {
+    format!("http://{}:{}", host, port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +261,18 @@ mod tests {
         // python title() only counts cased characters as word material
         assert_eq!(py_title("\u{4e2d}a"), "\u{4e2d}A");
         assert_eq!(py_title("don't"), "Don'T");
+    }
+
+    #[test]
+    fn bind_host_and_url() {
+        assert_eq!(bind_host(Some("local"), Some("10.0.0.5")), "127.0.0.1");
+        assert_eq!(bind_host(Some("internet"), None), "0.0.0.0");
+        assert_eq!(bind_host(Some("custom"), Some("10.0.0.5")), "10.0.0.5");
+        // python: an unset custom_host becomes the string "None" in the url
+        assert_eq!(bind_host(Some("custom"), None), "None");
+        // unknown or missing mode falls back to loopback
+        assert_eq!(bind_host(Some("lan"), Some("10.0.0.5")), "127.0.0.1");
+        assert_eq!(bind_host(None, None), "127.0.0.1");
+        assert_eq!(channel_url(&bind_host(Some("local"), None), 8080), "http://127.0.0.1:8080");
     }
 }

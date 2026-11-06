@@ -18,6 +18,13 @@ pub trait ExtHost: Send + Sync + 'static {
     fn log(&self, category: &str, message: &str);
 }
 
+/// `module_config` for a template: python `_ext_template_vars` gives `{}` when the owning module
+/// is not loaded, so anything that is not a settings object becomes an empty object
+fn module_config_value(host: &dyn ExtHost, module: &str) -> JValue {
+    let config = host.module_config(module);
+    JValue::from_serialize(if config.is_object() { config } else { serde_json::json!({}) })
+}
+
 /// jinja2 FileSystemLoader lookup: `..` segments are rejected
 fn load_file(base: &Path, name: &str) -> Option<String> {
     let mut path = base.to_path_buf();
@@ -84,7 +91,7 @@ fn render_slot(
     slot_name: &str,
 ) -> Result<Option<String>, Error> {
     let module = template_name.split('/').next().unwrap_or("");
-    let module_config = JValue::from_serialize(host.module_config(module));
+    let module_config = module_config_value(host.as_ref(), module);
     let tmpl = env.get_template(template_name)?;
     // python `make_module(vars=...)`: runs the module template and keeps its top-level names
     let captured = tmpl.render_captured(minijinja::context! { module_config => module_config })?;
@@ -151,7 +158,7 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
                 if !modal_root.is_dir() {
                     continue;
                 }
-                let module_config = JValue::from_serialize(host.module_config(module_name));
+                let module_config = module_config_value(host.as_ref(), module_name);
                 for filename in sorted_html_files(&modal_root) {
                     if !filename.ends_with(".html") || filename == "index.html" {
                         continue;
@@ -184,7 +191,7 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
                 if !sidebar_root.is_dir() {
                     continue;
                 }
-                let module_config = JValue::from_serialize(host.module_config(module_name));
+                let module_config = module_config_value(host.as_ref(), module_name);
                 for filename in sorted_html_files(&sidebar_root) {
                     if !filename.ends_with(".html") {
                         continue;
@@ -200,7 +207,7 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
                     if icon_path.is_file() {
                         match std::fs::read_to_string(&icon_path) {
                             Ok(s) => icon = s,
-                            Err(e) => host.log("webui", &format!("skipping sidebar icon '{}': {}", icon_path.display(), e)),
+                            Err(e) => host.log("webui", &format!("skipping sidebar icon '{}': {}", icon_path.display(), ol_core::detail_error(&e))),
                         }
                     }
                     let label = crate::util::py_title(&name.replace(['_', '-'], " "));
@@ -287,14 +294,17 @@ pub fn ui_asset_urls(asset_dirs: &BTreeMap<String, PathBuf>, ext: &str) -> Vec<S
             let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
             entries.sort();
             let mut files = Vec::new();
+            let mut subdirs = Vec::new();
             for path in entries {
                 if path.is_dir() {
-                    pending.push(path);
+                    subdirs.push(path);
                 } else if path.file_name().map(|n| n.to_string_lossy().ends_with(&format!(".{}", ext))).unwrap_or(false) {
                     files.push(path);
                 }
             }
-            // subdirectories are popped in reverse, so visit them in name order
+            // a LIFO stack pops the last push first: push in reverse so siblings pop in name order
+            // and the walk is depth-first pre-order, like python's top-down os.walk
+            pending.extend(subdirs.into_iter().rev());
             for path in files {
                 let Ok(rel) = path.strip_prefix(assets_dir) else { continue };
                 let rel = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
@@ -487,6 +497,9 @@ mod tests {
         write("zeta/webui/assets/css/b.css");
         write("zeta/webui/assets/css/a.css");
         write("zeta/webui/assets/css/deep/c.css");
+        write("zeta/webui/assets/css/zz/y.css");
+        write("zeta/webui/assets/css/aa/z.css");
+        write("zeta/webui/assets/css/aa/inner/q.css");
         write("zeta/webui/assets/css/skip.js");
         write("alpha/webui/assets/css/main.css");
         write("alpha/webui/assets/js/x.js");
@@ -495,8 +508,41 @@ mod tests {
         dirs.insert("alpha".to_string(), root.path().join("alpha/webui/assets"));
         assert_eq!(
             ui_asset_urls(&dirs, "css"),
-            ["/ext-assets/alpha/css/main.css", "/ext-assets/zeta/css/a.css", "/ext-assets/zeta/css/b.css", "/ext-assets/zeta/css/deep/c.css"]
+            [
+                "/ext-assets/alpha/css/main.css",
+                // root files first, then each sibling subtree depth-first in name order
+                "/ext-assets/zeta/css/a.css",
+                "/ext-assets/zeta/css/b.css",
+                "/ext-assets/zeta/css/aa/z.css",
+                "/ext-assets/zeta/css/aa/inner/q.css",
+                "/ext-assets/zeta/css/deep/c.css",
+                "/ext-assets/zeta/css/zz/y.css",
+            ]
         );
         assert_eq!(ui_asset_urls(&dirs, "js"), ["/ext-assets/alpha/js/x.js"]);
+    }
+
+    struct NullConfigHost;
+    impl ExtHost for NullConfigHost {
+        // what a host returns for a module that is not loaded
+        fn module_config(&self, _module: &str) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn log(&self, _category: &str, _message: &str) {}
+    }
+
+    #[test]
+    fn unloaded_module_gets_empty_module_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = tmp.path().join("core");
+        write(&core.join("page.html"), "{{ extension_slot('top') }}|{% for m in extension_modals() %}{{ m.config|length }}{% endfor %}");
+        let m1 = tmp.path().join("m1");
+        write(&m1.join("page.html"), "{% macro top() %}t{{ module_config|length }}{% endmacro %}");
+        write(&m1.join("modals/a.html"), "x");
+        let mut dirs = BTreeMap::new();
+        dirs.insert("m1".to_string(), m1);
+        let store = TemplateStore::new(core, dirs, Arc::new(NullConfigHost));
+        // python `_ext_template_vars` / modal config: `{}` rather than null
+        assert_eq!(store.render("page.html", minijinja::context! {}).unwrap(), "t0|0");
     }
 }

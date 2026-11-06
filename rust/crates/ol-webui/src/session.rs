@@ -12,9 +12,19 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Value};
 use sha2::Sha256;
+use std::collections::HashMap;
 
 pub const COOKIE_NAME: &str = "session";
 pub const DEFAULT_SECRET: &str = "openlumara-default-session-secret-change-me";
+/// python `Webui.__init__`: credential fallbacks when the config has no username/password
+pub const DEFAULT_USERNAME: &str = "admin";
+pub const DEFAULT_PASSWORD: &str = "admin";
+/// python `login_submit`: failed attempts older than this many seconds are forgotten
+pub const LOGIN_WINDOW_SECS: f64 = 900.0;
+/// python `login_submit`: this many kept attempts from one IP block further logins
+pub const LOGIN_MAX_ATTEMPTS: usize = 5;
+pub const LOGIN_RATE_LIMITED: &str = "Too many attempts. Try again later.";
+pub const INVALID_CREDENTIALS: &str = "Invalid credentials";
 const SECURITY_FLAGS: &str = "httponly; samesite=lax";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -69,14 +79,46 @@ impl SessionSigner {
         self.unsign_at(value, now())
     }
 
-    /// the Set-Cookie header value for a non-empty session
+    /// the Set-Cookie header value for a non-empty session. starlette only writes the Max-Age
+    /// attribute when max_age is truthy, so max_age 0 gives a session cookie
     pub fn set_cookie(&self, session: &Map<String, Value>) -> String {
-        format!("{}={}; path=/; Max-Age={}; {}", COOKIE_NAME, self.sign(session), self.max_age, SECURITY_FLAGS)
+        let max_age = if self.max_age != 0 { format!("Max-Age={}; ", self.max_age) } else { String::new() };
+        format!("{}={}; path=/; {}{}", COOKIE_NAME, self.sign(session), max_age, SECURITY_FLAGS)
     }
 
     /// the Set-Cookie header value that clears the session
     pub fn clear_cookie() -> String {
         format!("{}=null; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; {}", COOKIE_NAME, SECURITY_FLAGS)
+    }
+}
+
+/// python `Webui.login_attempts`: failed logins per client IP, as unix timestamps
+#[derive(Default)]
+pub struct LoginLimiter {
+    attempts: HashMap<String, Vec<f64>>,
+}
+
+impl LoginLimiter {
+    /// python `login_submit` pre-check: prunes attempts outside the window (`now - t < 900` is
+    /// kept) and reports whether the IP already has `LOGIN_MAX_ATTEMPTS` kept attempts
+    pub fn is_limited(&mut self, ip: &str, now: f64) -> bool {
+        match self.attempts.get_mut(ip) {
+            Some(list) => {
+                list.retain(|t| now - t < LOGIN_WINDOW_SECS);
+                list.len() >= LOGIN_MAX_ATTEMPTS
+            }
+            None => false,
+        }
+    }
+
+    /// a wrong password: the attempt is recorded
+    pub fn record_failure(&mut self, ip: &str, now: f64) {
+        self.attempts.entry(ip.to_string()).or_default().push(now);
+    }
+
+    /// a right password: the IP's attempt history is emptied
+    pub fn record_success(&mut self, ip: &str) {
+        self.attempts.insert(ip.to_string(), Vec::new());
     }
 }
 
@@ -176,6 +218,34 @@ mod tests {
         assert!(s.unsign_at("garbage", 1000).is_none());
         assert!(s.set_cookie(&sess).starts_with("session="));
         assert!(s.set_cookie(&sess).ends_with("; path=/; Max-Age=86400; httponly; samesite=lax"));
+        // max_age 0 is falsy in starlette: no Max-Age attribute at all
+        let zero = SessionSigner::new("secret", 0);
+        assert!(!zero.set_cookie(&sess).contains("Max-Age"));
+        assert!(zero.set_cookie(&sess).ends_with("; path=/; httponly; samesite=lax"));
+    }
+
+    #[test]
+    fn login_limiter_window_and_reset() {
+        let mut l = LoginLimiter::default();
+        assert!(!l.is_limited("1.2.3.4", 0.0));
+        for _ in 0..5 {
+            l.record_failure("1.2.3.4", 0.0);
+        }
+        assert!(l.is_limited("1.2.3.4", 10.0));
+        // another client is unaffected
+        assert!(!l.is_limited("5.6.7.8", 10.0));
+        // an attempt exactly 900 seconds old is pruned (python keeps only `now - t < 900`)
+        assert!(l.is_limited("1.2.3.4", 899.5));
+        assert!(!l.is_limited("1.2.3.4", 900.0));
+        // a successful login clears the history
+        for _ in 0..5 {
+            l.record_failure("1.2.3.4", 1000.0);
+        }
+        assert!(l.is_limited("1.2.3.4", 1000.0));
+        l.record_success("1.2.3.4");
+        assert!(!l.is_limited("1.2.3.4", 1000.0));
+        assert_eq!(LOGIN_RATE_LIMITED, "Too many attempts. Try again later.");
+        assert_eq!(DEFAULT_USERNAME, "admin");
     }
 
     #[test]
