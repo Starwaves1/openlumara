@@ -191,15 +191,28 @@ fn recursive_items(data: &Map<String, Value>, prefix: &str, out: &mut Vec<(Strin
     }
 }
 
+/// a name or category used as a dict key: python hashes it, so a JSON array or object raises TypeError
+/// before the tool does anything else with it
+fn key_arg(args: &ToolArgs, k: &str) -> anyhow::Result<String> {
+    match args.raw(k) {
+        Some(Value::Array(_)) => anyhow::bail!("unhashable type: 'list'"),
+        Some(Value::Object(_)) => anyhow::bail!("unhashable type: 'dict'"),
+        _ => Ok(args.str(k).unwrap_or_else(|| "None".into())),
+    }
+}
+
 /// the notes tools, operating on a storage dict
 pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolArgs) -> anyhow::Result<Value> {
-    let s = |k: &str| args.str(k).unwrap_or_else(|| "None".into());
     match method {
         "create" => {
-            let (name, category, content) = (s("name"), s("category"), args.raw("content").cloned().unwrap_or(Value::Null));
+            let category = key_arg(args, "category")?;
+            // python checks the name only after the category has been created, so its error comes later
+            let name = key_arg(args, "name");
+            let content = args.raw("content").cloned().unwrap_or(Value::Null);
             if !data.data.contains_key(&category) {
                 data.data.insert(category.clone(), json!({}));
             }
+            let name = name?;
             if as_dict(&data.data[&category])?.contains_key(&name) {
                 return Ok(base.result(json!("note already exists! edit it instead. make sure to read it before editing it."), false));
             }
@@ -208,10 +221,11 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             Ok(base.result(json!("note created"), true))
         }
         "read" => {
-            let (category, name) = (s("category"), s("name"));
+            let category = key_arg(args, "category")?;
             if !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
+            let name = key_arg(args, "name")?;
             let cat = as_dict(&data.data[&category])?;
             match cat.get(&name) {
                 None => Ok(base.result(json!("note does not exist"), false)),
@@ -219,10 +233,12 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             }
         }
         "edit" => {
-            let (category, name, content) = (s("category"), s("name"), args.raw("content").cloned().unwrap_or(Value::Null));
+            let category = key_arg(args, "category")?;
             if !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
+            let name = key_arg(args, "name")?;
+            let content = args.raw("content").cloned().unwrap_or(Value::Null);
             if !as_dict(&data.data[&category])?.contains_key(&name) {
                 return Ok(base.result(json!("note does not exist"), false));
             }
@@ -232,7 +248,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
         }
         "get_categories" => Ok(base.result(json!(data.data.keys().collect::<Vec<_>>()), true)),
         "list" => {
-            let category = s("category");
+            let category = key_arg(args, "category")?;
             if !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
@@ -243,7 +259,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             Ok(base.result(json!(keys), true))
         }
         "search" => {
-            let query = s("query");
+            let query = args.str("query").unwrap_or_else(|| "None".into());
             reload(data)?;
             let mut items = Vec::new();
             recursive_items(&data.data, "", &mut items);
@@ -268,10 +284,11 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             Ok(base.result(json!(lines.join("\n")), true))
         }
         "delete" => {
-            let (category, name) = (s("category"), s("name"));
+            let category = key_arg(args, "category")?;
             if !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
+            let name = key_arg(args, "name")?;
             if !as_dict(&data.data[&category])?.contains_key(&name) {
                 return Ok(base.result(json!("note does not exist"), false));
             }
@@ -475,6 +492,32 @@ mod tests {
         // b/a was written before the bad note, and the bad note's file was created empty
         assert_eq!(std::fs::read_to_string(dir.path().join("notes/b/a.md")).unwrap(), "one");
         assert_eq!(std::fs::read_to_string(dir.path().join("notes/c/n.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn unhashable_name_or_category_raises_like_python_dict_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("notes", StorageType::Markdown, Some(&p)).unwrap();
+        let base = ModuleBase::detached("notes");
+        run(&base, &mut d, "create", &args(json!({"name": "a", "category": "work", "content": "one"}))).unwrap();
+        // python: `category not in self.data.keys()` hashes the list and raises before anything else
+        let err = run(&base, &mut d, "list", &args(json!({"category": ["work"]}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'list'");
+        let err = run(&base, &mut d, "read", &args(json!({"category": {"a": 1}, "name": "a"}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'dict'");
+        // python only hashes the name once the category exists, so a missing category is still reported
+        let r = run(&base, &mut d, "read", &args(json!({"category": "nope", "name": ["a"]}))).unwrap();
+        assert_eq!(r, json!({"status": "error", "content": NO_CATEGORY}));
+        // python: `name in self.data[category].keys()` raises for a list name
+        let err = run(&base, &mut d, "delete", &args(json!({"category": "work", "name": ["a"]}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'list'");
+        // python created the new category before the name check raised, and it stays in memory
+        let err = run(&base, &mut d, "create", &args(json!({"name": ["x"], "category": "fresh", "content": "c"}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'list'");
+        assert_eq!(run(&base, &mut d, "get_categories", &args(json!({}))).unwrap()["content"], json!(["work", "fresh"]));
+        // nothing was written under the stringified name
+        assert!(!dir.path().join("notes/work/['a'].md").exists());
     }
 
     #[test]

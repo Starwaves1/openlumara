@@ -262,6 +262,12 @@ pub fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// python str.strip() with no arguments: removes every char for which str.isspace() is true. That is
+/// Unicode White_Space (what str::trim removes) plus U+001C to U+001F, which python also counts as spaces.
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
 /// python core.search.make_snippets. The match position is taken from text.lower() and then used to
 /// slice the original text, so a lowercase form with a different length (U+0130 'İ' becomes two code
 /// points) shifts the snippet exactly like python does. ol-core's version keeps positions aligned instead.
@@ -269,7 +275,7 @@ pub fn make_snippets(text: &str, query: &str, max_snippets: usize, radius: usize
     let chars: Vec<char> = text.chars().collect();
     let low: Vec<char> = text.to_lowercase().chars().collect();
     let low_str: String = low.iter().collect();
-    let mut candidates = vec![query.trim().to_lowercase()];
+    let mut candidates = vec![py_strip(query).to_lowercase()];
     candidates.extend(ol_core::search::normalize_words(query));
     let Some(term) = candidates.into_iter().find(|c| !c.is_empty() && low_str.contains(c.as_str())) else {
         return vec![];
@@ -287,7 +293,7 @@ pub fn make_snippets(text: &str, query: &str, max_snippets: usize, radius: usize
         if pos > radius {
             s.push_str("...");
         }
-        s.push_str(slice.replace('\n', " ").trim());
+        s.push_str(py_strip(&slice.replace('\n', " ")));
         if end < chars.len() {
             s.push_str("...");
         }
@@ -477,5 +483,22 @@ mod tests {
         assert_eq!(py_type_name(&serde_json::json!("s")), "str");
         assert_eq!(py_type_name(&serde_json::json!([1])), "list");
         assert_eq!(py_type_name(&serde_json::json!({})), "dict");
+    }
+
+    #[test]
+    fn py_strip_removes_python_isspace_chars_including_file_separators() {
+        // python: "\x1c" is a separator and isspace() is true, so str.strip() drops it
+        assert_eq!(py_strip("\u{1c}\u{1d}\u{1e}\u{1f} vitamin \u{1f}\u{a0}"), "vitamin");
+        // Unicode White_Space is still stripped as before
+        assert_eq!(py_strip("\t\u{3000}buy\u{2028}"), "buy");
+        // characters that are not spaces stay put
+        assert_eq!(py_strip("\u{200b}x\u{180e}"), "\u{200b}x\u{180e}");
+    }
+
+    #[test]
+    fn snippet_edges_drop_file_separator_control_chars_like_python_strip() {
+        // python: text[...].replace("\n", " ").strip() removes a leading \x1f from the chunk
+        assert_eq!(make_snippets("\u{1f}vitamin", "vitamin", 1, 50), vec!["vitamin".to_string()]);
+        assert_eq!(make_snippets("buy\u{1f}vitamin", "vitamin", 1, 50), vec!["buy\u{1f}vitamin".to_string()]);
     }
 }
