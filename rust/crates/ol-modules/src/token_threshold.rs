@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase};
 use serde_json::Value;
 use std::sync::Arc;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 #[path = "../../../generated/modules/token_threshold.rs"]
 pub mod meta;
@@ -41,25 +42,63 @@ impl PyInt {
     }
 }
 
-/// python `int(float)`: truncates toward zero, keeping the exact magnitude beyond the i64 range
-fn float_to_py_int(f: f64) -> PyInt {
+/// python `int(float)`: truncates toward zero, keeping the exact magnitude beyond the i64 range.
+/// NaN and infinity fail the way CPython does (ValueError / OverflowError).
+fn float_to_py_int(f: f64) -> anyhow::Result<PyInt> {
+    if f.is_nan() {
+        return Err(anyhow!("cannot convert float NaN to integer"));
+    }
+    if f.is_infinite() {
+        return Err(anyhow!("cannot convert float infinity to integer"));
+    }
     let t = f.trunc();
     if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t) {
-        PyInt::Exact(t as i64)
+        Ok(PyInt::Exact(t as i64))
     } else {
-        PyInt::Huge(t)
+        Ok(PyInt::Huge(t))
     }
+}
+
+/// the decimal value of a Unicode decimal digit (general category Nd), as python's int(str) reads
+/// it. Unicode encodes every Nd run as ascending groups of ten starting at zero, so the value is
+/// the count of Nd characters just before it, mod 10.
+fn unicode_decimal_digit(c: char) -> Option<u8> {
+    if c.is_ascii() || c.general_category() != GeneralCategory::DecimalNumber {
+        return None;
+    }
+    let mut before = 0u32;
+    let mut cp = c as u32;
+    while cp > 0 {
+        cp -= 1;
+        match char::from_u32(cp) {
+            Some(p) if p.general_category() == GeneralCategory::DecimalNumber => before += 1,
+            _ => break,
+        }
+    }
+    Some((before % 10) as u8)
 }
 
 /// CPython's default int/str conversion digit limit (sys.int_info.default_max_str_digits)
 const PY_MAX_STR_DIGITS: usize = 4300;
 
 /// python `int(str)` in base 10: surrounding whitespace, an optional sign, then digits in which a
-/// single `_` may sit between two digits (`int("4_096") == 4096`). `Err` carries python's ValueError
-/// text.
+/// single `_` may sit between two digits (`int("4_096") == 4096`). Any Unicode decimal digit
+/// counts as a digit (`int("٤٠96") == 4096`). `Err` carries python's ValueError text.
 fn parse_py_int_literal(s: &str) -> Result<PyInt, String> {
     let invalid = || format!("invalid literal for int() with base 10: {}", crate::util::repr_str(s));
-    let t = s.trim();
+    // python maps every decimal digit to its ASCII form before parsing; any other non-ASCII
+    // character makes the literal invalid
+    let mapped: String = s
+        .trim()
+        .chars()
+        .map(|c| match unicode_decimal_digit(c) {
+            Some(d) => Some(char::from(b'0' + d)),
+            None if c.is_ascii() => Some(c),
+            None => None,
+        })
+        .collect::<Option<String>>()
+        .ok_or_else(invalid)?;
+    let t = mapped.as_str();
     let (sign, digits) = match t.as_bytes().first() {
         Some(b'-') => ("-", &t[1..]),
         Some(b'+') => ("", &t[1..]),
@@ -94,7 +133,7 @@ fn py_int(v: &Value) -> anyhow::Result<PyInt> {
         Value::Bool(b) => Ok(PyInt::Exact(i64::from(*b))),
         Value::Number(n) => match n.as_i64() {
             Some(i) => Ok(PyInt::Exact(i)),
-            None => Ok(float_to_py_int(n.as_f64().unwrap_or(0.0))),
+            None => float_to_py_int(n.as_f64().unwrap_or(0.0)),
         },
         Value::String(s) => parse_py_int_literal(s).map_err(|msg| anyhow!("{}", msg)),
         other => Err(anyhow!(
@@ -215,6 +254,37 @@ mod tests {
             py_int(&Value::Null).unwrap_err().to_string(),
             "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
         );
+    }
+
+    #[test]
+    fn unicode_decimal_digits_parse_like_python() {
+        // python: int('٤٠٩٦') == 4096 (Arabic-Indic digits), int('４０９６') == 4096 (fullwidth)
+        assert_eq!(py_int(&json!("٤٠٩٦")).unwrap(), PyInt::Exact(4096));
+        assert_eq!(py_int(&json!("４０９６")).unwrap(), PyInt::Exact(4096));
+        assert_eq!(py_int(&json!(" -٤_٠٩٦ ")).unwrap(), PyInt::Exact(-4096));
+        // a non-digit non-ASCII character is still an invalid literal
+        assert_eq!(
+            py_int(&json!("٤٠é")).unwrap_err().to_string(),
+            "invalid literal for int() with base 10: '٤٠é'"
+        );
+    }
+
+    #[test]
+    fn non_finite_floats_fail_like_python_int() {
+        // python: int(float('nan')) -> ValueError, int(float('inf')) -> OverflowError
+        assert_eq!(
+            float_to_py_int(f64::NAN).unwrap_err().to_string(),
+            "cannot convert float NaN to integer"
+        );
+        assert_eq!(
+            float_to_py_int(f64::INFINITY).unwrap_err().to_string(),
+            "cannot convert float infinity to integer"
+        );
+        assert_eq!(
+            float_to_py_int(f64::NEG_INFINITY).unwrap_err().to_string(),
+            "cannot convert float infinity to integer"
+        );
+        assert_eq!(float_to_py_int(-7.9).unwrap(), PyInt::Exact(-7));
     }
 
     #[test]
