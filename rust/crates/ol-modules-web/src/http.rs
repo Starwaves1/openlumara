@@ -170,6 +170,17 @@ fn decode_bytes(bytes: &[u8], encoding: &str) -> Result<String, String> {
             Ok(bytes.iter().map(|&b| b as char).collect())
         }
         "ascii" | "us-ascii" | "646" | "us" => Ok(bytes.iter().map(|&b| if b < 128 { b as char } else { '\u{FFFD}' }).collect()),
+        // python's "utf-16" codec: BOM selects the byte order, otherwise little endian; the BOM is consumed
+        "utf-16" => {
+            let (enc, rest) = if let Some(r) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+                (encoding_rs::UTF_16LE, r)
+            } else if let Some(r) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+                (encoding_rs::UTF_16BE, r)
+            } else {
+                (encoding_rs::UTF_16LE, bytes)
+            };
+            Ok(enc.decode_without_bom_handling(rest).0.into_owned())
+        }
         _ => match encoding_rs::Encoding::for_label(norm.as_bytes()) {
             Some(enc) => Ok(enc.decode_without_bom_handling(bytes).0.into_owned()),
             None => Err(format!("unknown encoding: {}", encoding)),
@@ -203,6 +214,22 @@ enum Fail {
     Unexpected(String),
 }
 
+/// true when the error chain holds a rustls error. io::Error hides its payload from `source()`,
+/// so the payload is followed through `get_ref()`.
+fn chain_has_tls(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<rustls::Error>().is_some() {
+        return true;
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        if io.get_ref().is_some_and(|inner| chain_has_tls(inner)) {
+            return true;
+        }
+    }
+    err.source().is_some_and(chain_has_tls)
+}
+
+/// python's except order: Timeout, SSLError, ConnectionError, RequestException. Classification is by
+/// error type; the message text is only used for the audit log.
 fn classify(e: &reqwest::Error) -> Fail {
     let mut chain = format!("{}", e);
     let mut src = std::error::Error::source(e);
@@ -210,16 +237,211 @@ fn classify(e: &reqwest::Error) -> Fail {
         chain.push_str(&format!(": {}", s));
         src = s.source();
     }
-    let lower = chain.to_lowercase();
     if e.is_timeout() {
         Fail::Timeout
-    } else if lower.contains("certificate") || lower.contains("tls") || lower.contains("handshake") {
+    } else if chain_has_tls(e) {
         Fail::Ssl(chain)
     } else if e.is_connect() || e.is_request() {
         Fail::Connection(chain)
     } else {
         Fail::Request(chain)
     }
+}
+
+/// python's `py_repr`-style escape for one character inside a UnicodeEncodeError message
+fn py_char_escape(c: char) -> String {
+    let n = c as u32;
+    if n < 0x100 {
+        format!("\\x{:02x}", n)
+    } else if n < 0x10000 {
+        format!("\\u{:04x}", n)
+    } else {
+        format!("\\U{:08x}", n)
+    }
+}
+
+/// CPython's UnicodeEncodeError text for the first character at or above `limit`
+fn encode_error(codec: &str, pos: usize, c: char, limit: u32) -> String {
+    format!("'{}' codec can't encode character '{}' in position {}: ordinal not in range({})", codec, py_char_escape(c), pos, limit)
+}
+
+/// requests' `check_header_validity` name regex `^[^:\s][^:\r\n]*$`
+fn requests_header_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c != ':' && !c.is_whitespace() => {}
+        _ => return false,
+    }
+    !chars.any(|c| c == ':' || c == '\r' || c == '\n')
+}
+
+/// requests' `check_header_validity` value regex `^\S[^\r\n]*$|^$`
+fn requests_header_value_ok(value: &str) -> bool {
+    match value.chars().next() {
+        None => true,
+        Some(c) => !c.is_whitespace() && !value.chars().any(|c| c == '\r' || c == '\n'),
+    }
+}
+
+fn invalid_header_msg(kind: &str, part: &str) -> String {
+    format!("Invalid leading whitespace, reserved character(s), or return character(s) in header {}: {}", kind, py_repr(&json!(part)))
+}
+
+/// requests' `prepare_headers` validation (InvalidHeader -> "Request failed"), then http.client's
+/// `putheader` encodes: an ascii name or latin-1 value that does not encode raises UnicodeEncodeError
+/// (-> "An unexpected error occurred").
+fn build_header_map(headers: &[(String, String)]) -> Result<reqwest::header::HeaderMap, Fail> {
+    for (k, v) in headers {
+        if !requests_header_name_ok(k) {
+            return Err(Fail::Request(invalid_header_msg("name", k)));
+        }
+        if !requests_header_value_ok(v) {
+            return Err(Fail::Request(invalid_header_msg("value", v)));
+        }
+    }
+    let mut map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        if let Some((pos, c)) = k.chars().enumerate().find(|(_, c)| !c.is_ascii()) {
+            return Err(Fail::Unexpected(encode_error("ascii", pos, c, 128)));
+        }
+        if let Some((pos, c)) = v.chars().enumerate().find(|(_, c)| (*c as u32) > 0xFF) {
+            return Err(Fail::Unexpected(encode_error("latin-1", pos, c, 256)));
+        }
+        let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+            .map_err(|_| Fail::Request(format!("Invalid header name {}", py_repr(&json!(k)))))?;
+        let bytes: Vec<u8> = v.chars().map(|c| c as u32 as u8).collect();
+        let value = reqwest::header::HeaderValue::from_bytes(&bytes).map_err(|_| Fail::Request(invalid_header_msg("value", v)))?;
+        map.append(name, value);
+    }
+    Ok(map)
+}
+
+/// one `Set-Cookie` after `http.cookiejar`'s `parse_ns_headers` and `_normalized_cookie_tuples`
+struct ParsedCookie {
+    name: String,
+    value: Option<String>,
+    /// explicit Domain attribute, lower-cased (None when absent)
+    domain: Option<String>,
+    expires: Option<i64>,
+}
+
+/// the date formats http.cookiejar's `http2time` accepts most often (GMT is implied)
+fn parse_cookie_expires(text: &str) -> Option<i64> {
+    let t = text.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(t) {
+        return Some(dt.timestamp());
+    }
+    let t = t.trim_end_matches("GMT").trim_end_matches("UTC").trim();
+    const FORMATS: &[&str] = &[
+        "%a, %d %b %Y %H:%M:%S",
+        "%A, %d-%b-%Y %H:%M:%S",
+        "%a, %d-%b-%Y %H:%M:%S",
+        "%A, %d-%b-%y %H:%M:%S",
+        "%a, %d-%b-%y %H:%M:%S",
+        "%a %b %e %H:%M:%S %Y",
+        "%d-%b-%Y %H:%M:%S",
+    ];
+    FORMATS.iter().find_map(|f| chrono::NaiveDateTime::parse_from_str(t, f).ok()).map(|n| n.and_utc().timestamp())
+}
+
+/// `None` = the cookie is dropped (empty name, or a bad attribute value that cookiejar rejects)
+fn parse_set_cookie(raw: &str, now: i64) -> Option<ParsedCookie> {
+    let mut parts = raw.split(';');
+    let first = parts.next().unwrap_or("").trim();
+    let (name, value) = match first.split_once('=') {
+        Some((n, v)) => (n.trim(), Some(v.trim().to_string())),
+        None => (first, None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let mut domain: Option<String> = None;
+    let mut domain_seen = false;
+    let mut path_seen = false;
+    let mut expires: Option<i64> = None;
+    let mut max_age: Option<i64> = None;
+    for param in parts {
+        let param = param.trim();
+        let (key, val) = match param.split_once('=') {
+            Some((k, v)) => (k.trim(), Some(v.trim())),
+            None => (param, None),
+        };
+        if key.is_empty() {
+            continue;
+        }
+        match key.to_lowercase().as_str() {
+            "max-age" => {
+                // a non-integer Max-Age makes cookiejar drop the whole cookie; the last one wins
+                let n = val.and_then(|v| v.parse::<i64>().ok())?;
+                max_age = Some(now.saturating_add(n));
+            }
+            "expires" => {
+                if expires.is_none() {
+                    expires = val.and_then(|v| parse_cookie_expires(v.trim_matches('"')));
+                }
+            }
+            "domain" => {
+                if !domain_seen {
+                    domain_seen = true;
+                    domain = Some(val?.to_lowercase());
+                }
+            }
+            "path" => {
+                if !path_seen {
+                    path_seen = true;
+                    if val.is_none() {
+                        return None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(ParsedCookie { name: name.to_string(), value, domain, expires: max_age.or(expires) })
+}
+
+/// `http.cookiejar.DefaultCookiePolicy.set_ok_domain` for version-0 cookies, with the dot prefix that
+/// `_cookie_from_cookie_tuple` adds to an explicit Domain. `erhn` is the effective request host.
+fn cookie_domain_ok(domain: &str, erhn: &str) -> bool {
+    let undotted = domain.strip_prefix('.').unwrap_or(domain);
+    if !undotted.contains('.') && !erhn.ends_with(".local") {
+        return false;
+    }
+    erhn.ends_with(domain) || erhn.ends_with(&format!("{}.local", undotted)) || format!(".{}", erhn).ends_with(domain)
+}
+
+/// requests' `dict(resp.cookies)`: the cookie jar that requests builds from one response's Set-Cookie
+/// headers. Expired cookies delete a same-named cookie instead of being stored, cookies whose Domain
+/// does not match the request host are rejected, and a bare name is kept with a None value.
+/// RFC 2965 (version > 0) rules are not modelled.
+fn cookie_jar_dict(set_cookies: &[String], request_host: &str, now: i64) -> Map<String, Value> {
+    let host = request_host.to_lowercase();
+    let erhn = if host.contains('.') { host } else { format!("{}.local", host) };
+    // (name, domain, value); a cookie is replaced by one with the same name and domain
+    let mut jar: Vec<(String, String, Option<String>)> = Vec::new();
+    for raw in set_cookies {
+        let Some(c) = parse_set_cookie(raw, now) else { continue };
+        let domain_specified = c.domain.is_some();
+        let domain = match c.domain {
+            Some(d) if d.starts_with('.') => d,
+            Some(d) => format!(".{}", d),
+            None => erhn.clone(),
+        };
+        let same = |n: &String, d: &String| *n == c.name && *d == domain;
+        jar.retain(|(n, d, _)| !same(n, d));
+        if c.expires.is_some_and(|t| t <= now) {
+            continue;
+        }
+        if domain_specified && !cookie_domain_ok(&domain, &erhn) {
+            continue;
+        }
+        jar.push((c.name, domain, c.value));
+    }
+    let mut out = Map::new();
+    for (name, _, value) in jar {
+        out.insert(name, value.map(Value::String).unwrap_or(Value::Null));
+    }
+    out
 }
 
 impl HttpCore {
@@ -267,7 +489,9 @@ impl HttpCore {
         (0..32).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
     }
 
-    pub fn wrap_untrusted(&self, content: &Value, source: &str) -> Value {
+    /// python's `_wrap_untrusted(content, source="external_web")`; `None` = the python default
+    pub fn wrap_untrusted(&self, content: &Value, source: Option<&str>) -> Value {
+        let source = source.unwrap_or("external_web");
         let delim = Self::generate_delimiter();
         if let Value::String(s) = content {
             let detection = ContentSanitizer::sanitize_with_detection(s);
@@ -379,28 +603,33 @@ impl HttpCore {
         Ok(())
     }
 
-    /// Full safety validation for a URL we are about to connect to.
-    /// Err(Ok(msg)) = policy rejection, Err(Err(msg)) = python exception (port ValueError)
-    pub async fn is_safe_url(&self, url: &str) -> Result<(), Result<String, String>> {
-        let parsed = urlsplit(url).map_err(|e| Ok(format!("URL parse error: {}", e)))?;
-        if !ALLOWED_SCHEMES.contains(&parsed.scheme.as_str()) {
-            return Err(Ok(format!("Scheme not allowed: {}", parsed.scheme)));
+    /// Full safety validation for a URL we are about to connect to. Takes the parsed `Url` that the
+    /// request is sent to, so the checks and the connection share one parser. (python's urlparse
+    /// and the WHATWG parser disagree on `\` in the authority: `http://127.0.0.1\@evil.com/` would
+    /// validate as evil.com while connecting to 127.0.0.1.)
+    /// Err = policy rejection with python's message.
+    pub async fn is_safe_url(&self, url: &reqwest::Url) -> Result<(), String> {
+        let scheme = url.scheme();
+        if !ALLOWED_SCHEMES.contains(&scheme) {
+            return Err(format!("Scheme not allowed: {}", scheme));
         }
-        if self.config.get_bool("https_only") && parsed.scheme != "https" {
-            return Err(Ok("HTTPS-only mode is enabled".into()));
+        if self.config.get_bool("https_only") && scheme != "https" {
+            return Err("HTTPS-only mode is enabled".into());
         }
-        let Some(hostname) = parsed.hostname() else { return Err(Ok("URL has no hostname".into())) };
-        let port = parsed.port().map_err(Err)?;
-        if let Some(p) = port {
-            if p != 0 && DANGEROUS_PORTS.contains(&p) {
-                return Err(Ok(format!("Port {} is blocked", p)));
+        // host_str() is lower-cased and punycode-encoded (so IDN hosts resolve); IPv6 keeps brackets
+        let Some(hostname) = url.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']')).filter(|h| !h.is_empty()) else {
+            return Err("URL has no hostname".into());
+        };
+        if let Some(p) = url.port() {
+            if p != 0 && DANGEROUS_PORTS.contains(&(p as u32)) {
+                return Err(format!("Port {} is blocked", p));
             }
         }
-        self.check_domain_policy(&hostname).map_err(Ok)?;
+        self.check_domain_policy(hostname)?;
         if self.config.get_bool("block_local_network_access") && (hostname == "localhost" || hostname == "0.0.0.0") {
-            return Err(Ok("Blocked localhost access".into()));
+            return Err("Blocked localhost access".into());
         }
-        self.resolve_and_validate(&hostname).await.map_err(Ok)
+        self.resolve_and_validate(hostname).await
     }
 
     /// Validate URL format, scheme, and port.
@@ -489,11 +718,6 @@ impl HttpCore {
             }
         }
         result
-    }
-
-    /// `_guardrail_check`: python placeholder that always reports safe (its only caller is commented out)
-    pub async fn guardrail_check(&self, _content: &str) -> bool {
-        true
     }
 
     // ==================== Input Sanitization ====================
@@ -629,32 +853,20 @@ impl HttpCore {
         include_content: bool,
     ) -> Result<Value, Fail> {
         let client = Self::client().map_err(|e| Fail::Unexpected(e.to_string()))?;
-        let mut header_map = reqwest::header::HeaderMap::new();
-        for (k, v) in headers {
-            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).map_err(|_| Fail::Request(format!("Invalid header name {}", py_repr(&json!(k)))))?;
-            if v.chars().any(|c| (c as u32) > 0xFF) {
-                return Err(Fail::Unexpected(format!("'latin-1' codec can't encode characters in header {}", py_repr(&json!(k)))));
-            }
-            let bytes: Vec<u8> = v.chars().map(|c| c as u32 as u8).collect();
-            let value = reqwest::header::HeaderValue::from_bytes(&bytes)
-                .map_err(|_| Fail::Request(format!("Invalid leading whitespace, reserved character(s), or return character(s) in header value: {}", py_repr(&json!(v)))))?;
-            header_map.append(name, value);
-        }
         let has_ct = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
 
         let mut current_url = url.to_string();
         for _hop in 0..=MAX_REDIRECTS {
-            match self.is_safe_url(&current_url).await {
-                Ok(()) => {}
-                Err(Ok(err)) => {
-                    self.log(&format!("Blocked URL ({}): {}", current_url, err));
-                    return Ok(ol_core::module::tool_result(json!("URL blocked by security policy"), false));
-                }
-                Err(Err(exc)) => return Err(Fail::Unexpected(exc)),
+            // one parse per hop: the Url that is validated is the Url that is sent
+            let mut full = reqwest::Url::parse(&current_url).map_err(|e| Fail::Request(format!("Invalid URL {}: {}", py_repr(&json!(current_url)), e)))?;
+            if let Err(err) = self.is_safe_url(&full).await {
+                self.log(&format!("Blocked URL ({}): {}", current_url, err));
+                return Ok(ol_core::module::tool_result(json!("URL blocked by security policy"), false));
             }
 
+            // requests validates the headers when it prepares the request, after the URL check
+            let header_map = build_header_map(headers)?;
             // requests: prepare_url (+ params appended to the existing query)
-            let mut full = reqwest::Url::parse(&current_url).map_err(|e| Fail::Request(format!("Invalid URL {}: {}", py_repr(&json!(current_url)), e)))?;
             if let Some(p) = params {
                 let enc = urlencode(p);
                 if !enc.is_empty() {
@@ -665,7 +877,7 @@ impl HttpCore {
                     full.set_query(Some(&q));
                 }
             }
-            let mut req = client.request(method.reqwest(), full).headers(header_map.clone());
+            let mut req = client.request(method.reqwest(), full).headers(header_map);
             if let Some(d) = data {
                 let body = urlencode(d);
                 if !body.is_empty() {
@@ -718,18 +930,9 @@ impl HttpCore {
             let vals: Vec<String> = resp.headers().get_all(name).iter().map(|v| latin1(v.as_bytes())).collect();
             headers.insert(title_case_header(name.as_str()), Value::String(vals.join(", ")));
         }
-        // dict(resp.cookies)
-        let mut cookies = Map::new();
-        for sc in resp.headers().get_all("set-cookie") {
-            let s = latin1(sc.as_bytes());
-            let first = s.split(';').next().unwrap_or("");
-            if let Some((k, v)) = first.split_once('=') {
-                let k = k.trim();
-                if !k.is_empty() {
-                    cookies.insert(k.to_string(), Value::String(v.trim().to_string()));
-                }
-            }
-        }
+        // dict(resp.cookies): cookiejar policy applied to this hop's Set-Cookie headers
+        let set_cookies: Vec<String> = resp.headers().get_all("set-cookie").iter().map(|v| latin1(v.as_bytes())).collect();
+        let cookies = cookie_jar_dict(&set_cookies, resp.url().host_str().unwrap_or(""), now_secs() as i64);
         let content_type_raw = resp.headers().get("content-type").map(|v| latin1(v.as_bytes()));
 
         let mut response = Map::new();
@@ -988,5 +1191,66 @@ mod tests {
         assert_eq!(v, json!({"is_safe": true, "issues": []}));
         let v = HttpCore::validate_output_safety("ééé a");
         assert_eq!(v["issues"][0]["description"], "60.0% non-ASCII characters");
+    }
+    #[test]
+    fn cookie_jar_follows_cookiejar_policy() {
+        // 2030: the 2015 Expires date is in the past
+        let now = 1_900_000_000;
+        let set = vec![
+            "gone=1; Max-Age=0".to_string(),
+            "keep=2".to_string(),
+            "bad=3; Domain=other.org".to_string(),
+            "bare".to_string(),
+            "ok=4; Domain=example.com; Path=/".to_string(),
+            "old=5; Expires=Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+        ];
+        let jar = cookie_jar_dict(&set, "api.example.com", now);
+        assert_eq!(serde_json::to_string(&jar).unwrap(), r#"{"keep":"2","bare":null,"ok":"4"}"#);
+        // an expiring Set-Cookie deletes the same-named cookie from the same response
+        let jar = cookie_jar_dict(&["a=1".to_string(), "a=2; Max-Age=0".to_string()], "api.example.com", now);
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn header_policy_matches_requests_and_http_client() {
+        let lead_space = vec![("X-A".to_string(), " x".to_string())];
+        match build_header_map(&lead_space) {
+            Err(Fail::Request(m)) => assert_eq!(m, "Invalid leading whitespace, reserved character(s), or return character(s) in header value: ' x'"),
+            _ => panic!("expected InvalidHeader-style Request failure"),
+        }
+        let cjk = vec![("X-A".to_string(), "\u{4e2d}".to_string())];
+        match build_header_map(&cjk) {
+            Err(Fail::Unexpected(m)) => assert_eq!(m, "'latin-1' codec can't encode character '\\u4e2d' in position 0: ordinal not in range(256)"),
+            _ => panic!("expected UnicodeEncodeError-style Unexpected failure"),
+        }
+        let ok = vec![("X-A".to_string(), "fine".to_string())];
+        assert!(build_header_map(&ok).is_ok());
+    }
+
+    #[tokio::test]
+    async fn safety_check_judges_the_host_that_is_connected() {
+        let core = HttpCore::new(ModuleConfig::new(ol_core::config::ConfigView::new(&["modules", "settings", "http"])));
+        // WHATWG reads `\` as the end of the authority, so the host is metadata.internal
+        let url = reqwest::Url::parse("http://metadata.internal\\@evil.example/").unwrap();
+        assert_eq!(core.is_safe_url(&url).await.unwrap_err(), "Blocked metadata endpoint");
+        let ftp = reqwest::Url::parse("ftp://x.example/").unwrap();
+        assert_eq!(core.is_safe_url(&ftp).await.unwrap_err(), "Scheme not allowed: ftp");
+    }
+
+    #[test]
+    fn tls_failures_are_found_by_type_not_text() {
+        let tls = std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::General("bad certificate".into()));
+        assert!(chain_has_tls(&tls));
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connect failed for https://tlsnotes.example.com certificate");
+        assert!(!chain_has_tls(&refused));
+    }
+
+    #[test]
+    fn wrap_untrusted_defaults_source_and_utf16_bom() {
+        let core = HttpCore::new(ModuleConfig::new(ol_core::config::ConfigView::new(&["modules", "settings", "http"])));
+        assert_eq!(core.wrap_untrusted(&json!("hi"), None)["source"], "external_web");
+        assert_eq!(core.wrap_untrusted(&json!("hi"), Some("search"))["source"], "search");
+        assert_eq!(decode_bytes(b"\xfe\xff\x00A", "utf-16").unwrap(), "A");
+        assert_eq!(decode_bytes(b"\xff\xfeA\x00", "utf-16").unwrap(), "A");
     }
 }
