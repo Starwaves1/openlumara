@@ -203,7 +203,7 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
                             Err(e) => host.log("webui", &format!("skipping sidebar icon '{}': {}", icon_path.display(), e)),
                         }
                     }
-                    let label = ol_core::pyjson::title(&name.replace(['_', '-'], " "));
+                    let label = crate::util::py_title(&name.replace(['_', '-'], " "));
                     let mut entry: BTreeMap<&str, JValue> = BTreeMap::new();
                     entry.insert("module", JValue::from(module_name.clone()));
                     entry.insert("name", JValue::from(name));
@@ -242,6 +242,67 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
     }
 
     env
+}
+
+/// python `Webui._ui_extension_enabled`: the module's configured `enable_webui_extension`
+/// decides, falling back to the declared setting default, and defaulting to enabled when neither
+/// exists. strings are false only for false/0/no/off/'' (after strip and lower)
+pub fn ui_extension_enabled(config_value: Option<&serde_json::Value>, declared_setting: Option<&serde_json::Value>) -> bool {
+    use serde_json::Value;
+    let configured = config_value.filter(|v| !v.is_null());
+    let enabled = configured.or_else(|| {
+        declared_setting
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("default"))
+            .filter(|v| !v.is_null())
+    });
+    match enabled {
+        None => true,
+        Some(Value::String(s)) => !matches!(crate::util::py_strip(s).to_lowercase().as_str(), "false" | "0" | "no" | "off" | ""),
+        Some(v) => ol_core::pyjson::truthy(v),
+    }
+}
+
+/// python `Webui._ext_module_config`: every declared setting name mapped to the module's value
+/// (None when the module has no value for it)
+pub fn ext_module_config(setting_names: &[&str], config: &serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+    setting_names
+        .iter()
+        .map(|name| (name.to_string(), config.get(*name).cloned().unwrap_or(serde_json::Value::Null)))
+        .collect()
+}
+
+/// python `Webui._ui_asset_urls(ext)`: `/ext-assets/<module>/<relpath>` for every `.<ext>` file under
+/// each module's assets dir, modules in sorted order, files sorted within each directory
+pub fn ui_asset_urls(asset_dirs: &BTreeMap<String, PathBuf>, ext: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for (module_name, assets_dir) in asset_dirs {
+        let ext_dir = assets_dir.join(ext);
+        if !ext_dir.is_dir() {
+            continue;
+        }
+        let mut pending = vec![ext_dir];
+        while let Some(dir) = pending.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            entries.sort();
+            let mut files = Vec::new();
+            for path in entries {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().map(|n| n.to_string_lossy().ends_with(&format!(".{}", ext))).unwrap_or(false) {
+                    files.push(path);
+                }
+            }
+            // subdirectories are popped in reverse, so visit them in name order
+            for path in files {
+                let Ok(rel) = path.strip_prefix(assets_dir) else { continue };
+                let rel = rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
+                urls.push(format!("/ext-assets/{}/{}", module_name, rel));
+            }
+        }
+    }
+    urls
 }
 
 /// (file count, newest mtime, total size) over the template folders: changes trigger a
@@ -395,5 +456,47 @@ mod tests {
         write(&core.join("part.html"), "CHANGED and longer");
         let out = store.render("page.html", minijinja::context! { config => JValue::from_serialize(serde_json::json!({})), version => 2.0 }).unwrap();
         assert!(out.contains("CHANGED"));
+    }
+
+    #[test]
+    fn extension_gate_and_module_config() {
+        use serde_json::json;
+        // configured value wins; a string is compared as python does
+        assert!(!ui_extension_enabled(Some(&json!(" False ")), Some(&json!({"default": true}))));
+        assert!(!ui_extension_enabled(Some(&json!("  ")), None));
+        assert!(ui_extension_enabled(Some(&json!("yes")), None));
+        assert!(!ui_extension_enabled(Some(&json!(false)), None));
+        // not persisted yet: the declared default decides, and no setting at all means enabled
+        assert!(!ui_extension_enabled(None, Some(&json!({"default": false}))));
+        assert!(!ui_extension_enabled(Some(&json!(null)), Some(&json!({"default": 0}))));
+        assert!(ui_extension_enabled(None, Some(&json!({"type": "boolean"}))));
+        assert!(ui_extension_enabled(None, None));
+        let config = json!({"a": 1}).as_object().unwrap().clone();
+        let cfg = ext_module_config(&["a", "b"], &config);
+        assert_eq!(cfg, json!({"a": 1, "b": null}).as_object().unwrap().clone());
+    }
+
+    #[test]
+    fn asset_urls_are_sorted_and_filtered() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |rel: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        write("zeta/webui/assets/css/b.css");
+        write("zeta/webui/assets/css/a.css");
+        write("zeta/webui/assets/css/deep/c.css");
+        write("zeta/webui/assets/css/skip.js");
+        write("alpha/webui/assets/css/main.css");
+        write("alpha/webui/assets/js/x.js");
+        let mut dirs = BTreeMap::new();
+        dirs.insert("zeta".to_string(), root.path().join("zeta/webui/assets"));
+        dirs.insert("alpha".to_string(), root.path().join("alpha/webui/assets"));
+        assert_eq!(
+            ui_asset_urls(&dirs, "css"),
+            ["/ext-assets/alpha/css/main.css", "/ext-assets/zeta/css/a.css", "/ext-assets/zeta/css/b.css", "/ext-assets/zeta/css/deep/c.css"]
+        );
+        assert_eq!(ui_asset_urls(&dirs, "js"), ["/ext-assets/alpha/js/x.js"]);
     }
 }

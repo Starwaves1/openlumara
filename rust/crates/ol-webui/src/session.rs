@@ -6,6 +6,7 @@
 //! `session`, expires after `max_age` seconds, is re-issued on every response while the
 //! session is non-empty and cleared once it becomes empty.
 
+use crate::util::py_strip;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -83,31 +84,68 @@ pub fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// value of a cookie from a Cookie header
+/// value of a cookie, as starlette's `websocket.cookies.get(name)` sees it: only the first
+/// Cookie header is parsed (`headers.get`), and within it `cookie_parser` overwrites on each
+/// `;` chunk, so the LAST occurrence of a duplicated name wins
 pub fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    for h in headers.get_all(axum::http::header::COOKIE) {
-        let Ok(s) = h.to_str() else { continue };
-        for part in s.split(';') {
-            if let Some((k, v)) = part.trim().split_once('=') {
-                if k.trim() == name {
-                    let v = v.trim();
-                    let v = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(v);
-                    return Some(v.to_string());
-                }
-            }
+    let header = headers.get(axum::http::header::COOKIE)?;
+    let s = header.to_str().ok()?;
+    let mut found = None;
+    for chunk in s.split(';') {
+        let (key, val) = match chunk.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => ("", chunk),
+        };
+        let (key, val) = (py_strip(key), py_strip(val));
+        if key.is_empty() && val.is_empty() {
+            continue;
+        }
+        if key == name {
+            // http.cookies._unquote: surrounding double quotes are removed
+            let unquoted = val.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(val);
+            found = Some(unquoted.to_string());
         }
     }
-    None
+    found
 }
 
-/// timing-safe string comparison (python secrets.compare_digest)
-pub fn compare_digest(a: &str, b: &str) -> bool {
+pub const NON_ASCII_COMPARE: &str = "comparing strings with non-ASCII characters is not supported";
+
+/// timing-safe string comparison (python `secrets.compare_digest(str, str)`). python raises
+/// TypeError for non-ASCII str arguments, reported here as Err with the python message
+pub fn compare_digest(a: &str, b: &str) -> Result<bool, String> {
     use subtle::ConstantTimeEq;
+    if !a.is_ascii() || !b.is_ascii() {
+        return Err(NON_ASCII_COMPARE.to_string());
+    }
     // python returns False immediately for different lengths too
     if a.len() != b.len() {
-        return false;
+        return Ok(false);
     }
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    Ok(a.as_bytes().ct_eq(b.as_bytes()).into())
+}
+
+/// `compare_digest(str, None)` (a missing configured credential) is a TypeError in python
+fn compare_digest_configured(given: &str, configured: Option<&str>) -> Result<bool, String> {
+    match configured {
+        Some(c) => compare_digest(given, c),
+        None => Err("unsupported operand types(s) or combination of types: 'str' and 'NoneType'".to_string()),
+    }
+}
+
+/// python `Webui._verify_credentials`: the username is checked first; on a mismatch the
+/// password is still compared (dummy comparison against timing attacks) before returning False
+pub fn verify_credentials(
+    username: &str,
+    password: &str,
+    correct_username: Option<&str>,
+    correct_password: Option<&str>,
+) -> Result<bool, String> {
+    if !compare_digest_configured(username, correct_username)? {
+        compare_digest_configured(password, correct_password)?;
+        return Ok(false);
+    }
+    compare_digest_configured(password, correct_password)
 }
 
 #[cfg(test)]
@@ -142,12 +180,29 @@ mod tests {
 
     #[test]
     fn digest_and_cookies() {
-        assert!(compare_digest("admin", "admin"));
-        assert!(!compare_digest("admin", "admin2"));
-        assert!(!compare_digest("admin", "admiN"));
+        assert_eq!(compare_digest("admin", "admin"), Ok(true));
+        assert_eq!(compare_digest("admin", "admin2"), Ok(false));
+        assert_eq!(compare_digest("admin", "admiN"), Ok(false));
+        // python raises TypeError for non-ASCII str arguments
+        assert_eq!(compare_digest("pässword", "pässword"), Err(NON_ASCII_COMPARE.to_string()));
+        assert_eq!(verify_credentials("ü", "x", Some("ü"), Some("x")), Err(NON_ASCII_COMPARE.to_string()));
+        assert_eq!(verify_credentials("admin", "pw", Some("admin"), Some("pw")), Ok(true));
+        assert_eq!(verify_credentials("admin", "bad", Some("admin"), Some("pw")), Ok(false));
+        // username mismatch still compares the password first, which can raise
+        assert_eq!(verify_credentials("bob", "pässword", Some("admin"), Some("pw")), Err(NON_ASCII_COMPARE.to_string()));
+        assert_eq!(verify_credentials("admin", "pw", None, Some("pw")).is_err(), true);
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::COOKIE, "a=1; session=abc.def; b=2".parse().unwrap());
         assert_eq!(cookie_value(&h, "session").as_deref(), Some("abc.def"));
         assert_eq!(cookie_value(&h, "nope"), None);
+        // duplicate names: the last one wins, as in starlette's cookie_parser
+        let mut dup = axum::http::HeaderMap::new();
+        dup.insert(axum::http::header::COOKIE, "session=first; x=1; session=\"second\"".parse().unwrap());
+        assert_eq!(cookie_value(&dup, "session").as_deref(), Some("second"));
+        // only the first Cookie header is looked at (starlette uses headers.get)
+        let mut two = axum::http::HeaderMap::new();
+        two.append(axum::http::header::COOKIE, "session=one".parse().unwrap());
+        two.append(axum::http::header::COOKIE, "session=two".parse().unwrap());
+        assert_eq!(cookie_value(&two, "session").as_deref(), Some("one"));
     }
 }

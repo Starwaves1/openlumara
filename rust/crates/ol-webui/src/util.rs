@@ -1,6 +1,8 @@
 //! small python-semantics helpers used by the webui port
 
 use ol_core::pyjson::truthy;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::Value;
 
 /// python `type(x).__name__` for json values (used in python-style error strings)
@@ -16,46 +18,73 @@ pub fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// python `str.strip()` with no arguments: removes every char for which `str.isspace()` holds.
+/// rust's `trim()` (White_Space) misses U+001C-U+001F, which python treats as whitespace.
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
 /// python `(value or default).strip()`: falsy values become `default`, truthy
 /// non-strings raise AttributeError (returned as the python error message)
 pub fn or_strip(v: Option<&Value>, default: &str) -> Result<String, String> {
     match v {
         Some(v) if truthy(v) => match v {
-            Value::String(s) => Ok(s.trim().to_string()),
+            Value::String(s) => Ok(py_strip(s).to_string()),
             other => Err(format!("'{}' object has no attribute 'strip'", py_type_name(other))),
         },
-        _ => Ok(default.trim().to_string()),
+        _ => Ok(py_strip(default).to_string()),
     }
 }
 
 /// python `value.strip()` for `data.get(key, default)` (no `or` fallback)
 pub fn get_strip(v: Option<&Value>, default: &str) -> Result<String, String> {
     match v {
-        None => Ok(default.trim().to_string()),
-        Some(Value::String(s)) => Ok(s.trim().to_string()),
+        None => Ok(py_strip(default).to_string()),
+        Some(Value::String(s)) => Ok(py_strip(s).to_string()),
         Some(other) => Err(format!("'{}' object has no attribute 'strip'", py_type_name(other))),
     }
 }
 
-/// python `int(str)` (surrounding whitespace allowed, optional sign, underscores between digits)
+static DECIMAL_DIGIT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\p{Nd}$").unwrap());
+
+/// value of a unicode decimal digit (category Nd), as python's int() accepts them.
+/// unicode guarantees each Nd run is made of blocks of ten digits that start at zero,
+/// so the offset from the start of the contiguous run gives the digit value
+fn decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - '0' as u32);
+    }
+    let is_nd = |c: char| DECIMAL_DIGIT.is_match(c.encode_utf8(&mut [0; 4]));
+    if !is_nd(c) {
+        return None;
+    }
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).map(is_nd).unwrap_or(false) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// python `int(str)`: surrounding whitespace (python's definition) allowed, optional sign,
+/// unicode decimal digits, single underscores between digits. Values beyond the i64 range
+/// saturate: every caller clamps (list slicing) or overflows the same way python does.
 pub fn py_int_str(s: &str) -> Option<i64> {
-    let t = s.trim();
-    if t.is_empty() || t.starts_with('_') || t.ends_with('_') || t.contains("__") {
-        return None;
-    }
-    let (sign, digits) = match t.as_bytes()[0] {
-        b'+' => (1, &t[1..]),
-        b'-' => (-1, &t[1..]),
-        _ => (1, t),
+    const BIG: i128 = 1 << 70;
+    let t = py_strip(s);
+    let (negative, body) = match t.chars().next()? {
+        '+' => (false, &t[1..]),
+        '-' => (true, &t[1..]),
+        _ => (false, t),
     };
-    if digits.is_empty() || digits.starts_with('_') {
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
         return None;
     }
-    let cleaned: String = digits.chars().filter(|c| *c != '_').collect();
-    if !cleaned.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+    let mut value: i128 = 0;
+    for c in body.chars().filter(|c| *c != '_') {
+        value = (value * 10 + decimal_value(c)? as i128).min(BIG);
     }
-    cleaned.parse::<i64>().ok().map(|n| n * sign)
+    let value = if negative { -value } else { value };
+    Some(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 /// python `int(value)` for json values (floats truncate, bools are 0/1, strings are parsed)
@@ -83,6 +112,23 @@ pub fn py_slice<T: Clone>(items: &[T], start: i64, stop: i64) -> Vec<T> {
         return Vec::new();
     }
     items[s as usize..e as usize].to_vec()
+}
+
+/// python `str.title()`: the first cased char of each run of cased chars is upper-cased,
+/// the rest lower-cased. uncased chars (CJK, Hebrew, digits, punctuation) only separate words.
+/// (rust has no titlecase mapping in std, so ǆ-style digraphs become their uppercase form)
+pub fn py_title(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut previous_cased = false;
+    for c in s.chars() {
+        if previous_cased {
+            out.extend(c.to_lowercase());
+        } else {
+            out.extend(c.to_uppercase());
+        }
+        previous_cased = c.is_uppercase() || c.is_lowercase();
+    }
+    out
 }
 
 /// markupsafe `escape` (what jinja2 autoescape applies to plain str values):
@@ -174,5 +220,29 @@ mod tests {
         assert_eq!(or_strip(Some(&json!(5)), "").unwrap_err(), "'int' object has no attribute 'strip'");
         assert!(py_eq(&json!({"a": [1, 2.0]}), &json!({"a": [1.0, 2]})));
         assert_eq!(markup_escape("/assets/a&b'<\"x\">"), "/assets/a&amp;b&#39;&lt;&#34;x&#34;&gt;");
+    }
+
+    #[test]
+    fn python_strip_and_int_semantics() {
+        // python str.isspace() includes the file/group/record/unit separators
+        assert_eq!(py_strip("\u{1c}x\u{1f}"), "x");
+        assert_eq!(or_strip(Some(&json!("\u{1d}title\u{1e}")), "general").unwrap(), "title");
+        assert_eq!(py_int_str("\u{1c}7"), Some(7));
+        // unicode decimal digits (Nd) are accepted by python int()
+        assert_eq!(py_int_str("\u{0665}\u{0664}"), Some(54));
+        assert_eq!(py_int_str("\u{1d7db}"), Some(3));
+        assert_eq!(py_int_str("\u{00b2}"), None);
+        // arbitrary-size values saturate: callers clamp, so the result matches python's
+        assert_eq!(py_int_str("99999999999999999999999"), Some(i64::MAX));
+        assert_eq!(py_int_str("-99999999999999999999999"), Some(i64::MIN));
+        assert_eq!(py_int_str("1__0"), None);
+    }
+
+    #[test]
+    fn python_title() {
+        assert_eq!(py_title("hello world-foo"), "Hello World-Foo");
+        // python title() only counts cased characters as word material
+        assert_eq!(py_title("\u{4e2d}a"), "\u{4e2d}A");
+        assert_eq!(py_title("don't"), "Don'T");
     }
 }
