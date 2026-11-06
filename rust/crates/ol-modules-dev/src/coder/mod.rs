@@ -1069,8 +1069,10 @@ impl Coder {
                     Ok(_) => {}
                     Err(_) => continue,
                 }
-                let Ok(content) = pyos::read_text(&fpath) else { continue };
-                for (i, line) in pyos::readlines(&content).iter().enumerate() {
+                // python streams the file: lines decoded before a bad chunk still count,
+                // and the decode error only ends this file
+                let Ok((lines, _decode_error)) = pyos::stream_lines(&fpath) else { continue };
+                for (i, line) in lines.iter().enumerate() {
                     let hit = match &pattern {
                         Some(p) => match re_search(p, line) {
                             Ok(h) => h,
