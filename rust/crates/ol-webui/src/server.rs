@@ -191,7 +191,7 @@ impl Webui {
 }
 
 /// python `Webui.on_ready`: paths, template env, network mode -> host, url, websocket manager, session
-fn build_shared(ch: &Arc<Channel>) -> anyhow::Result<Arc<Shared>> {
+pub(crate) fn build_shared(ch: &Arc<Channel>) -> anyhow::Result<Arc<Shared>> {
     let webui_dir = PathBuf::from(get_path("channels/webui")?);
     let template_path = webui_dir.join("templates");
     let host: Arc<dyn ExtHost> = Arc::new(WebuiHost { ch: Arc::downgrade(ch) });
