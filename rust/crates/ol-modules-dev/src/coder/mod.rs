@@ -2,14 +2,13 @@
 //! extension routes (file tree/editor/search and git panel).
 
 #[path = "../../../../generated/modules/coder.rs"]
-mod meta;
+pub mod meta;
 pub mod syntax;
 
 use crate::pyos;
 use anyhow::anyhow;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, truthy};
-use ol_core::registry::{ModuleDescriptor, Registry};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::ops::ControlFlow;
@@ -20,18 +19,6 @@ const REGEX_BACKTRACK_LIMIT: usize = 1_000_000;
 const BUILTIN_TEMPLATES_PATH: &str = "modules/coder/templates";
 /// files the webui editor refuses to open (binary / huge)
 const UI_MAX_READ_BYTES: u64 = 1_000_000;
-
-pub fn register(r: &mut Registry) {
-    r.add_module(ModuleDescriptor {
-        name: "coder",
-        class_name: meta::CLASS_NAME,
-        doc: meta::DOC,
-        settings: meta::settings,
-        unsafe_: meta::UNSAFE,
-        category: meta::CATEGORY,
-        factory: |base| Arc::new(Coder::new(base)),
-    });
-}
 
 pub struct Coder {
     base: ModuleBase,
@@ -309,6 +296,10 @@ fn py_type(v: &Value) -> &'static str {
 }
 
 impl Coder {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
@@ -766,7 +757,8 @@ impl Coder {
 
     fn route_sandboxes(&self) -> anyhow::Result<Value> {
         let mode = self.cfg("editor_mode").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "standard".into());
-        let autosave = self.cfg("autosave_interval").filter(truthy).and_then(|v| ol_core::pyjson::as_f64(&v)).map(|f| f as i64).unwrap_or(0);
+        // python: int(self.config.get("autosave_interval") or 0)
+        let autosave = py_int(self.cfg("autosave_interval").filter(truthy).as_ref(), 0)?;
         Ok(json!({
             "sandboxes": self.get_sandbox_paths().map_err(err)?,
             "read_only": self.read_only(),
@@ -1070,6 +1062,8 @@ impl Coder {
                     Err(_) => continue,
                 }
                 let Ok(content) = pyos::read_text(&fpath) else { continue };
+                // python only breaks the line loop here: the file loop has no truncated
+                // check, so later files can still append (and the walk stops per folder)
                 for (i, line) in pyos::readlines(&content).iter().enumerate() {
                     let hit = match &pattern {
                         Some(p) => match re_search(p, line) {
@@ -1086,9 +1080,6 @@ impl Coder {
                             break;
                         }
                     }
-                }
-                if truncated {
-                    break;
                 }
             }
             if truncated {
@@ -1869,5 +1860,64 @@ mod tests {
         // python quirk: context_lines[:1] includes the line *after* the match
         assert_eq!(b, vec![json!("b")]);
         assert_eq!(a, vec![json!("b")]);
+    }
+
+    fn call(rt: &tokio::runtime::Runtime, c: &Coder, method: &str, args: Value) -> Value {
+        let map = args.as_object().cloned().unwrap_or_default();
+        rt.block_on(c.call_tool(method, ToolArgs::new(map))).unwrap()
+    }
+
+    /// one test owns the process-wide config (set_for_tests), so every tool check lives here
+    #[test]
+    fn tool_return_strings_match_python() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sb");
+        std::fs::create_dir_all(&root).unwrap();
+        ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
+            "sandbox_paths": [root.to_string_lossy()],
+            "enable_builtin_templates": false,
+            "template_paths": [],
+            "folder_blacklist": ["venv", "__pycache__"],
+            "global_line_limit": 1000,
+            "read-only": false,
+        }}}}));
+        let c = Coder::new(ModuleBase::detached("coder"));
+
+        // syntax gate: the file must not be written
+        let v = call(&rt, &c, "file_create", json!({"sandbox": "sb", "path": "bad.py", "content": "def f(:\n    return 1\n"}));
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["content"]["message"], "Syntax errors detected! File was not written to disk.");
+        assert!(!root.join("bad.py").exists());
+
+        let v = call(&rt, &c, "file_create", json!({"sandbox": "sb", "path": "a.py", "content": "x = 1\n# foo bar\n"}));
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["content"], "File a.py successfully created. Syntax verification passed - no need to verify further.");
+
+        // plain read of a small file: raw dict, no status wrapper
+        let v = call(&rt, &c, "file_read", json!({"sandbox": "sb", "path": "a.py"}));
+        assert_eq!(v["content"], "x = 1\n# foo bar\n");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["success"], true);
+
+        let v = call(&rt, &c, "file_grep", json!({"sandbox": "sb", "file_path": "a.py", "regex_pattern": "foo"}));
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["content"][0]["line_num"], 2);
+        assert_eq!(v["content"][0]["line"], "# foo bar");
+
+        let v = call(&rt, &c, "folder_grep", json!({"sandbox": "sb", "sub_path": "", "regex_pattern": "zzz"}));
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["content"], "No matches found");
+
+        let v = call(&rt, &c, "file_edit", json!({"sandbox": "sb", "path": "a.py", "original_code": "x = 1", "replacement_code": "x = 2"}));
+        assert_eq!(v["content"], "Successfully edited file a.py. Syntax verification passed - no need to verify further.");
+        assert_eq!(std::fs::read_to_string(root.join("a.py")).unwrap(), "x = 2\n# foo bar\n");
+
+        // webui route: flat search results, python shape
+        let out = rt
+            .block_on(c.ui_route("search", "POST", Some(json!({"sandbox": "sb", "query": "FOO"})), Map::new()))
+            .unwrap();
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["results"][0], json!({"file": "a.py", "line": 2, "text": "# foo bar"}));
     }
 }
