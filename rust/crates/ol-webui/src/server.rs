@@ -476,9 +476,10 @@ fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-/// `request.form.get(name)` for url-encoded bodies
+/// `request.form.get(name)` for url-encoded bodies. starlette's FormData keeps the LAST value of a
+/// repeated key (it is built as a dict), so this takes the last match too
 fn form_field(body: &[u8], name: &str) -> Option<String> {
-    url::form_urlencoded::parse(body).find(|(k, _)| k == name).map(|(_, v)| v.into_owned())
+    url::form_urlencoded::parse(body).filter(|(k, _)| k == name).last().map(|(_, v)| v.into_owned())
 }
 
 async fn login_submit(
@@ -606,6 +607,8 @@ mod tests {
     fn form_field_reads_urlencoded_body() {
         assert_eq!(form_field(b"username=admin&password=p%40ss+x", "password").as_deref(), Some("p@ss x"));
         assert_eq!(form_field(b"username=admin", "password"), None);
+        // a repeated key: starlette's dict-built FormData keeps the last value
+        assert_eq!(form_field(b"username=a&username=b", "username").as_deref(), Some("b"));
         assert_eq!(py_int(&json!(3)), Some(3));
     }
 }

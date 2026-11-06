@@ -7,13 +7,12 @@
 //! `sync`, `chat_switched`, `chat_metadata_updated`, `error`, `shutdown`.
 
 use crate::server::Shared;
-use crate::util::{py_int, py_type_name};
+use crate::util::py_type_name;
 use anyhow::anyhow;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use indexmap::IndexMap;
 use ol_core::channel::{Channel, Files, SendArgs, TokenStream};
@@ -196,7 +195,7 @@ async fn serve_connection(app: Arc<Shared>, socket: WebSocket) {
             Ok(_) => {}
             // python: a transport error that is not a clean disconnect is logged before the close
             Err(e) => {
-                ch.log(&ch.name, &format!("WebSocket error: {}", e));
+                ch.log(&ch.name, &format!("WebSocket error: {}", ol_core::detail_error(&e)));
                 break;
             }
         }
@@ -272,14 +271,35 @@ async fn handle_command(app: &Arc<Shared>, ch: &Arc<Channel>, text: &str) -> Flo
     }
 }
 
-/// python `index < 0` / `messages[index]` operand: an int (bool counts as int); anything else is
-/// the python TypeError raised by the comparison
-fn py_index(value: Option<&Value>) -> anyhow::Result<i64> {
+/// a client index as python sees it in `index < 0`: an int (bool counts as int) or a float. a float
+/// passes that comparison, so python fails later in the operation that uses it
+#[derive(Debug)]
+enum PyIndex {
+    Int(i64),
+    Float(f64),
+}
+
+/// python `index < 0` operand from the client JSON; anything that is not a number is the python
+/// TypeError raised by the comparison
+fn py_index(value: Option<&Value>) -> anyhow::Result<PyIndex> {
     let v = value.cloned().unwrap_or(Value::Null);
-    let int_like = matches!(v, Value::Number(_) | Value::Bool(_));
-    match py_int(&v).filter(|_| int_like) {
-        Some(i) => Ok(i),
-        None => anyhow::bail!("'<' not supported between instances of '{}' and 'int'", py_type_name(&v)),
+    match &v {
+        Value::Bool(b) => Ok(PyIndex::Int(i64::from(*b))),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => Ok(PyIndex::Int(i)),
+            None => Ok(PyIndex::Float(n.as_f64().unwrap_or(0.0))),
+        },
+        _ => anyhow::bail!("'<' not supported between instances of '{}' and 'int'", py_type_name(&v)),
+    }
+}
+
+/// the error python raises for a float index that passed `index < 0`: `messages.get` and
+/// `delete_from` check `index >= len` first, then fail on the float itself
+fn float_index_error(ch: &Channel, index: f64, list_error: &str) -> anyhow::Error {
+    if index >= ch.chat.messages_get().len() as f64 {
+        anyhow!("Invalid message index")
+    } else {
+        anyhow!("{}", list_error)
     }
 }
 
@@ -289,19 +309,58 @@ fn message_at(ch: &Channel, index: i64) -> anyhow::Result<Value> {
     ch.chat.messages_get_at(i).map_err(|_| anyhow!("list index out of range"))
 }
 
-/// python `base64.b64decode(data)` (validate=False): characters outside the base64 alphabet are
-/// discarded before decoding, so line wraps and spaces are accepted. non-ASCII text is a TypeError
+fn base64_value(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// python `base64.b64decode(data)` (`binascii.a2b_base64`, validate=False), ported: characters that
+/// are not in the alphabet or '=' are skipped, the trailing bits of the last quad are dropped, and
+/// the padding is only checked at the end. non-ASCII text is a TypeError. the error texts are CPython's
 fn b64decode_lenient(text: &str) -> anyhow::Result<Vec<u8>> {
     if !text.is_ascii() {
         anyhow::bail!("string argument should contain only ASCII characters");
     }
-    let cleaned: String = text
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
-        .collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(cleaned)
-        .map_err(|_| anyhow!("Incorrect padding"))
+    let mut out = Vec::new();
+    let mut quad: Vec<u8> = Vec::with_capacity(4);
+    let mut data_chars = 0usize;
+    let mut pads_since_data = 0usize;
+    for c in text.bytes() {
+        if c == b'=' {
+            pads_since_data += 1;
+            continue;
+        }
+        let Some(v) = base64_value(c) else { continue };
+        data_chars += 1;
+        pads_since_data = 0;
+        quad.push(v);
+        if let &[a, b, c, d] = quad.as_slice() {
+            out.push((a << 2) | (b >> 4));
+            out.push(((b & 0x0f) << 4) | (c >> 2));
+            out.push(((c & 0x03) << 6) | d);
+            quad.clear();
+        }
+    }
+    match quad.as_slice() {
+        [] => {}
+        [_] => anyhow::bail!(
+            "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
+            data_chars
+        ),
+        &[a, b] if pads_since_data >= 2 => out.push((a << 2) | (b >> 4)),
+        &[a, b, c] if pads_since_data >= 1 => {
+            out.push((a << 2) | (b >> 4));
+            out.push(((b & 0x0f) << 4) | (c >> 2));
+        }
+        _ => anyhow::bail!("Incorrect padding"),
+    }
+    Ok(out)
 }
 
 /// python `_stream_task` file decoding: `{f["name"]: base64.b64decode(f["data"])}`. the error texts
@@ -354,10 +413,12 @@ async fn cmd_user_message(app: &Arc<Shared>, ch: &Arc<Channel>, obj: &serde_json
 }
 
 async fn cmd_message_edit(app: &Arc<Shared>, ch: &Arc<Channel>, obj: &serde_json::Map<String, Value>) -> anyhow::Result<Flow> {
-    let index = py_index(obj.get("index"))?;
-    if index < 0 {
-        return Ok(Flow::Close);
-    }
+    let index = match py_index(obj.get("index"))? {
+        PyIndex::Int(i) if i < 0 => return Ok(Flow::Close),
+        PyIndex::Float(f) if f < 0.0 => return Ok(Flow::Close),
+        PyIndex::Int(i) => i,
+        PyIndex::Float(f) => return Err(float_index_error(ch, f, "list indices must be integers or slices, not float")),
+    };
     let mut message = message_at(ch, index)?;
     if !message.is_object() {
         anyhow::bail!("'{}' object does not support item assignment", py_type_name(&message));
@@ -369,10 +430,14 @@ async fn cmd_message_edit(app: &Arc<Shared>, ch: &Arc<Channel>, obj: &serde_json
 }
 
 async fn cmd_message_delete(app: &Arc<Shared>, ch: &Arc<Channel>, obj: &serde_json::Map<String, Value>) -> anyhow::Result<Flow> {
-    let index = py_index(obj.get("index"))?;
-    if index < 0 {
-        return Ok(Flow::Close);
-    }
+    let index = match py_index(obj.get("index"))? {
+        PyIndex::Int(i) if i < 0 => return Ok(Flow::Close),
+        PyIndex::Float(f) if f < 0.0 => return Ok(Flow::Close),
+        PyIndex::Int(i) => i,
+        PyIndex::Float(f) => {
+            return Err(float_index_error(ch, f, "slice indices must be integers or None or have an __index__ method"))
+        }
+    };
     ch.chat.messages_delete_from(index as usize).await?;
     app.ws.broadcast(json!({"type": "sync"}));
     Ok(Flow::Continue)
@@ -383,7 +448,18 @@ async fn cmd_message_regenerate(app: &Arc<Shared>, ch: &Arc<Channel>, obj: &serd
     if index.is_null() {
         return Ok(Flow::Continue);
     }
-    let cutoff = py_index(Some(&index))?;
+    let cutoff = match py_index(Some(&index))? {
+        PyIndex::Int(i) => i,
+        PyIndex::Float(f) => {
+            // python `min(cutoff, len - 1)` keeps the float unless it is past the last index, and then
+            // `range()` rejects it. with fewer than two messages python returns before that point
+            let last = ch.chat.messages_get().len() as i64 - 1;
+            if last >= 1 && f <= last as f64 {
+                anyhow::bail!("'float' object cannot be interpreted as an integer");
+            }
+            last
+        }
+    };
     let last_user = ch.chat.get_last_message_with_role("user", Some(cutoff));
     if last_user == -1 {
         app.ws.broadcast(json!({
@@ -587,9 +663,11 @@ mod tests {
 
     #[test]
     fn python_index_semantics() {
-        assert_eq!(py_index(Some(&json!(2))).unwrap(), 2);
-        assert_eq!(py_index(Some(&json!(true))).unwrap(), 1);
-        assert_eq!(py_index(Some(&json!(-1))).unwrap(), -1);
+        assert!(matches!(py_index(Some(&json!(2))).unwrap(), PyIndex::Int(2)));
+        assert!(matches!(py_index(Some(&json!(true))).unwrap(), PyIndex::Int(1)));
+        assert!(matches!(py_index(Some(&json!(-1))).unwrap(), PyIndex::Int(-1)));
+        // a float is kept as a float (python `1.5 < 0` works, then the operation raises), not truncated
+        assert!(matches!(py_index(Some(&json!(1.5))).unwrap(), PyIndex::Float(f) if f == 1.5));
         assert_eq!(
             py_index(None).unwrap_err().to_string(),
             "'<' not supported between instances of 'NoneType' and 'int'"
@@ -598,6 +676,20 @@ mod tests {
             py_index(Some(&json!("3"))).unwrap_err().to_string(),
             "'<' not supported between instances of 'str' and 'int'"
         );
+    }
+
+    #[test]
+    fn base64_matches_cpython_a2b_base64_outputs() {
+        // expected values were produced by python3 base64.b64decode (validate=False)
+        assert_eq!(b64decode_lenient("QR==").unwrap(), b"A");
+        assert_eq!(b64decode_lenient("QR==QR").unwrap(), vec![65u8, 20, 17]);
+        assert_eq!(b64decode_lenient("QUJ=DRA==").unwrap(), b"ABCD");
+        assert_eq!(b64decode_lenient("aGk=kk").unwrap_err().to_string(), "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4");
+        assert_eq!(b64decode_lenient("aGkkk=").unwrap_err().to_string(), "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4");
+        assert_eq!(b64decode_lenient("QR=").unwrap_err().to_string(), "Incorrect padding");
+        assert_eq!(b64decode_lenient("QUJDRA==QUJD").unwrap_err().to_string(), "Incorrect padding");
+        assert_eq!(b64decode_lenient("aGk").unwrap_err().to_string(), "Incorrect padding");
+        assert_eq!(b64decode_lenient("aGk=").unwrap(), b"hi");
     }
 
     #[test]
