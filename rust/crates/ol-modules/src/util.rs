@@ -142,6 +142,10 @@ pub fn os_error(e: &std::io::Error, path: &str) -> String {
 /// python `open(path, 'r', encoding='utf-8').read()`: utf-8 decoding + universal newlines.
 /// errors are formatted like str(exception).
 pub fn read_text(path: &str) -> Result<String, String> {
+    // python: open() rejects a NUL in the path before any system call
+    if path.contains('\0') {
+        return Err("embedded null byte".to_string());
+    }
     let bytes = std::fs::read(path).map_err(|e| os_error(&e, path))?;
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
@@ -217,7 +221,16 @@ pub fn no_channel() -> anyhow::Error {
 
 /// `self.channel.context.chat.get("metadata").get("character")` (truthy?)
 pub fn chat_has_character(ch: &Arc<Channel>) -> anyhow::Result<bool> {
-    match ch.chat.get("metadata") {
+    // python: Chat.get() raises before the key lookup when no chat is loaded
+    if ch.chat.current().is_none() {
+        return Err(anyhow::anyhow!("No chat is currently loaded!"));
+    }
+    metadata_has_character(ch.chat.get("metadata"))
+}
+
+/// `metadata.get("character")` (truthy?) for the value of the "metadata" key of the current chat
+fn metadata_has_character(metadata: Option<Value>) -> anyhow::Result<bool> {
+    match metadata {
         Some(Value::Object(m)) => Ok(m.get("character").map(truthy).unwrap_or(false)),
         Some(Value::Null) | None => Err(anyhow::anyhow!("'NoneType' object has no attribute 'get'")),
         Some(other) => Err(anyhow::anyhow!("'{}' object has no attribute 'get'", py_type_name(&other))),
@@ -240,6 +253,9 @@ pub fn py_type_name(v: &Value) -> &'static str {
 /// os.listdir: names only. a read error part way through fails the whole listing, like python.
 /// names that are not valid utf-8 are lossy (python keeps them via surrogateescape).
 pub fn listdir(path: &str) -> Result<Vec<String>, String> {
+    if path.contains('\0') {
+        return Err("listdir: embedded null character in path".to_string());
+    }
     let rd = std::fs::read_dir(path).map_err(|e| os_error(&e, path))?;
     let mut names = Vec::new();
     for entry in rd {
@@ -375,6 +391,25 @@ mod tests {
         assert_eq!(
             listdir(missing.to_str().unwrap()).unwrap_err(),
             format!("[Errno 2] No such file or directory: {}", repr_str(missing.to_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn nul_in_path_raises_like_python() {
+        // python: open('a\0b') -> ValueError 'embedded null byte'; os.listdir('a\0b') -> ValueError
+        assert_eq!(read_text("a\0b").unwrap_err(), "embedded null byte");
+        assert_eq!(listdir("a\0b").unwrap_err(), "listdir: embedded null character in path");
+    }
+
+    #[test]
+    fn chat_metadata_character_flag_and_python_errors() {
+        assert_eq!(metadata_has_character(Some(serde_json::json!({"character": "Ann"}))).unwrap(), true);
+        assert_eq!(metadata_has_character(Some(serde_json::json!({"character": ""}))).unwrap(), false);
+        assert_eq!(metadata_has_character(Some(serde_json::json!({}))).unwrap(), false);
+        assert_eq!(metadata_has_character(None).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
+        assert_eq!(
+            metadata_has_character(Some(serde_json::json!("s"))).unwrap_err().to_string(),
+            "'str' object has no attribute 'get'"
         );
     }
 
