@@ -8,6 +8,18 @@ use std::ffi::{CStr, CString, OsString};
 use std::sync::Arc;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
+/// python channels/webui `_ui_extension_enabled`, given the configured value and the declared
+/// default. A configured value wins, then the default, then True. Strings are false for
+/// 'false', '0', 'no', 'off' or '' (case and surrounding whitespace ignored).
+pub fn ui_extension_enabled(configured: Option<&Value>, declared_default: Option<&Value>) -> bool {
+    let value = [configured, declared_default].into_iter().flatten().find(|v| !v.is_null());
+    match value {
+        None => true,
+        Some(Value::String(s)) => !matches!(s.trim().to_lowercase().as_str(), "false" | "0" | "no" | "off" | ""),
+        Some(v) => truthy(v),
+    }
+}
+
 /// os.path.expanduser
 pub fn expanduser(p: &str) -> String {
     expanduser_with(p, std::env::var_os("HOME"), passwd_home)
