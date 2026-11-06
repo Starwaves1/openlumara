@@ -9,8 +9,8 @@
 pub mod meta;
 
 use crate::util::{
-    os_err, os_err2, os_err_bare, py_abspath, py_basename, py_join, py_name, py_absolute, py_parent, py_path, py_type_name,
-    same_file, universal_newlines,
+    display_os, os_err, os_err2, os_err_bare, py_abspath, py_absolute, py_basename_os, py_name, py_parent, py_path, py_quote,
+    py_repr_os, py_type_name, same_file, universal_newlines,
 };
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -19,9 +19,21 @@ use serde_json::{json, Map, Value};
 use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// python `os.path.samefile` / `os.stat` ValueError text for an embedded NUL in a path
+const STAT_NUL: &str = "stat: embedded null character in path";
+/// python `os.mkdir` ValueError text for an embedded NUL in a path
+const MKDIR_NUL: &str = "mkdir: embedded null character in path";
+/// python `open()` ValueError text for an embedded NUL in a path
+const OPEN_NUL: &str = "embedded null byte";
+
+fn has_nul(p: &Path) -> bool {
+    p.as_os_str().as_bytes().contains(&0)
+}
 
 pub struct FileManager {
     base: ModuleBase,
@@ -59,7 +71,7 @@ fn read_text(path: &str) -> Result<String, ReadErr> {
 
 /// python `shutil.copystat(src, dst, follow_symlinks=follow)`: atime and mtime, then extended
 /// attributes, then mode (a followed link only, since Linux cannot chmod a symlink)
-fn copystat(src: &str, dst: &str, follow: bool) -> Result<(), String> {
+fn copystat(src: &Path, dst: &Path, follow: bool) -> Result<(), String> {
     let md = if follow { fs::metadata(src) } else { fs::symlink_metadata(src) }.map_err(|e| os_err(&e, src))?;
     set_times(dst, &md, follow)?;
     copy_xattrs(src, dst, follow)?;
@@ -69,8 +81,8 @@ fn copystat(src: &str, dst: &str, follow: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn set_times(dst: &str, md: &fs::Metadata, follow: bool) -> Result<(), String> {
-    let c = CString::new(dst).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(dst)))?;
+fn set_times(dst: &Path, md: &fs::Metadata, follow: bool) -> Result<(), String> {
+    let c = CString::new(dst.as_os_str().as_bytes()).map_err(|_| format!("embedded null byte in path {}", py_repr_os(dst)))?;
     let times = [
         libc::timespec { tv_sec: md.atime() as libc::time_t, tv_nsec: md.atime_nsec() as libc::c_long },
         libc::timespec { tv_sec: md.mtime() as libc::time_t, tv_nsec: md.mtime_nsec() as libc::c_long },
@@ -180,9 +192,9 @@ fn set_xattr(path: &CStr, name: &CStr, value: &[u8], follow: bool) -> io::Result
 }
 
 /// python `shutil._copyxattr`: copy every extended attribute, skipping the ones it cannot set
-fn copy_xattrs(src: &str, dst: &str, follow: bool) -> Result<(), String> {
-    let cs = CString::new(src).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(src)))?;
-    let cd = CString::new(dst).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(dst)))?;
+fn copy_xattrs(src: &Path, dst: &Path, follow: bool) -> Result<(), String> {
+    let cs = CString::new(src.as_os_str().as_bytes()).map_err(|_| format!("embedded null byte in path {}", py_repr_os(src)))?;
+    let cd = CString::new(dst.as_os_str().as_bytes()).map_err(|_| format!("embedded null byte in path {}", py_repr_os(dst)))?;
     let names = match list_xattrs(&cs, follow) {
         Ok(names) => names,
         Err(e) if errno_in(&e, &XATTR_SKIP_LIST) => return Ok(()),
@@ -204,15 +216,19 @@ fn copy_xattrs(src: &str, dst: &str, follow: bool) -> Result<(), String> {
 }
 
 /// python `shutil.copy2(src, dst)`: a directory `dst` receives `src` by its basename
-fn copy2(src: &str, dst: &str) -> Result<(), String> {
-    let real_dst = if Path::new(dst).is_dir() { py_join(dst, &py_basename(src)) } else { dst.to_string() };
-    if same_file(src, &real_dst) {
-        return Err(format!("{} and {} are the same file", crate::util::py_quote(src), crate::util::py_quote(&real_dst)));
+fn copy2(src: &Path, dst: &Path) -> Result<(), String> {
+    let real_dst = if dst.is_dir() { dst.join(py_basename_os(src.as_os_str())) } else { dst.to_path_buf() };
+    // python's copyfile() calls os.path.samefile first, which raises ValueError (not OSError) on a NUL
+    if has_nul(src) || has_nul(&real_dst) {
+        return Err(STAT_NUL.to_string());
     }
-    for name in [src, real_dst.as_str()] {
+    if same_file(src, &real_dst) {
+        return Err(format!("{} and {} are the same file", py_repr_os(src), py_repr_os(&real_dst)));
+    }
+    for name in [src, real_dst.as_path()] {
         if let Ok(m) = fs::metadata(name) {
             if m.file_type().is_fifo() {
-                return Err(format!("`{}` is a named pipe", name));
+                return Err(format!("`{}` is a named pipe", display_os(name)));
             }
         }
     }
@@ -223,7 +239,8 @@ fn copy2(src: &str, dst: &str) -> Result<(), String> {
     copystat(src, &real_dst, true)
 }
 
-/// `(src, dst, message)` triples python's `shutil.copytree` collects into `shutil.Error`
+/// `(src, dst, message)` triples python's `shutil.copytree` collects into `shutil.Error`; the paths
+/// are already python reprs, since that is how the list is shown
 type CopyErrors = Vec<(String, String, String)>;
 
 /// how a `_copytree` step fails: a plain OSError (raised as-is by the caller's loop) or the
@@ -239,10 +256,8 @@ impl CopyErr {
         match self {
             CopyErr::Os(m) => m,
             CopyErr::Tree(errors) => {
-                let items: Vec<String> = errors
-                    .iter()
-                    .map(|(s, d, m)| format!("({}, {}, {})", crate::util::py_quote(s), crate::util::py_quote(d), crate::util::py_quote(m)))
-                    .collect();
+                let items: Vec<String> =
+                    errors.iter().map(|(s, d, m)| format!("({}, {}, {})", s, d, py_quote(m))).collect();
                 format!("[{}]", items.join(", "))
             }
         }
@@ -251,11 +266,11 @@ impl CopyErr {
 
 /// python `shutil.copytree(src, dst, symlinks=...)` with the default copy2 copy function. A failing
 /// entry is recorded and the rest of the tree is still copied; the collected errors are raised together
-fn copytree(src: &str, dst: &str, symlinks: bool) -> Result<(), String> {
+fn copytree(src: &Path, dst: &Path, symlinks: bool) -> Result<(), String> {
     copytree_inner(src, dst, symlinks).map_err(CopyErr::into_message)
 }
 
-fn copytree_inner(src: &str, dst: &str, symlinks: bool) -> Result<(), CopyErr> {
+fn copytree_inner(src: &Path, dst: &Path, symlinks: bool) -> Result<(), CopyErr> {
     let entries: Vec<fs::DirEntry> = fs::read_dir(src)
         .map_err(|e| CopyErr::Os(os_err(&e, src)))?
         .collect::<Result<_, _>>()
@@ -263,18 +278,19 @@ fn copytree_inner(src: &str, dst: &str, symlinks: bool) -> Result<(), CopyErr> {
     fs::create_dir(dst).map_err(|e| CopyErr::Os(os_err(&e, dst)))?;
     let mut errors: CopyErrors = Vec::new();
     for ent in entries {
-        let name = ent.file_name().to_string_lossy().into_owned();
-        let srcname = py_join(src, &name);
-        let dstname = py_join(dst, &name);
+        // the raw entry name: python joins it as-is, so non-UTF-8 names copy like any other
+        let name = ent.file_name();
+        let srcname = src.join(&name);
+        let dstname = dst.join(&name);
         if let Err(err) = copy_entry(&ent, &srcname, &dstname, symlinks) {
             match err {
-                CopyErr::Os(m) => errors.push((srcname, dstname, m)),
+                CopyErr::Os(m) => errors.push((py_repr_os(&srcname), py_repr_os(&dstname), m)),
                 CopyErr::Tree(nested) => errors.extend(nested),
             }
         }
     }
     if let Err(m) = copystat(src, dst, true) {
-        errors.push((src.to_string(), dst.to_string(), m));
+        errors.push((py_repr_os(src), py_repr_os(dst), m));
     }
     if errors.is_empty() {
         Ok(())
@@ -284,14 +300,14 @@ fn copytree_inner(src: &str, dst: &str, symlinks: bool) -> Result<(), CopyErr> {
 }
 
 /// one iteration of python `_copytree`'s loop body for a single directory entry
-fn copy_entry(ent: &fs::DirEntry, srcname: &str, dstname: &str, symlinks: bool) -> Result<(), CopyErr> {
+fn copy_entry(ent: &fs::DirEntry, srcname: &Path, dstname: &Path, symlinks: bool) -> Result<(), CopyErr> {
     let ft = ent.file_type().map_err(|e| CopyErr::Os(os_err(&e, srcname)))?;
     if ft.is_symlink() {
         if symlinks {
-            let target = fs::read_link(srcname).map_err(|e| CopyErr::Os(os_err(&e, srcname)))?.to_string_lossy().into_owned();
+            let target = fs::read_link(srcname).map_err(|e| CopyErr::Os(os_err(&e, srcname)))?;
             std::os::unix::fs::symlink(&target, dstname).map_err(|e| CopyErr::Os(os_err2(&e, &target, dstname)))?;
             copystat(srcname, dstname, false).map_err(CopyErr::Os)
-        } else if Path::new(srcname).is_dir() {
+        } else if srcname.is_dir() {
             copytree_inner(srcname, dstname, symlinks)
         } else {
             copy2(srcname, dstname).map_err(CopyErr::Os)
@@ -318,54 +334,141 @@ fn destinsrc(src: &str, dst: &str) -> bool {
 
 /// python `shutil.move(src, dst)` (rename first, copy + delete when rename fails)
 fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
-    let mut real_dst = dst.to_string();
-    if Path::new(dst).is_dir() {
-        if same_file(src, dst) {
-            return fs::rename(src, dst).map_err(|e| os_err2(&e, src, dst));
+    let (src_p, dst_p) = (Path::new(src), Path::new(dst));
+    let mut real_dst = dst_p.to_path_buf();
+    if dst_p.is_dir() {
+        // python's _samefile() only swallows OSError, so a NUL in src escapes as a ValueError from os.stat
+        if has_nul(src_p) {
+            return Err(STAT_NUL.to_string());
         }
-        real_dst = py_join(dst, &py_basename(src));
-        if Path::new(&real_dst).exists() {
-            return Err(format!("Destination path '{}' already exists", real_dst));
+        if same_file(src_p, dst_p) {
+            return fs::rename(src_p, dst_p).map_err(|e| os_err2(&e, src, dst));
+        }
+        real_dst = dst_p.join(py_basename_os(src_p.as_os_str()));
+        if real_dst.exists() {
+            return Err(format!("Destination path '{}' already exists", display_os(&real_dst)));
         }
     }
-    if fs::rename(src, &real_dst).is_ok() {
+    // os.rename's own ValueError for a NUL (not an OSError, so no fallback): src is converted first
+    if has_nul(src_p) {
+        return Err("rename: embedded null character in src".to_string());
+    }
+    if has_nul(&real_dst) {
+        return Err("rename: embedded null character in dst".to_string());
+    }
+    if fs::rename(src_p, &real_dst).is_ok() {
         return Ok(());
     }
-    let is_link = fs::symlink_metadata(src).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    let is_link = fs::symlink_metadata(src_p).map(|m| m.file_type().is_symlink()).unwrap_or(false);
     if is_link {
-        let linkto = fs::read_link(src).map_err(|e| os_err(&e, src))?.to_string_lossy().into_owned();
+        let linkto = fs::read_link(src_p).map_err(|e| os_err(&e, src_p))?;
         std::os::unix::fs::symlink(&linkto, &real_dst).map_err(|e| os_err2(&e, &linkto, &real_dst))?;
-        fs::remove_file(src).map_err(|e| os_err(&e, src))
-    } else if Path::new(src).is_dir() {
+        fs::remove_file(src_p).map_err(|e| os_err(&e, src_p))
+    } else if src_p.is_dir() {
         if destinsrc(src, dst) {
             return Err(format!("Cannot move a directory '{}' into itself '{}'.", src, dst));
         }
-        copytree(src, &real_dst, true)?;
-        fs::remove_dir_all(src).map_err(|e| os_err(&e, src))
+        copytree(src_p, &real_dst, true)?;
+        rmtree(src)
     } else {
-        copy2(src, &real_dst)?;
-        fs::remove_file(src).map_err(|e| os_err(&e, src))
+        copy2(src_p, &real_dst)?;
+        fs::remove_file(src_p).map_err(|e| os_err(&e, src_p))
     }
+}
+
+/// python `shutil.rmtree(path)` on CPython 3.14's fd-based walk. The walk is replayed with the same stack
+/// order, and each failure is reported on the path the failing step was working on: the directory for an
+/// unlink or scandir, the entry itself for its open or rmdir. A child that vanishes mid-walk is skipped.
+fn rmtree(top: &str) -> Result<(), String> {
+    enum Step {
+        /// open a directory and scan it (`child` is false only for the top-level path)
+        Walk { path: PathBuf, child: bool },
+        /// remove an emptied directory
+        Rmdir { path: PathBuf, child: bool },
+    }
+    let skip_missing = |e: &io::Error, child: bool| child && e.kind() == io::ErrorKind::NotFound;
+    let mut stack = vec![Step::Walk { path: PathBuf::from(top), child: false }];
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Rmdir { path, child } => match fs::remove_dir(&path) {
+                Ok(()) => {}
+                Err(e) if skip_missing(&e, child) => {}
+                Err(e) => return Err(os_err(&e, &path)),
+            },
+            Step::Walk { path, child } => {
+                let md = match fs::symlink_metadata(&path) {
+                    Ok(md) => md,
+                    Err(e) if skip_missing(&e, child) => continue,
+                    Err(e) => return Err(os_err(&e, &path)),
+                };
+                if md.file_type().is_symlink() {
+                    return Err("Cannot call rmtree on a symbolic link".to_string());
+                }
+                let entries = match fs::read_dir(&path) {
+                    Ok(rd) => rd,
+                    Err(e) if skip_missing(&e, child) => continue,
+                    Err(e) => return Err(os_err(&e, &path)),
+                };
+                stack.push(Step::Rmdir { path: path.clone(), child });
+                let entries: Vec<fs::DirEntry> = match entries.collect::<Result<_, _>>() {
+                    Ok(v) => v,
+                    Err(e) if skip_missing(&e, child) => continue,
+                    Err(e) => return Err(os_err(&e, &path)),
+                };
+                for ent in entries {
+                    let fullname = path.join(ent.file_name());
+                    match ent.file_type() {
+                        Ok(ft) if ft.is_dir() => {
+                            stack.push(Step::Walk { path: fullname, child: true });
+                            continue;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        _ => {}
+                    }
+                    match fs::remove_file(&fullname) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        // python's onexc re-raises with the directory being scanned as the filename
+                        Err(e) => return Err(os_err(&e, &path)),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// python `Path(dst).parent.mkdir(parents=True, exist_ok=True)`, which move and copy run before their body
 fn make_parent(dst: &str) -> Result<(), String> {
     let parent = py_parent(dst);
+    if parent.contains('\0') {
+        return Err(MKDIR_NUL.to_string());
+    }
     fs::create_dir_all(&parent).map_err(|e| os_err(&e, &parent))
 }
 
 fn copy_inner(src: &str, dst: &str) -> Result<(), String> {
     if Path::new(src).is_dir() {
-        copytree(src, dst, false)
+        // python's copytree makes dst with os.makedirs, which raises the mkdir ValueError for a NUL
+        if has_nul(Path::new(dst)) {
+            return Err(MKDIR_NUL.to_string());
+        }
+        copytree(Path::new(src), Path::new(dst), false)
     } else {
-        copy2(src, dst)
+        copy2(Path::new(src), Path::new(dst))
     }
 }
 
 /// python `Module._write` body: parent dirs, open (truncating for 'w'), then `f.write(content)`
 fn write_inner(path: &str, content: &Value, mode: &str) -> Result<(), String> {
     let parent = py_parent(path);
+    if parent.contains('\0') {
+        return Err(MKDIR_NUL.to_string());
+    }
     fs::create_dir_all(&parent).map_err(|e| os_err(&e, &parent))?;
+    if path.contains('\0') {
+        return Err(OPEN_NUL.to_string());
+    }
     let mut f = if mode == "a" {
         OpenOptions::new().append(true).create(true).open(path)
     } else {
@@ -616,6 +719,9 @@ impl FileManager {
     }
 
     fn mkdir(&self, path: &str) -> Value {
+        if path.contains('\0') {
+            return self.fail(MKDIR_NUL);
+        }
         let p = py_path(path);
         match fs::create_dir_all(&p) {
             Ok(()) => self.base.result(format!("Directory created: {}", path), true),
@@ -631,15 +737,15 @@ impl FileManager {
         }
         let is_link = fs::symlink_metadata(pp).map(|m| m.file_type().is_symlink()).unwrap_or(false);
         let removed = if pp.is_file() || is_link {
-            fs::remove_file(pp)
+            fs::remove_file(pp).map_err(|e| os_err(&e, pp))
         } else if pp.is_dir() {
-            fs::remove_dir_all(pp)
+            rmtree(&p)
         } else {
             return self.fail("Path is not a file or directory");
         };
         match removed {
             Ok(()) => self.base.result(format!("Successfully removed: {}", path), true),
-            Err(e) => self.fail(os_err(&e, &p)),
+            Err(m) => self.fail(m),
         }
     }
 
@@ -968,6 +1074,93 @@ mod tests {
         let err = call(&m, "write", json!({"path": fs_.clone()})).await.unwrap_err();
         assert_eq!(err.to_string(), "FileManager.write() missing 1 required positional argument: 'content'");
         assert_eq!(fs::read_to_string(&file).unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn nul_bytes_raise_the_same_messages_as_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let m = fm();
+        let file = format!("{}/x.txt", root);
+        fs::write(&file, "x").unwrap();
+
+        // open() rejects a NUL in the basename after the parent was made
+        let w = call(&m, "write", json!({"path": format!("{}/a\0b", root), "content": "c"})).await.unwrap();
+        assert_eq!(w, json!({"status": "error", "content": "embedded null byte"}));
+        // a NUL in the parent fails in mkdir first
+        let w = call(&m, "write", json!({"path": format!("{}/a\0/c", root), "content": "c"})).await.unwrap();
+        assert_eq!(w, json!({"status": "error", "content": "mkdir: embedded null character in path"}));
+        let mk = call(&m, "mkdir", json!({"path": format!("{}/a\0b/c", root)})).await.unwrap();
+        assert_eq!(mk, json!({"status": "error", "content": "mkdir: embedded null character in path"}));
+        // rename() names the argument that holds the NUL, source first
+        let mv = call(&m, "move", json!({"src": format!("{}/a\0b", root), "dst": format!("{}/y", root)})).await.unwrap();
+        assert_eq!(mv, json!({"status": "error", "content": "rename: embedded null character in src"}));
+        let mv = call(&m, "move", json!({"src": file.clone(), "dst": format!("{}/q\0", root)})).await.unwrap();
+        assert_eq!(mv, json!({"status": "error", "content": "rename: embedded null character in dst"}));
+        // copy2's samefile() check raises a stat ValueError
+        let cp = call(&m, "copy", json!({"src": file.clone(), "dst": format!("{}/q\0", root)})).await.unwrap();
+        assert_eq!(cp, json!({"status": "error", "content": "stat: embedded null character in path"}));
+        // a NUL-named path does not exist for remove or read
+        let rm = call(&m, "remove", json!({"path": format!("{}/a\0b", root)})).await.unwrap();
+        assert_eq!(rm, json!({"status": "error", "content": "path does not exist"}));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "x", "a refused write never truncates the file");
+    }
+
+    #[tokio::test]
+    async fn copy_and_move_handle_non_utf8_entry_names_like_python() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let src = root.join("s");
+        fs::create_dir(&src).unwrap();
+        let raw = std::ffi::OsStr::from_bytes(b"f\xffname");
+        fs::write(src.join(raw), "raw").unwrap();
+        fs::write(src.join("plain.txt"), "p").unwrap();
+        let m = fm();
+
+        // copytree copies the entry under its raw bytes, so the copy reports success
+        let dst = root.join("t");
+        let r = call(&m, "copy", json!({"src": src.to_str().unwrap(), "dst": dst.to_str().unwrap()})).await.unwrap();
+        assert_eq!(r["status"], "success", "{}", r);
+        assert_eq!(fs::read(dst.join(raw)).unwrap(), b"raw");
+
+        // a directory moved to a new name keeps its raw entry names (rename takes the fast path here)
+        let moved = root.join("m");
+        let r = call(&m, "move", json!({"src": dst.to_str().unwrap(), "dst": moved.to_str().unwrap()})).await.unwrap();
+        assert_eq!(r["status"], "success", "{}", r);
+        assert_eq!(fs::read(moved.join(raw)).unwrap(), b"raw");
+        assert!(!dst.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_reports_the_directory_whose_step_failed() {
+        // root bypasses the permission check that makes the failure, so there is nothing to test
+        // SAFETY: geteuid has no preconditions
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("top");
+        let inner = top.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("f"), "x").unwrap();
+        // a read-only directory cannot unlink its entries, so python names that directory
+        fs::set_permissions(&inner, std::os::unix::fs::PermissionsExt::from_mode(0o555)).unwrap();
+        let m = fm();
+        let r = call(&m, "remove", json!({"path": top.to_str().unwrap()})).await.unwrap();
+        fs::set_permissions(&inner, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(
+            r,
+            json!({"status": "error", "content": format!("[Errno 13] Permission denied: '{}'", inner.to_str().unwrap())})
+        );
+    }
+
+    #[test]
+    fn repr_of_undecodable_names_matches_python() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(crate::util::py_repr_os(std::ffi::OsStr::from_bytes(b"a\xff")), "'a\\udcff'");
+        assert_eq!(crate::util::py_repr_os(std::ffi::OsStr::from_bytes(b"a'\xff\"")), "'a\\'\\udcff\"'");
+        assert_eq!(crate::util::display_os(std::ffi::OsStr::from_bytes(b"a\xff")), "a\\udcff");
     }
 
     #[test]

@@ -6,6 +6,9 @@ use crate::pytext::urlsplit;
 use crate::sanitize::ContentSanitizer;
 use ol_core::pyjson::float_repr;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 /// python `urllib.parse.uses_relative` / `uses_netloc` (python 3.14)
 const USES_RELATIVE: &[&str] = &[
@@ -465,19 +468,107 @@ mod tests {
 // ==================== python os / pathlib / shutil helpers (file_manager) ====================
 
 /// python `str(OSError)` for an error on one path: `[Errno N] strerror: 'path'`
-pub fn os_err(e: &std::io::Error, path: &str) -> String {
+pub fn os_err<P: AsRef<OsStr>>(e: &std::io::Error, path: P) -> String {
     match e.raw_os_error() {
-        Some(code) => format!("[Errno {}] {}: {}", code, strerror(code), py_quote(path)),
+        Some(code) => format!("[Errno {}] {}: {}", code, strerror(code), py_repr_os(path)),
         None => e.to_string(),
     }
 }
 
 /// python `str(OSError)` for a two-path error: `[Errno N] strerror: 'src' -> 'dst'`
-pub fn os_err2(e: &std::io::Error, src: &str, dst: &str) -> String {
+pub fn os_err2<P: AsRef<OsStr>, Q: AsRef<OsStr>>(e: &std::io::Error, src: P, dst: Q) -> String {
     match e.raw_os_error() {
-        Some(code) => format!("[Errno {}] {}: {} -> {}", code, strerror(code), py_quote(src), py_quote(dst)),
+        Some(code) => format!("[Errno {}] {}: {} -> {}", code, strerror(code), py_repr_os(src), py_repr_os(dst)),
         None => e.to_string(),
     }
+}
+
+/// one unit of a path as python sees it after `os.fsdecode`: a decoded character, or a byte that
+/// did not decode and became a `surrogateescape` lone surrogate (U+DC80..U+DCFF)
+enum OsPiece {
+    Char(char),
+    Escaped(u8),
+}
+
+fn os_pieces(mut bytes: &[u8]) -> Vec<OsPiece> {
+    let mut out = Vec::new();
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                out.extend(s.chars().map(OsPiece::Char));
+                return out;
+            }
+            Err(e) => {
+                let (good, rest) = bytes.split_at(e.valid_up_to());
+                out.extend(std::str::from_utf8(good).unwrap_or("").chars().map(OsPiece::Char));
+                let bad = e.error_len().unwrap_or(rest.len());
+                out.extend(rest[..bad].iter().map(|b| OsPiece::Escaped(*b)));
+                bytes = &rest[bad..];
+            }
+        }
+    }
+}
+
+/// python `repr()` of `os.fsdecode(path)`: undecodable bytes show as `\udcXX`, as CPython's repr does
+pub fn py_repr_os<P: AsRef<OsStr>>(path: P) -> String {
+    let path = path.as_ref();
+    if let Some(s) = path.to_str() {
+        return py_quote(s);
+    }
+    let pieces = os_pieces(path.as_bytes());
+    let has_sq = pieces.iter().any(|p| matches!(p, OsPiece::Char('\'')));
+    let has_dq = pieces.iter().any(|p| matches!(p, OsPiece::Char('"')));
+    let quote = if has_sq && !has_dq { '"' } else { '\'' };
+    let mut out = String::new();
+    out.push(quote);
+    for piece in pieces {
+        match piece {
+            OsPiece::Escaped(b) => out.push_str(&format!("\\udc{:02x}", b)),
+            OsPiece::Char('\\') => out.push_str("\\\\"),
+            OsPiece::Char('\t') => out.push_str("\\t"),
+            OsPiece::Char('\n') => out.push_str("\\n"),
+            OsPiece::Char('\r') => out.push_str("\\r"),
+            OsPiece::Char(c) if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            OsPiece::Char(c) if c.is_ascii() && (c as u32) >= 0x20 && c as u32 != 0x7f => out.push(c),
+            OsPiece::Char(c) if c.is_ascii() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            OsPiece::Char(c) => {
+                let q = py_quote(&c.to_string());
+                out.push_str(&q[1..q.len() - 1]);
+            }
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// python `str()` of `os.fsdecode(path)` without quotes (a plain message such as a SpecialFileError)
+pub fn display_os<P: AsRef<OsStr>>(path: P) -> String {
+    let path = path.as_ref();
+    if let Some(s) = path.to_str() {
+        return s.to_string();
+    }
+    os_pieces(path.as_bytes())
+        .into_iter()
+        .map(|p| match p {
+            OsPiece::Char(c) => c.to_string(),
+            OsPiece::Escaped(b) => format!("\\udc{:02x}", b),
+        })
+        .collect()
+}
+
+/// python `os.path.basename(path.rstrip('/'))` on the raw bytes of a path
+pub fn py_basename_os(path: &OsStr) -> OsString {
+    let b = path.as_bytes();
+    let mut end = b.len();
+    while end > 0 && b[end - 1] == b'/' {
+        end -= 1;
+    }
+    let trimmed = &b[..end];
+    let start = trimmed.iter().rposition(|c| *c == b'/').map_or(0, |i| i + 1);
+    OsStr::from_bytes(&trimmed[start..]).to_os_string()
 }
 
 /// python `str(OSError)` for an error without a filename: `[Errno N] strerror`
@@ -589,11 +680,6 @@ pub fn py_join(a: &str, b: &str) -> String {
     }
 }
 
-/// python `os.path.basename(path.rstrip('/'))`
-pub fn py_basename(s: &str) -> String {
-    s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
-}
-
 /// python `posixpath.normpath`
 pub fn py_normpath(s: &str) -> String {
     let (lead, rest) = if s.starts_with("//") && !s.starts_with("///") {
@@ -639,7 +725,7 @@ pub fn py_abspath(s: &str) -> String {
 }
 
 /// python `os.path.samefile` (False when either stat fails)
-pub fn same_file(a: &str, b: &str) -> bool {
+pub fn same_file<P: AsRef<Path>, Q: AsRef<Path>>(a: P, b: Q) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
