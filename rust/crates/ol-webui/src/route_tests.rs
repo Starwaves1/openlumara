@@ -270,6 +270,20 @@ async fn ext_api_passes_the_json_body_and_query_to_post_handlers() {
 }
 
 #[tokio::test]
+async fn ext_api_parses_a_json_body_with_a_utf8_bom_like_python() {
+    // python's json.loads(bytes) detects utf-8-sig, so a leading BOM is skipped
+    let h = harness_with_probe().await;
+    let mut req = request(Method::POST, "/api/ext/probe/echo", None, Some("application/json"), "");
+    *req.body_mut() = Body::from("\u{feff}{\"x\": 1}");
+    let resp = h.send(req).await;
+    assert_eq!(resp.json(), json!({"data": {"body": {"x": 1}, "query": {}}, "success": true}));
+
+    // a body that is not JSON (or a JSON null) reaches the handler as None
+    let bad = h.send(request(Method::POST, "/api/ext/probe/echo", None, None, "{x")).await;
+    assert_eq!(bad.json(), json!({"data": {"body": null, "query": {}}, "success": true}));
+}
+
+#[tokio::test]
 async fn ext_api_rejects_the_wrong_method_and_unknown_routes_like_python() {
     let h = harness_with_probe().await;
     let wrong = h.send(request(Method::POST, "/api/ext/probe/ping", None, None, "")).await;

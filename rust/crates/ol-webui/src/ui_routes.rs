@@ -131,11 +131,13 @@ async fn dispatch(
     // ext routes bypass send()/send_stream(), the only other caller of set_as_active_channel()
     ch.set_as_active_channel().await;
 
-    // python: request.json() for every method but GET; a failed parse or a JSON null is None
+    // python: request.json() for every method but GET; a failed parse or a JSON null is None.
+    // json.loads on bytes accepts a UTF-8 BOM (detect_encoding picks utf-8-sig), serde_json does not
     let json_body = if method == Method::GET {
         None
     } else {
-        serde_json::from_slice::<Value>(&body).ok().filter(|v| !v.is_null())
+        let bytes = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&body);
+        serde_json::from_slice::<Value>(bytes).ok().filter(|v| !v.is_null())
     };
 
     match module.ui_route(&wanted, method_name, json_body, query_map(raw_query.as_deref())).await {
