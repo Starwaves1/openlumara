@@ -170,13 +170,14 @@ async fn serve_connection(app: Arc<Shared>, socket: WebSocket) {
         ready_app.ws.broadcast(json!({"type": "ready"}));
     });
 
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
+        // ends once the registry's sender is gone and the queue is empty, so everything queued before a
+        // server-side close still reaches the client (python's send is immediate)
         while let Some(text) = rx.recv().await {
             if sink.send(Message::Text(text.into())).await.is_err() {
                 break;
             }
         }
-        let _ = sink.close().await;
     });
 
     while let Some(frame) = stream.next().await {
@@ -200,8 +201,12 @@ async fn serve_connection(app: Arc<Shared>, socket: WebSocket) {
             }
         }
     }
+    // python returns from the endpoint and uvicorn drops the transport without a close frame. dropping
+    // the registry's sender lets the writer flush what is already queued and then drop the socket
     app.ws.remove_connection(id);
-    writer.abort();
+    if tokio::time::timeout(Duration::from_secs(5), &mut writer).await.is_err() {
+        writer.abort();
+    }
 }
 
 /// python `websocket_endpoint` read loop body: parse one client message and run its command
@@ -303,10 +308,11 @@ fn float_index_error(ch: &Channel, index: f64, list_error: &str) -> anyhow::Erro
     }
 }
 
-/// python `messages.get(index)`
+/// python `messages.get(index)`: a miss raises python's "Invalid message index", which passes through
+/// unchanged. callers reject negative indexes before this point
 fn message_at(ch: &Channel, index: i64) -> anyhow::Result<Value> {
-    let i = usize::try_from(index).map_err(|_| anyhow!("list index out of range"))?;
-    ch.chat.messages_get_at(i).map_err(|_| anyhow!("list index out of range"))
+    let i = usize::try_from(index).map_err(|_| anyhow!("Invalid message index"))?;
+    ch.chat.messages_get_at(i)
 }
 
 fn base64_value(c: u8) -> Option<u8> {
@@ -386,7 +392,14 @@ fn decode_files(files_data: &Value) -> anyhow::Result<Files> {
         let encoded = data.as_str().ok_or_else(|| {
             anyhow!("argument should be a bytes-like object or ASCII string, not '{}'", py_type_name(data))
         })?;
-        files.insert(py_str(name), b64decode_lenient(encoded)?);
+        let decoded = b64decode_lenient(encoded)?;
+        // python builds the dict with the name as its key, so a list or dict name fails at that insert
+        let key = match name {
+            Value::Array(_) => anyhow::bail!("unhashable type: 'list'"),
+            Value::Object(_) => anyhow::bail!("unhashable type: 'dict'"),
+            other => py_str(other),
+        };
+        files.insert(key, decoded);
     }
     Ok(files)
 }
@@ -720,4 +733,16 @@ mod tests {
         assert_eq!(decode_files(&json!([{"data": "aGk="}])).unwrap_err().to_string(), "'name'");
     }
 
+    #[test]
+    fn file_name_must_be_hashable_like_a_python_dict_key() {
+        // python: {f["name"]: ...} with a list or dict name raises at the insert
+        assert_eq!(
+            decode_files(&json!([{"name": ["a"], "data": "aGk="}])).unwrap_err().to_string(),
+            "unhashable type: 'list'"
+        );
+        assert_eq!(
+            decode_files(&json!([{"name": {"x": 1}, "data": "aGk="}])).unwrap_err().to_string(),
+            "unhashable type: 'dict'"
+        );
+    }
 }

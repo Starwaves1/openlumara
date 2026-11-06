@@ -476,10 +476,100 @@ fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
-/// `request.form.get(name)` for url-encoded bodies. starlette's FormData keeps the LAST value of a
-/// repeated key (it is built as a dict), so this takes the last match too
-fn form_field(body: &[u8], name: &str) -> Option<String> {
-    url::form_urlencoded::parse(body).filter(|(k, _)| k == name).last().map(|(_, v)| v.into_owned())
+/// one field of a request form. `value` is `None` for a file part: starlette hands that back as an
+/// UploadFile, which is not a str and so cannot be read as a credential
+struct FormPart {
+    name: String,
+    value: Option<String>,
+}
+
+/// starlette `request.form()`: the body is read as url-encoded or multipart/form-data by its
+/// Content-Type, and any other Content-Type gives an empty form. `None` is a multipart body with no
+/// boundary, which python fails to parse as well
+fn read_form(headers: &HeaderMap, body: &[u8]) -> Option<Vec<FormPart>> {
+    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let mut params = content_type.split(';');
+    let mime = params.next().unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "application/x-www-form-urlencoded" => Some(
+            url::form_urlencoded::parse(body)
+                .map(|(k, v)| FormPart { name: k.into_owned(), value: Some(v.into_owned()) })
+                .collect(),
+        ),
+        "multipart/form-data" => {
+            let boundary = params.find_map(|p| {
+                let (k, v) = p.trim().split_once('=')?;
+                k.trim().eq_ignore_ascii_case("boundary").then(|| v.trim().trim_matches('"').to_string())
+            })?;
+            multipart_parts(body, &boundary)
+        }
+        _ => Some(Vec::new()),
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// the fields of a multipart/form-data body (RFC 7578). text before the first boundary is ignored,
+/// and a part without a name is skipped. `None` when the body is not laid out as multipart
+fn multipart_parts(body: &[u8], boundary: &str) -> Option<Vec<FormPart>> {
+    if boundary.is_empty() {
+        return None;
+    }
+    let delim = format!("--{boundary}").into_bytes();
+    let end_marker = [b"\r\n".as_slice(), delim.as_slice()].concat();
+    let mut rest = &body[find_bytes(body, &delim)? + delim.len()..];
+    let mut parts = Vec::new();
+    loop {
+        // the closing delimiter is `--boundary--`
+        if rest.starts_with(b"--") {
+            break;
+        }
+        // transport padding and the line break end the delimiter line
+        let eol = find_bytes(rest, b"\r\n")?;
+        rest = &rest[eol + 2..];
+        let end = find_bytes(rest, &end_marker)?;
+        let section = &rest[..end];
+        rest = &rest[end + end_marker.len()..];
+
+        let (head, content) = if section.starts_with(b"\r\n") {
+            (&section[..0], &section[2..])
+        } else if let Some(split) = find_bytes(section, b"\r\n\r\n") {
+            (&section[..split], &section[split + 4..])
+        } else if section.is_empty() {
+            continue;
+        } else {
+            return None;
+        };
+        let Ok(head) = std::str::from_utf8(head) else { return None };
+        let Some(disposition) = head.split("\r\n").find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("content-disposition").then_some(v)
+        }) else {
+            continue;
+        };
+        let mut name = None;
+        let mut is_file = false;
+        for param in disposition.split(';').skip(1) {
+            let Some((k, v)) = param.trim().split_once('=') else { continue };
+            match k.trim().to_ascii_lowercase().as_str() {
+                "name" => name = Some(v.trim().trim_matches('"').to_string()),
+                "filename" => is_file = true,
+                _ => {}
+            }
+        }
+        let Some(name) = name else { continue };
+        let value = if is_file { None } else { String::from_utf8(content.to_vec()).ok() };
+        parts.push(FormPart { name, value });
+    }
+    Some(parts)
+}
+
+/// `form.get(name)` as a str. starlette's FormData keeps the LAST value of a repeated key (it is
+/// built as a dict), so this takes the last field of that name; a file part reads as `None`
+fn form_text(parts: &[FormPart], name: &str) -> Option<String> {
+    parts.iter().rev().find(|p| p.name == name)?.value.clone()
 }
 
 async fn login_submit(
@@ -497,8 +587,10 @@ async fn login_submit(
         return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": session::LOGIN_RATE_LIMITED}))).into_response();
     }
 
-    // python: a missing field is None, and compare_digest(None, ...) raises
-    let (Some(username), Some(password)) = (form_field(&body, "username"), form_field(&body, "password")) else {
+    // python: a missing field is None (and a file part is an UploadFile), and compare_digest of either
+    // raises. a multipart body that cannot be parsed fails in request.form() the same way
+    let Some(form) = read_form(&headers, &body) else { return internal_error() };
+    let (Some(username), Some(password)) = (form_text(&form, "username"), form_text(&form, "password")) else {
         return internal_error();
     };
     let verified = session::verify_credentials(
@@ -604,11 +696,35 @@ mod tests {
     }
 
     #[test]
-    fn form_field_reads_urlencoded_body() {
-        assert_eq!(form_field(b"username=admin&password=p%40ss+x", "password").as_deref(), Some("p@ss x"));
-        assert_eq!(form_field(b"username=admin", "password"), None);
+    fn form_reads_urlencoded_body_only_with_a_urlencoded_content_type() {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded; charset=utf-8"));
+        let form = read_form(&h, b"username=admin&password=p%40ss+x").unwrap();
+        assert_eq!(form_text(&form, "password").as_deref(), Some("p@ss x"));
+        assert_eq!(form_text(&form, "missing"), None);
         // a repeated key: starlette's dict-built FormData keeps the last value
-        assert_eq!(form_field(b"username=a&username=b", "username").as_deref(), Some("b"));
+        let form = read_form(&h, b"username=a&username=b").unwrap();
+        assert_eq!(form_text(&form, "username").as_deref(), Some("b"));
+        // a urlencoded-looking body without the form Content-Type is an empty form, as in starlette
+        assert!(read_form(&HeaderMap::new(), b"username=admin&password=x").unwrap().is_empty());
         assert_eq!(py_int(&json!(3)), Some(3));
+    }
+
+    #[test]
+    fn form_reads_multipart_text_fields_and_refuses_file_parts() {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("multipart/form-data; boundary=XyZ"));
+        let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nadmin\r\n\
+            --XyZ\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\np@ss\r\n--XyZ--\r\n";
+        let form = read_form(&h, body).unwrap();
+        assert_eq!(form_text(&form, "username").as_deref(), Some("admin"));
+        assert_eq!(form_text(&form, "password").as_deref(), Some("p@ss"));
+        // a file part is not a str, so it cannot be read as a credential
+        let file_body = b"--XyZ\r\nContent-Disposition: form-data; name=\"password\"; filename=\"p.txt\"\r\n\
+            Content-Type: text/plain\r\n\r\nsecret\r\n--XyZ--\r\n";
+        assert_eq!(form_text(&read_form(&h, file_body).unwrap(), "password"), None);
+        // a multipart Content-Type without a boundary cannot be parsed
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static("multipart/form-data"));
+        assert!(read_form(&h, body).is_none());
     }
 }
