@@ -175,6 +175,25 @@ fn resolve_dockerfile_path(dockerfile_path: &str) -> anyhow::Result<Option<Strin
     Ok(Some(pyos::abspath(&expanded)))
 }
 
+/// python `float(text)` for a str: like rust's parse, but PEP 515 digit underscores are allowed
+/// (only between two ASCII digits, as python's grammar requires), e.g. '1_024' -> 1024.0
+fn py_float(text: &str) -> Option<f64> {
+    if !text.contains('_') {
+        return text.parse::<f64>().ok();
+    }
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'_' {
+            let before = i.checked_sub(1).map(|j| bytes[j].is_ascii_digit()).unwrap_or(false);
+            let after = bytes.get(i + 1).map(|c| c.is_ascii_digit()).unwrap_or(false);
+            if !(before && after) {
+                return None;
+            }
+        }
+    }
+    text.replace('_', "").parse::<f64>().ok()
+}
+
 /// `_parse_memory_string`: '10.23MiB' / '256m' -> bytes (kept as python wrote it, including
 /// its quirks: '512MB' has its 'M' suffix sliced as one char and so yields 0)
 pub fn parse_memory_string(mem_str: &str) -> f64 {
@@ -186,10 +205,10 @@ pub fn parse_memory_string(mem_str: &str) -> f64 {
     for (suffix, mult) in multipliers {
         if s.ends_with(&format!("{suffix}B")) || s.ends_with(suffix) {
             let cut = s.len() - suffix.len();
-            return s[..cut].trim().parse::<f64>().map(|v| v * mult).unwrap_or(0.0);
+            return py_float(s[..cut].trim()).map(|v| v * mult).unwrap_or(0.0);
         }
     }
-    s.parse::<f64>().unwrap_or(0.0)
+    py_float(&s).unwrap_or(0.0)
 }
 
 /// `_get_dockerfile_hash`: md5 hexdigest of the file
@@ -500,8 +519,15 @@ impl Shell {
         OutputLimit::from_config(&self.cfg("output_limit", json!(2000)))
     }
 
-    /// `timeout_val + 5` as the safety timeout for a command
+    /// `timeout_val + 5` as the safety timeout for a command. python raises TypeError for a
+    /// string (or list) because `str + int` is not numeric addition, and the error escapes
+    /// run() before any command starts. numeric strings are not converted.
     fn safety_timeout(timeout_val: &Value) -> anyhow::Result<Duration> {
+        match timeout_val {
+            Value::String(_) => anyhow::bail!("can only concatenate str (not \"int\") to str"),
+            Value::Array(_) => anyhow::bail!("can only concatenate list (not \"int\") to list"),
+            _ => {}
+        }
         let secs = as_f64(timeout_val).ok_or_else(|| anyhow!("unsupported operand type(s) for +: '{}' and 'int'", py_type_name(timeout_val)))?;
         Ok(Duration::from_secs_f64((secs + 5.0).clamp(0.0, 1.0e9)))
     }
@@ -1207,5 +1233,32 @@ mod tests {
         // a numeric string is not comparable with len(): python raises TypeError
         assert_eq!(OutputLimit::from_config(&json!("2000")).unwrap_err(), "str");
         assert_eq!(incomparable_limit_error("str"), "'>=' not supported between instances of 'int' and 'str'");
+    }
+
+    #[test]
+    fn string_execution_timeout_fails_before_any_command_like_python() {
+        // python `"30" + 5` raises TypeError before the command starts; a numeric string is not added
+        assert_eq!(Shell::safety_timeout(&json!(30)).unwrap(), Duration::from_secs(35));
+        assert_eq!(Shell::safety_timeout(&json!(2.5)).unwrap(), Duration::from_secs_f64(7.5));
+        let err = Shell::safety_timeout(&json!("30")).unwrap_err().to_string();
+        assert_eq!(err, "can only concatenate str (not \"int\") to str");
+        let err = Shell::safety_timeout(&json!("abc")).unwrap_err().to_string();
+        assert_eq!(err, "can only concatenate str (not \"int\") to str");
+        let err = Shell::safety_timeout(&Value::Null).unwrap_err().to_string();
+        assert_eq!(err, "unsupported operand type(s) for +: 'NoneType' and 'int'");
+    }
+
+    #[test]
+    fn memory_string_accepts_pep515_underscores_like_python_float() {
+        assert_eq!(parse_memory_string("1_024"), 1024.0);
+        assert_eq!(parse_memory_string("1_0k"), 10240.0);
+        assert_eq!(parse_memory_string("2_0.5_0M"), 20.5 * 1024.0 * 1024.0);
+        // python float() rejects misplaced underscores, so the value is 0
+        assert_eq!(parse_memory_string("1__0"), 0.0);
+        assert_eq!(parse_memory_string("_1"), 0.0);
+        assert_eq!(parse_memory_string("1_k"), 0.0);
+        // the python quirk is kept: '512MB' slices one char and fails to parse
+        assert_eq!(parse_memory_string("512MB"), 0.0);
+        assert_eq!(parse_memory_string("256m"), 256.0 * 1024.0 * 1024.0);
     }
 }
