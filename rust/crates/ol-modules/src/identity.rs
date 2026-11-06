@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 #[path = "../../../generated/modules/identity.rs"]
-pub mod meta;
+pub(crate) mod meta;
 
 const NOT_SET: &str = "You have not yet set up an identity.";
 
