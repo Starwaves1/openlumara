@@ -11,7 +11,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use md5::{Digest, Md5};
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
-use ol_core::pyjson::{as_f64, as_i64, py_repr, py_str, py_str_opt, truthy};
+use ol_core::pyjson::{as_f64, as_i64, float_repr, py_str, py_str_opt, truthy};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::os::fd::OwnedFd;
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// category used by the python module for its log lines
@@ -217,18 +218,74 @@ async fn kill_process_tree(child: &mut Child) -> Option<ExitStatus> {
     }
 }
 
-/// copy stream output into `buf`, stopping at `limit` bytes but still draining the pipe
-async fn read_stream<R: AsyncRead + Unpin>(mut stream: R, buf: Arc<Mutex<Vec<u8>>>, limit: Option<i64>) {
+/// python's `output_limit` value as the stream reader and the `len(...) >= output_limit`
+/// checks see it
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputLimit {
+    /// bytes a stream keeps (python `len(buffer) < limit`, then `chunk[:remaining]`)
+    keep: i64,
+    /// a positive float makes python's reader raise TypeError on its first chunk (float slice
+    /// index) and stop reading; the error is swallowed by the reader's `except`
+    stop_after_first_chunk: bool,
+    /// the value `len(...) >= output_limit` compares against
+    threshold: f64,
+    /// python f-string interpolation of the raw value
+    text: String,
+}
+
+impl OutputLimit {
+    pub fn int(n: i64) -> Self {
+        OutputLimit { keep: n.max(0), stop_after_first_chunk: false, threshold: n as f64, text: n.to_string() }
+    }
+
+    /// python's view of a config value; `Err(type name)` when `len(...) >= value` raises TypeError
+    pub fn from_config(v: &Value) -> Result<Self, &'static str> {
+        let limit = match v {
+            Value::Bool(b) => Some(OutputLimit { text: if *b { "True" } else { "False" }.to_string(), ..Self::int(i64::from(*b)) }),
+            Value::Number(n) if n.is_f64() => n.as_f64().map(|f| OutputLimit { keep: 0, stop_after_first_chunk: f > 0.0, threshold: f, text: float_repr(f) }),
+            Value::Number(_) => as_i64(v).map(Self::int),
+            _ => None,
+        };
+        limit.ok_or_else(|| py_type_name(v))
+    }
+
+    /// the reader used for a non-numeric limit: python raises on the first chunk, except for
+    /// None, where it keeps everything. The output is discarded either way.
+    fn incomparable(type_name: &str) -> Self {
+        OutputLimit { keep: 0, stop_after_first_chunk: type_name != "NoneType", threshold: f64::NAN, text: String::new() }
+    }
+}
+
+/// the text of python's TypeError from `len(stdout) >= output_limit` with a non-numeric limit
+fn incomparable_limit_error(type_name: &str) -> String {
+    format!("'>=' not supported between instances of 'int' and '{}'", type_name)
+}
+
+/// how long readers may keep draining once the child has exited (only matters when a background
+/// grandchild still holds the pipes; a normal command reaches EOF at exit)
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+/// cancel a reader task and wait for it to stop; a task that already finished is not awaited
+/// again (its output was taken or it is complete)
+async fn stop_reader(task: &mut JoinHandle<()>) {
+    if !task.is_finished() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+/// copy stream output into `buf` up to the limit, still draining the pipe past it
+async fn read_stream<R: AsyncRead + Unpin>(mut stream: R, buf: Arc<Mutex<Vec<u8>>>, limit: Option<OutputLimit>) {
     let mut chunk = [0u8; 4096];
     loop {
         match stream.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let mut b = buf.lock();
-                let take = match limit {
+                let take = match &limit {
                     None => n,
                     Some(l) => {
-                        let cap = l.max(0) as usize;
+                        let cap = l.keep.max(0) as usize;
                         if b.len() < cap {
                             (cap - b.len()).min(n)
                         } else {
@@ -237,14 +294,19 @@ async fn read_stream<R: AsyncRead + Unpin>(mut stream: R, buf: Arc<Mutex<Vec<u8>
                     }
                 };
                 b.extend_from_slice(&chunk[..take]);
+                if limit.as_ref().is_some_and(|l| l.stop_after_first_chunk) {
+                    break;
+                }
             }
         }
     }
 }
 
 /// python `_run_async_cmd`: run a host command in its own session with a timeout and an
-/// optional output cap. Output is read until EOF; on timeout the process group is killed.
-pub async fn run_cmd<S: AsRef<str>>(args: &[S], dur: Duration, limit: Option<i64>) -> anyhow::Result<CmdOutput> {
+/// optional output cap. Returns once the direct child exits (python `process.wait()`), not
+/// at pipe EOF, so a background grandchild holding the pipes does not hold the result. On
+/// timeout the process group is killed.
+pub async fn run_cmd<S: AsRef<str>>(args: &[S], dur: Duration, limit: Option<OutputLimit>) -> anyhow::Result<CmdOutput> {
     let program = args.first().map(|a| a.as_ref().to_string()).ok_or_else(|| anyhow!("empty command"))?;
     let mut cmd = Command::new(&program);
     cmd.args(args.get(1..).unwrap_or(&[]).iter().map(|a| a.as_ref())).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -256,25 +318,25 @@ pub async fn run_cmd<S: AsRef<str>>(args: &[S], dur: Duration, limit: Option<i64
 
     let out_buf = Arc::new(Mutex::new(Vec::new()));
     let err_buf = Arc::new(Mutex::new(Vec::new()));
-    let mut out_task = tokio::spawn(read_stream(stdout, out_buf.clone(), limit));
+    let mut out_task = tokio::spawn(read_stream(stdout, out_buf.clone(), limit.clone()));
     let mut err_task = tokio::spawn(read_stream(stderr, err_buf.clone(), limit));
 
-    let waited = timeout(dur, async {
-        let status = child.wait().await;
-        let _ = (&mut out_task).await;
-        let _ = (&mut err_task).await;
-        status
-    })
-    .await;
-
-    let (status, timed_out) = match waited {
-        Ok(status) => (Some(status?), false),
+    let (status, timed_out) = match timeout(dur, child.wait()).await {
+        Ok(status) => {
+            // keep whatever is already in the pipes, but never wait on a grandchild's EOF
+            let _ = timeout(DRAIN_GRACE, async {
+                let _ = (&mut out_task).await;
+                let _ = (&mut err_task).await;
+            })
+            .await;
+            stop_reader(&mut out_task).await;
+            stop_reader(&mut err_task).await;
+            (Some(status?), false)
+        }
         Err(_elapsed) => {
             let status = kill_process_tree(&mut child).await;
-            out_task.abort();
-            err_task.abort();
-            let _ = (&mut out_task).await;
-            let _ = (&mut err_task).await;
+            stop_reader(&mut out_task).await;
+            stop_reader(&mut err_task).await;
             (status, true)
         }
     };
@@ -289,19 +351,19 @@ fn output_text(out: &CmdOutput) -> (String, String) {
     (String::from_utf8_lossy(&out.stdout).trim().to_string(), String::from_utf8_lossy(&out.stderr).trim().to_string())
 }
 
-fn output_limit_hit(out: &CmdOutput, output_limit: i64) -> bool {
-    out.stdout.len() as i64 >= output_limit || out.stderr.len() as i64 >= output_limit
+fn output_limit_hit(out: &CmdOutput, limit: &OutputLimit) -> bool {
+    out.stdout.len() as f64 >= limit.threshold || out.stderr.len() as f64 >= limit.threshold
 }
 
 /// result dict of a passthrough command: truncation counts as an error here
-pub fn passthrough_results(out: &CmdOutput, timeout_val: &Value, output_limit: i64) -> (Value, bool) {
+pub fn passthrough_results(out: &CmdOutput, timeout_val: &Value, limit: &OutputLimit) -> (Value, bool) {
     let (stdout, stderr) = output_text(out);
     let mut errors = Vec::new();
     if out.timed_out {
         errors.push(format!("Command execution timed out after {}s", py_str(timeout_val)));
     }
-    if output_limit_hit(out, output_limit) {
-        errors.push(format!("Output truncated - limit: {} chars", output_limit));
+    if output_limit_hit(out, limit) {
+        errors.push(format!("Output truncated - limit: {} chars", limit.text));
     }
     if out.return_code == 137 {
         errors.push("Process forcibly killed".to_string());
@@ -315,15 +377,15 @@ pub fn passthrough_results(out: &CmdOutput, timeout_val: &Value, output_limit: i
 }
 
 /// result dict of a sandboxed command: truncation is informational (truncation_note), not a failure
-pub fn sandbox_results(out: &CmdOutput, timeout_val: &Value, output_limit: i64) -> (Value, bool) {
+pub fn sandbox_results(out: &CmdOutput, timeout_val: &Value, limit: &OutputLimit) -> (Value, bool) {
     let (stdout, stderr) = output_text(out);
     let mut results = json!({"stdout": stdout, "stderr": stderr, "exit_code": out.return_code});
     let mut errors = Vec::new();
     if out.timed_out {
         errors.push(format!("Command execution timed out after {}s", py_str(timeout_val)));
     }
-    if output_limit_hit(out, output_limit) {
-        results["truncation_note"] = json!(format!("Output truncated - limit: {} chars", output_limit));
+    if output_limit_hit(out, limit) {
+        results["truncation_note"] = json!(format!("Output truncated - limit: {} chars", limit.text));
     }
     if out.return_code == 137 {
         errors.push("Process forcibly killed".to_string());
@@ -432,9 +494,10 @@ impl Shell {
         Ok((uid, gid))
     }
 
-    fn output_limit(&self) -> anyhow::Result<i64> {
-        let v = self.cfg("output_limit", json!(2000));
-        as_i64(&v).or_else(|| as_f64(&v).map(|f| f as i64)).ok_or_else(|| anyhow!("unsupported output_limit: {}", py_repr(&v)))
+    /// `config.get("output_limit", default=2000)` as python sees it; `Err(type name)` when the
+    /// stored value is not comparable with an int
+    fn output_limit(&self) -> Result<OutputLimit, &'static str> {
+        OutputLimit::from_config(&self.cfg("output_limit", json!(2000)))
     }
 
     /// `timeout_val + 5` as the safety timeout for a command
@@ -521,7 +584,7 @@ impl Shell {
             // python wraps this whole check in try/except Exception: pass
             if let Ok(Some(runtime)) = self.runtime() {
                 let args = [runtime.as_str(), "images", "--format", "{{.Repository}}:{{.Tag}}", FULL_IMAGE];
-                if let Ok(out) = run_cmd(&args, Duration::from_secs(5), Some(256)).await {
+                if let Ok(out) = run_cmd(&args, Duration::from_secs(5), Some(OutputLimit::int(256))).await {
                     if std::str::from_utf8(&out.stdout).map(|s| s.contains(FULL_IMAGE)).unwrap_or(false) {
                         self.slog(&format!("Image {} is up to date (hash unchanged), skipping build.", FULL_IMAGE));
                         return Ok(Some(FULL_IMAGE.to_string()));
@@ -578,7 +641,7 @@ impl Shell {
     async fn container_listed(&self, runtime: &str, name: &str) -> bool {
         let filter = format!("name={}", name);
         let args = [runtime, "ps", "--format", "{{.Names}}", "--filter", filter.as_str()];
-        match run_cmd(&args, Duration::from_secs(5), Some(256)).await {
+        match run_cmd(&args, Duration::from_secs(5), Some(OutputLimit::int(256))).await {
             Ok(out) => std::str::from_utf8(&out.stdout).map(|s| s.contains(name)).unwrap_or(false),
             Err(_) => false,
         }
@@ -673,7 +736,7 @@ impl Shell {
 
         self.base.log(&self.base.name, &format!("starting using command: {}", cmd.join(" ")));
 
-        match run_cmd(&cmd, Duration::from_secs(30), Some(1024 * 1024)).await {
+        match run_cmd(&cmd, Duration::from_secs(30), Some(OutputLimit::int(1024 * 1024))).await {
             Ok(out) => {
                 if !out.stderr.is_empty() {
                     self.slog(&format!("ERROR: {}", py_bytes_repr(&out.stderr)));
@@ -711,13 +774,20 @@ impl Shell {
     /// `_run_passthrough`: run directly on the host when openlumara is already in a container
     async fn run_passthrough(&self, command: &str) -> anyhow::Result<Value> {
         let timeout_val = self.cfg("execution_timeout", json!(10));
-        let output_limit = self.output_limit()?;
+        let limit = self.output_limit();
         let safety = Self::safety_timeout(&timeout_val)?;
-        match run_cmd(&["sh", "-c", command], safety, Some(output_limit)).await {
-            Ok(out) => {
-                let (results, success) = passthrough_results(&out, &timeout_val, output_limit);
-                Ok(self.base.result(results, success))
-            }
+        let reader = match &limit {
+            Ok(l) => l.clone(),
+            Err(t) => OutputLimit::incomparable(t),
+        };
+        match run_cmd(&["sh", "-c", command], safety, Some(reader)).await {
+            Ok(out) => match &limit {
+                Ok(limit) => {
+                    let (results, success) = passthrough_results(&out, &timeout_val, limit);
+                    Ok(self.base.result(results, success))
+                }
+                Err(t) => Ok(self.base.result(format!("Error while running passthrough shell command: {}", incomparable_limit_error(t)), false)),
+            },
             Err(e) => Ok(self.base.result(format!("Error while running passthrough shell command: {}", e), false)),
         }
     }
@@ -745,7 +815,7 @@ impl Shell {
         let container = self.container_name()?.ok_or_else(|| anyhow!("argument must be str, not None"))?;
 
         let timeout_val = self.cfg("execution_timeout", json!(10));
-        let output_limit = self.output_limit()?;
+        let limit = self.output_limit();
         let safety = Self::safety_timeout(&timeout_val)?;
         let timeout_str = py_str(&timeout_val);
         let args = [
@@ -762,11 +832,18 @@ impl Shell {
             "-c",
             command,
         ];
-        match run_cmd(&args, safety, Some(output_limit)).await {
-            Ok(out) => {
-                let (results, success) = sandbox_results(&out, &timeout_val, output_limit);
-                Ok(self.base.result(results, success))
-            }
+        let reader = match &limit {
+            Ok(l) => l.clone(),
+            Err(t) => OutputLimit::incomparable(t),
+        };
+        match run_cmd(&args, safety, Some(reader)).await {
+            Ok(out) => match &limit {
+                Ok(limit) => {
+                    let (results, success) = sandbox_results(&out, &timeout_val, limit);
+                    Ok(self.base.result(results, success))
+                }
+                Err(t) => Ok(self.base.result(format!("Error while running sandboxed shell command: {}", incomparable_limit_error(t)), false)),
+            },
             Err(e) => Ok(self.base.result(format!("Error while running sandboxed shell command: {}", e), false)),
         }
     }
@@ -1024,12 +1101,12 @@ mod tests {
     #[test]
     fn passthrough_truncation_is_an_error_and_timeout_message() {
         let o = out(b"hel", b"", 0, false);
-        let (results, success) = passthrough_results(&o, &json!(10), 3);
+        let (results, success) = passthrough_results(&o, &json!(10), &OutputLimit::int(3));
         assert!(!success);
         assert_eq!(results, json!({"stdout": "hel", "stderr": "", "exit_code": 0, "errors": ["Output truncated - limit: 3 chars"]}));
 
         let killed = out(b"", b"", 137, true);
-        let (results, success) = passthrough_results(&killed, &json!(10), 2000);
+        let (results, success) = passthrough_results(&killed, &json!(10), &OutputLimit::int(2000));
         assert!(!success);
         assert_eq!(
             results["errors"],
@@ -1040,7 +1117,7 @@ mod tests {
     #[test]
     fn sandbox_truncation_is_informational() {
         let o = out(b"hel", b"", 0, false);
-        let (results, success) = sandbox_results(&o, &json!(30), 3);
+        let (results, success) = sandbox_results(&o, &json!(30), &OutputLimit::int(3));
         assert!(success);
         assert_eq!(results, json!({"stdout": "hel", "stderr": "", "exit_code": 0, "truncation_note": "Output truncated - limit: 3 chars"}));
     }
@@ -1067,7 +1144,7 @@ mod tests {
 
     #[test]
     fn run_cmd_kills_process_group_on_timeout() {
-        let o = rt().block_on(run_cmd(&["sh", "-c", "sleep 30"], Duration::from_millis(300), Some(100))).unwrap();
+        let o = rt().block_on(run_cmd(&["sh", "-c", "sleep 30"], Duration::from_millis(300), Some(OutputLimit::int(100)))).unwrap();
         assert!(o.timed_out);
         assert_eq!(o.return_code, -(libc::SIGKILL as i64));
     }
@@ -1087,5 +1164,48 @@ mod tests {
         assert_eq!(err.to_string(), "'Shell' object has no attribute 'passthrough'");
         *shell.state.lock() = Some(State { passthrough: true, ..State::default() });
         assert_eq!(shell.get_setup().unwrap(), PASSTHROUGH_SETUP);
+    }
+
+    #[test]
+    fn run_cmd_returns_when_child_exits_with_background_grandchild() {
+        // the `sleep` inherits the pipes; python's process.wait() returns as soon as `sh` exits
+        let started = std::time::Instant::now();
+        let o = rt().block_on(run_cmd(&["sh", "-c", "sleep 30 & echo \"$!\"; echo hi"], Duration::from_secs(10), Some(OutputLimit::int(2000)))).unwrap();
+        assert!(!o.timed_out);
+        assert_eq!(o.return_code, 0);
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        let mut lines = text.lines();
+        let grandchild: libc::pid_t = lines.next().unwrap().parse().unwrap();
+        assert_eq!(lines.next(), Some("hi"));
+        unsafe { libc::kill(grandchild, libc::SIGKILL) };
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn float_output_limit_keeps_no_output_like_python() {
+        // python's reader slices with a float, raises, and the error is swallowed: nothing is kept
+        let limit = OutputLimit::from_config(&json!(2000.0)).unwrap();
+        let o = rt().block_on(run_cmd(&["sh", "-c", "echo hi"], Duration::from_secs(10), Some(limit.clone()))).unwrap();
+        assert_eq!(o.stdout, b"");
+        assert_eq!(o.return_code, 0);
+        let (results, success) = passthrough_results(&o, &json!(10), &limit);
+        assert!(success);
+        assert_eq!(results, json!({"stdout": "", "stderr": "", "exit_code": 0}));
+    }
+
+    #[test]
+    fn non_int_output_limits_render_like_python() {
+        // a float limit is interpolated as python prints it
+        let zero = OutputLimit::from_config(&json!(0.0)).unwrap();
+        let (results, success) = sandbox_results(&out(b"", b"", 0, false), &json!(10), &zero);
+        assert!(success);
+        assert_eq!(results, json!({"stdout": "", "stderr": "", "exit_code": 0, "truncation_note": "Output truncated - limit: 0.0 chars"}));
+        // a bool is an int in python (True == 1) and prints as True
+        let no = OutputLimit::from_config(&json!(false)).unwrap();
+        let (results, _) = passthrough_results(&out(b"", b"", 0, false), &json!(10), &no);
+        assert_eq!(results["errors"], json!(["Output truncated - limit: False chars"]));
+        // a numeric string is not comparable with len(): python raises TypeError
+        assert_eq!(OutputLimit::from_config(&json!("2000")).unwrap_err(), "str");
+        assert_eq!(incomparable_limit_error("str"), "'>=' not supported between instances of 'int' and 'str'");
     }
 }
