@@ -1542,6 +1542,7 @@ dependencies = [
  "chrono",
  "encoding_rs",
  "futures",
+ "hyper",
  "indexmap",
  "libc",
  "ol-core",
