@@ -56,10 +56,17 @@ pub fn read_text(path: &str) -> Result<String, String> {
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
         Err(e) => {
+            // python reports the lead byte of the broken sequence and its offset in the file
             let err = e.utf8_error();
             let pos = err.valid_up_to();
             let b = e.as_bytes()[pos];
-            let reason = if (0x80..0xc0).contains(&b) || b >= 0xf8 { "invalid start byte" } else { "invalid continuation byte" };
+            let reason = if (0x80..=0xc1).contains(&b) || b >= 0xf5 {
+                "invalid start byte"
+            } else if err.error_len().is_none() {
+                "unexpected end of data"
+            } else {
+                "invalid continuation byte"
+            };
             return Err(format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", b, pos, reason));
         }
     };
@@ -148,5 +155,51 @@ mod tests {
     fn os_error_format() {
         let e = std::fs::read("/nonexistent/x").unwrap_err();
         assert_eq!(os_error(&e, "/nonexistent/x"), "[Errno 2] No such file or directory: '/nonexistent/x'");
+    }
+
+    #[test]
+    fn expanduser_and_basename_like_python() {
+        assert_eq!(expanduser("/abs/x"), "/abs/x");
+        if let Ok(home) = std::env::var("HOME") {
+            assert_eq!(expanduser("~/notes.md"), format!("{}/notes.md", home.trim_end_matches('/')));
+            assert_eq!(expanduser("~"), home);
+        }
+        assert_eq!(expanduser("~user/x"), "~user/x");
+        assert_eq!(basename("a/b/c.txt"), "c.txt");
+        assert_eq!(basename("a/b/"), "");
+        assert_eq!(basename("plain"), "plain");
+    }
+
+    #[test]
+    fn read_text_normalises_newlines_and_reports_decode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = dir.path().join("ok.txt");
+        std::fs::write(&ok, b"one\r\ntwo\rthree\n").unwrap();
+        assert_eq!(read_text(ok.to_str().unwrap()).unwrap(), "one\ntwo\nthree\n");
+
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&bad, b"ab\xff").unwrap();
+        assert_eq!(
+            read_text(bad.to_str().unwrap()).unwrap_err(),
+            "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte"
+        );
+
+        let trunc = dir.path().join("trunc.txt");
+        std::fs::write(&trunc, b"x\xe4\xb8").unwrap();
+        assert_eq!(
+            read_text(trunc.to_str().unwrap()).unwrap_err(),
+            "'utf-8' codec can't decode byte 0xe4 in position 1: unexpected end of data"
+        );
+    }
+
+    #[test]
+    fn py_type_name_matches_python_type_names() {
+        assert_eq!(py_type_name(&Value::Null), "NoneType");
+        assert_eq!(py_type_name(&serde_json::json!(true)), "bool");
+        assert_eq!(py_type_name(&serde_json::json!(3)), "int");
+        assert_eq!(py_type_name(&serde_json::json!(1.5)), "float");
+        assert_eq!(py_type_name(&serde_json::json!("s")), "str");
+        assert_eq!(py_type_name(&serde_json::json!([1])), "list");
+        assert_eq!(py_type_name(&serde_json::json!({})), "dict");
     }
 }
