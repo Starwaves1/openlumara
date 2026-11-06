@@ -8,9 +8,10 @@ use ol_core::pyjson::py_str;
 use ol_core::storage::{StorageDict, StorageType};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/notes.rs"]
-pub(crate) mod meta;
+pub mod meta;
 
 pub struct Notes {
     base: ModuleBase,
@@ -18,6 +19,10 @@ pub struct Notes {
 }
 
 impl Notes {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, data: Mutex::new(None) }
     }
@@ -200,5 +205,40 @@ mod tests {
         assert_eq!(r["content"], "note deleted");
         assert!(d.data.is_empty());
         assert!(!dir.path().join("notes/home").exists());
+    }
+
+    #[test]
+    fn error_strings_and_category_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("notes", StorageType::Markdown, Some(&p)).unwrap();
+        let base = ModuleBase::detached("notes");
+        run(&base, &mut d, "create", &args(json!({"name": "a", "category": "work", "content": "one"}))).unwrap();
+        let r = run(&base, &mut d, "create", &args(json!({"name": "b", "category": "work", "content": "two"}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "note created"}));
+        let missing = json!({"status": "error", "content": "note does not exist"});
+        assert_eq!(run(&base, &mut d, "read", &args(json!({"category": "work", "name": "zz"}))).unwrap(), missing);
+        assert_eq!(run(&base, &mut d, "edit", &args(json!({"category": "work", "name": "zz", "content": "x"}))).unwrap(), missing);
+        assert_eq!(run(&base, &mut d, "delete", &args(json!({"category": "work", "name": "zz"}))).unwrap(), missing);
+        let no_cat = json!({"status": "error", "content": NO_CATEGORY});
+        assert_eq!(run(&base, &mut d, "edit", &args(json!({"category": "nope", "name": "a", "content": "x"}))).unwrap(), no_cat);
+        assert_eq!(run(&base, &mut d, "list", &args(json!({"category": "nope"}))).unwrap(), no_cat);
+        let r = run(&base, &mut d, "search", &args(json!({"query": "   "}))).unwrap();
+        assert_eq!(r["content"], "no notes found matching '   '");
+        // the category survives while it still holds notes, and is dropped once empty
+        assert_eq!(run(&base, &mut d, "delete", &args(json!({"category": "work", "name": "a"}))).unwrap()["content"], "note deleted");
+        assert_eq!(run(&base, &mut d, "get_categories", &args(json!({}))).unwrap()["content"], json!(["work"]));
+        assert_eq!(run(&base, &mut d, "delete", &args(json!({"category": "work", "name": "b"}))).unwrap()["content"], "note deleted");
+        assert_eq!(run(&base, &mut d, "get_categories", &args(json!({}))).unwrap()["content"], json!([]));
+    }
+
+    #[test]
+    fn nested_items_flatten_to_slash_paths() {
+        let data = json!({"home": {"groceries": "milk"}, "work": {"ideas": {"x": "y"}}});
+        let mut items = Vec::new();
+        recursive_items(data.as_object().unwrap(), "", &mut items);
+        let paths: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(paths, vec!["home/groceries", "work/ideas/x"]);
+        assert_eq!(items[0].1, json!("milk"));
     }
 }

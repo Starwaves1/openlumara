@@ -1,6 +1,7 @@
 //! (being ported - see rust/PORTING.md)
 
 pub mod identity;
+pub mod notes;
 pub mod replacer;
 pub mod token_threshold;
 pub mod tutorial;
@@ -55,5 +56,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: replacer::meta::UNSAFE,
         category: replacer::meta::CATEGORY,
         factory: replacer::Replacer::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "notes",
+        class_name: notes::meta::CLASS_NAME,
+        doc: notes::meta::DOC,
+        settings: notes::meta::settings,
+        unsafe_: notes::meta::UNSAFE,
+        category: notes::meta::CATEGORY,
+        factory: notes::Notes::factory,
     });
 }
