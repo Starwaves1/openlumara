@@ -262,6 +262,49 @@ pub fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// python core.search.make_snippets. The match position is taken from text.lower() and then used to
+/// slice the original text, so a lowercase form with a different length (U+0130 'İ' becomes two code
+/// points) shifts the snippet exactly like python does. ol-core's version keeps positions aligned instead.
+pub fn make_snippets(text: &str, query: &str, max_snippets: usize, radius: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let low: Vec<char> = text.to_lowercase().chars().collect();
+    let low_str: String = low.iter().collect();
+    let mut candidates = vec![query.trim().to_lowercase()];
+    candidates.extend(ol_core::search::normalize_words(query));
+    let Some(term) = candidates.into_iter().find(|c| !c.is_empty() && low_str.contains(c.as_str())) else {
+        return vec![];
+    };
+    let term_chars: Vec<char> = term.chars().collect();
+    let mut snippets = Vec::new();
+    let mut start = 0usize;
+    while snippets.len() < max_snippets {
+        let Some(pos) = find_chars(&low, &term_chars, start) else { break };
+        // python: end = min(len(text), pos + len(term) + radius); text[max(0, pos - radius):end]
+        let end = chars.len().min(pos + term_chars.len() + radius);
+        let from = pos.saturating_sub(radius);
+        let slice: String = if from < end { chars[from..end].iter().collect() } else { String::new() };
+        let mut s = String::new();
+        if pos > radius {
+            s.push_str("...");
+        }
+        s.push_str(slice.replace('\n', " ").trim());
+        if end < chars.len() {
+            s.push_str("...");
+        }
+        snippets.push(s);
+        start = end;
+    }
+    snippets
+}
+
+/// python str.find(needle, start) over char indices
+fn find_chars(hay: &[char], needle: &[char], start: usize) -> Option<usize> {
+    if needle.len() > hay.len() {
+        return None;
+    }
+    (start..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
+}
+
 /// os.listdir: names only. a read error part way through fails the whole listing, like python.
 /// names that are not valid utf-8 are lossy (python keeps them via surrogateescape).
 pub fn listdir(path: &str) -> Result<Vec<String>, String> {

@@ -1,6 +1,6 @@
 //! Port of modules/notes/module.py
 
-use crate::util::{py_type_name, read_text};
+use crate::util::{make_snippets, py_type_name, read_text};
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
@@ -47,7 +47,13 @@ fn load_markdown(root: &str) -> anyhow::Result<Map<String, Value>> {
         .filter(|e| !e.path().is_dir() && e.path().to_string_lossy().ends_with(".md"))
         .map(|e| e.path().to_path_buf())
         .collect();
-    files.sort();
+    // python's flat dict holds a folder's root-level files before its subfolders' files, so a
+    // file "home.md" is inserted before "home/x.md". Ordering by depth reproduces that for every
+    // key that is a prefix of another one, which is what decides whether the load fails.
+    files.sort_by_key(|p| {
+        let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        (rel.matches('/').count(), rel)
+    });
     let mut flat = Vec::new();
     for p in files {
         let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string();
@@ -57,30 +63,46 @@ fn load_markdown(root: &str) -> anyhow::Result<Map<String, Value>> {
         let content = read_text(&p.to_string_lossy()).map_err(|e| anyhow::anyhow!(e))?;
         flat.push((key, Value::String(content)));
     }
-    Ok(parse_nested_keys(flat))
+    parse_nested_keys(flat)
 }
 
-/// python _parse_nested_keys: "a/b/c" becomes {"a": {"b": {"c": ...}}}
-fn parse_nested_keys(flat: Vec<(String, Value)>) -> Map<String, Value> {
-    let mut result = Map::new();
+/// python _parse_nested_keys, step for step: "a/b/c" becomes {"a": {"b": {"c": ...}}}. A note that
+/// is also a folder's name is a str, and python then fails on the next item assignment into it.
+fn parse_nested_keys(flat: Vec<(String, Value)>) -> anyhow::Result<Map<String, Value>> {
+    let mut result = Value::Object(Map::new());
     for (key, value) in flat {
         let norm = key.replace('\\', "/");
         let parts: Vec<&str> = norm.split('/').collect();
+        let (last, dirs) = parts.split_last().expect("split always yields one part");
         let mut current = &mut result;
-        for part in &parts[..parts.len() - 1] {
-            let entry = current.entry(part.to_string()).or_insert_with(|| Value::Object(Map::new()));
-            if !entry.is_object() {
-                *entry = Value::Object(Map::new());
+        for part in dirs {
+            if let Value::String(s) = current {
+                // python: `part in current` is a substring test on a str, then current[part] indexes it
+                if s.contains(part) {
+                    anyhow::bail!("string indices must be integers, not 'str'");
+                }
+                anyhow::bail!("'str' object does not support item assignment");
             }
-            current = entry.as_object_mut().unwrap();
+            let map = current.as_object_mut().expect("only objects are descended into");
+            current = map.entry(part.to_string()).or_insert_with(|| Value::Object(Map::new()));
         }
-        current.insert(parts[parts.len() - 1].to_string(), value);
+        match current {
+            Value::Object(map) => {
+                map.insert(last.to_string(), value);
+            }
+            _ => anyhow::bail!("'str' object does not support item assignment"),
+        }
     }
-    result
+    match result {
+        Value::Object(map) => Ok(map),
+        _ => unreachable!("the root is always an object"),
+    }
 }
 
-/// python StorageDict.load(): replaces the in-memory notes with what is on disk
+/// python StorageDict.load(): clears the in-memory notes first, then replaces them with what is on
+/// disk. A failure part way leaves the store empty, as python's clear() has already run.
 fn reload(data: &mut StorageDict) -> anyhow::Result<()> {
+    data.load_data(Map::new());
     let nested = load_markdown(&data.path)?;
     data.load_data(nested);
     Ok(())
@@ -94,28 +116,68 @@ fn reload_on_get(data: &mut StorageDict) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// python save() writes every note with f.write(content), so a note that is not a str raises TypeError
+/// python core.storage.StorageDict.save() for the markdown kind, notes in flattened order. Each note is
+/// written as it is reached, so a note that is not a str raises TypeError part way through: the notes
+/// before it are already written, the note itself is left truncated, and stale files are not removed.
+/// An invalid name is dropped from memory and reported only after the loop.
 fn save_notes(data: &mut StorageDict) -> anyhow::Result<()> {
-    if let Some(bad) = first_non_str(&data.data) {
-        let name = if bad.is_null() { "None" } else { py_type_name(bad) };
-        anyhow::bail!("write() argument must be str, not {}", name);
+    // python save() returns before anything else in TEMPORARY mode
+    if temporary() && !data.override_temporary {
+        return Ok(());
+    }
+    let mut flat = Vec::new();
+    recursive_items(&data.data, "", &mut flat);
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for (key, content) in flat {
+        let name = match ol_core::paths::sandbox_path(&data.path, Some(&format!("{}.md", key))) {
+            Ok(n) => n,
+            Err(e) => {
+                delete_nested_key(&mut data.data, &key);
+                failed.push((key, e.to_string()));
+                continue;
+            }
+        };
+        if let Some(dir) = Path::new(&name).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        match content.as_str() {
+            Some(text) => std::fs::write(&name, text)?,
+            None => {
+                // python: open(name, "w") has already truncated the file when f.write() raises
+                std::fs::File::create(&name)?;
+                anyhow::bail!("write() argument must be str, not {}", type_name_for_write(&content));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        let lines: Vec<String> = failed.iter().map(|(k, e)| format!("- {}: {}", k, e)).collect();
+        anyhow::bail!("Failed to save the following keys due to validation errors:\n{}", lines.join("\n"));
     }
     data.save()
 }
 
-fn first_non_str(m: &Map<String, Value>) -> Option<&Value> {
-    for v in m.values() {
-        match v {
-            Value::Object(inner) => {
-                if let Some(found) = first_non_str(inner) {
-                    return Some(found);
-                }
-            }
-            Value::String(_) => {}
-            other => return Some(other),
+/// the name python's write() error gives for a note value (None is spelled out)
+fn type_name_for_write(v: &Value) -> &'static str {
+    if v.is_null() {
+        "None"
+    } else {
+        py_type_name(v)
+    }
+}
+
+/// python _delete_nested_key: walks down through dicts only, and does nothing when the path is missing
+fn delete_nested_key(root: &mut Map<String, Value>, flat_key: &str) {
+    let norm = flat_key.replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').collect();
+    let Some((last, dirs)) = parts.split_last() else { return };
+    let mut current = root;
+    for part in dirs {
+        match current.get_mut(*part) {
+            Some(Value::Object(m)) => current = m,
+            _ => return,
         }
     }
-    None
+    current.shift_remove(*last);
 }
 
 fn recursive_items(data: &Map<String, Value>, prefix: &str, out: &mut Vec<(String, Value)>) {
@@ -197,7 +259,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             for hit in results {
                 let entry = &hit.entry;
                 let mut line = format!("{} (score {:.2})", py_str(&entry["path"]), hit.score);
-                let snippets = ol_core::search::make_snippets(entry["content"].as_str().unwrap_or(""), &query, 1, 50);
+                let snippets = make_snippets(entry["content"].as_str().unwrap_or(""), &query, 1, 50);
                 if let Some(first) = snippets.first() {
                     line.push_str(&format!("\n  {}", first));
                 }
@@ -373,5 +435,54 @@ mod tests {
         // deleting the null note leaves the number note in memory, so the save now names int
         let err = run(&base, &mut d, "delete", &args(json!({"category": "c", "name": "n"}))).unwrap_err();
         assert_eq!(err.to_string(), "write() argument must be str, not int");
+    }
+
+    #[test]
+    fn file_and_folder_with_the_same_name_fail_the_load_like_python() {
+        // python: "home" (root file) is inserted before "home/x", then "home/x" indexes into a str
+        let flat = vec![("home".to_string(), json!("a file")), ("home/x".to_string(), json!("in folder"))];
+        let err = parse_nested_keys(flat).unwrap_err();
+        assert_eq!(err.to_string(), "'str' object does not support item assignment");
+        // when the folder name is a substring of the file's text, python indexes the str instead
+        let flat = vec![("home".to_string(), json!("box")), ("home/x/z".to_string(), json!("in folder"))];
+        assert_eq!(parse_nested_keys(flat).unwrap_err().to_string(), "string indices must be integers, not 'str'");
+        let flat = vec![("a".to_string(), json!("a file")), ("a/b".to_string(), json!("nested"))];
+        assert_eq!(parse_nested_keys(flat).unwrap_err().to_string(), "'str' object does not support item assignment");
+
+        // on disk: the failed load leaves the store empty, so later calls see no categories
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("notes", StorageType::Markdown, Some(&p)).unwrap();
+        let base = ModuleBase::detached("notes");
+        std::fs::create_dir_all(dir.path().join("notes/home")).unwrap();
+        std::fs::write(dir.path().join("notes/home.md"), "file").unwrap();
+        std::fs::write(dir.path().join("notes/home/x.md"), "folder").unwrap();
+        assert!(reload(&mut d).is_err());
+        assert!(d.data.is_empty());
+        let r = run(&base, &mut d, "get_categories", &args(json!({}))).unwrap();
+        assert_eq!(r["content"], json!([]));
+    }
+
+    #[test]
+    fn non_str_note_stops_the_save_after_earlier_notes_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("notes", StorageType::Markdown, Some(&p)).unwrap();
+        let base = ModuleBase::detached("notes");
+        run(&base, &mut d, "create", &args(json!({"name": "a", "category": "b", "content": "one"}))).unwrap();
+        let err = run(&base, &mut d, "create", &args(json!({"name": "n", "category": "c", "content": null}))).unwrap_err();
+        assert_eq!(err.to_string(), "write() argument must be str, not None");
+        // b/a was written before the bad note, and the bad note's file was created empty
+        assert_eq!(std::fs::read_to_string(dir.path().join("notes/b/a.md")).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(dir.path().join("notes/c/n.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn snippets_take_positions_from_the_lowercased_text_like_python() {
+        // "İ" lowercases to two code points, so the match at 3 in the lowercased text is at 2 in
+        // the original, and python slices the original from 1 (" vitamin") instead of 0
+        assert_eq!(make_snippets("İ vitamin", "vitamin", 1, 2), vec!["...vitamin".to_string()]);
+        // same-length text is unaffected
+        assert_eq!(make_snippets("buy vitamins", "vitamin", 1, 50), vec!["buy vitamins".to_string()]);
     }
 }
