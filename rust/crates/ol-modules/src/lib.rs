@@ -3,6 +3,7 @@
 pub mod identity;
 pub mod tutorial;
 pub mod util;
+pub mod webui_extension_example;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
 
@@ -25,5 +26,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: tutorial::meta::UNSAFE,
         category: tutorial::meta::CATEGORY,
         factory: tutorial::Tutorial::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "webui_extension_example",
+        class_name: webui_extension_example::meta::CLASS_NAME,
+        doc: webui_extension_example::meta::DOC,
+        settings: webui_extension_example::meta::settings,
+        unsafe_: webui_extension_example::meta::UNSAFE,
+        category: webui_extension_example::meta::CATEGORY,
+        factory: webui_extension_example::WebuiExtensionExample::factory,
     });
 }
