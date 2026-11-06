@@ -19,11 +19,13 @@ use crate::ws::{self, WsManager};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, RawQuery, Request, State};
+use axum::handler::Handler;
+use axum::http::uri::PathAndQuery;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{any, get, MethodRouter};
 use axum::Json;
 use axum::Router;
 use ol_core::channel::{Channel, ChannelBehavior, TokenStream};
@@ -40,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, watch};
+use tower::ServiceExt;
 
 /// python `Webui.settings` is read through the generated meta; the class-level metadata comes from there
 pub fn descriptor() -> ChannelDescriptor {
@@ -72,6 +75,55 @@ pub fn detail_response(status: StatusCode, detail: &str) -> Response {
 /// starlette's plain-text 500 (an unhandled exception in a route)
 pub fn internal_error() -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+}
+
+/// starlette's 405 for a route that does not take the request's method: the detail body plus `Allow`
+pub fn method_not_allowed_allowing(allow: &'static str) -> Response {
+    let mut response = detail_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+    response.headers_mut().insert(header::ALLOW, HeaderValue::from_static(allow));
+    response
+}
+
+/// the 405 of a python route declared with `@app.get` only (FastAPI adds no HEAD to GET), so HEAD and the
+/// other methods get starlette's 405 with `Allow: GET`
+pub async fn get_only_not_allowed() -> Response {
+    method_not_allowed_allowing("GET")
+}
+
+/// a python `@app.get` route: GET serves the handler, every other method (HEAD included) is starlette's 405.
+/// axum's `get` would otherwise serve HEAD with the body stripped
+pub fn get_only<H, T, S>(handler: H) -> MethodRouter<S>
+where
+    H: Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    get(handler).head(get_only_not_allowed).fallback(get_only_not_allowed)
+}
+
+/// starlette's `redirect_slashes`: a path that matches only with or without its trailing slash is a 307 to the
+/// other form, for any method. starlette makes the `Location` absolute from the Host header, query kept
+pub fn slash_redirect(headers: &HeaderMap, path: &str, query: Option<&str>) -> Response {
+    let mut location = match headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        Some(host) => format!("http://{host}{path}"),
+        None => path.to_string(),
+    };
+    if let Some(query) = query {
+        location.push('?');
+        location.push_str(query);
+    }
+    match HeaderValue::from_str(&location) {
+        Ok(value) => (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, value)]).into_response(),
+        Err(_) => internal_error(),
+    }
+}
+
+async fn login_slash(headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    slash_redirect(&headers, "/login", query.as_deref())
+}
+
+async fn logout_slash(headers: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    slash_redirect(&headers, "/logout", query.as_deref())
 }
 
 /// python `ADMIN_ONLY_ENDPOINTS`: blocked outright when `enable_admin_settings` is off
@@ -627,12 +679,61 @@ async fn method_not_allowed() -> Response {
     detail_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
 }
 
+/// python `%`-unquoting (`urllib.parse.unquote`): `%XX` escapes become bytes, a malformed escape stays as written
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16)) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// starlette routes on the percent-decoded path (uvicorn unquotes it before the app sees it), axum on the raw
+/// one. the path is re-encoded from its decoded bytes (only unreserved characters and `/` stay bare), so the
+/// fixed routes match the decoded spelling and axum's own decoding of the path params gives the same values
+fn route_on_decoded_path(mut req: Request) -> Request {
+    let uri = req.uri().clone();
+    let decoded = percent_decode(uri.path());
+    let mut path = String::with_capacity(decoded.len());
+    for byte in decoded.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            path.push(byte as char);
+        } else {
+            path.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    let mut parts = uri.into_parts();
+    if let Ok(pq) = path_and_query.parse::<PathAndQuery>() {
+        parts.path_and_query = Some(pq);
+    }
+    if let Ok(rebuilt) = Uri::from_parts(parts) {
+        *req.uri_mut() = rebuilt;
+    }
+    req
+}
+
 /// the whole app: page routes, static/ui/api route groups, then the middleware stack
 pub fn build_router(app: Arc<Shared>) -> Router {
     let router = Router::new()
-        .route("/", get(root))
-        .route("/login", get(login_page).post(login_submit))
-        .route("/logout", get(logout))
+        .route("/", get_only(root))
+        .route("/login", get(login_page).head(get_only_not_allowed).post(login_submit).fallback(get_only_not_allowed))
+        .route("/login/", any(login_slash))
+        .route("/logout", get_only(logout))
+        .route("/logout/", any(logout_slash))
         .route("/ws", get(ws::ws_route));
     let router = static_routes::add_routes(router, &app);
     let router = ui_routes::add_routes(router);
@@ -640,14 +741,17 @@ pub fn build_router(app: Arc<Shared>) -> Router {
 
     // layers wrap everything registered above, so they must come last. the last layer is the
     // outermost: session, then auth (its early answers skip the coi headers, as in python), then coi
-    router
+    let app_router = router
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn(coi_middleware))
         .layer(middleware::from_fn_with_state(app.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(app.clone(), session_middleware))
-        .with_state(app)
+        .with_state(app);
+
+    // the outer router has no routes, so every request reaches the app router with its path re-encoded
+    Router::new().fallback_service(app_router.map_request(route_on_decoded_path))
 }
 
 #[cfg(test)]

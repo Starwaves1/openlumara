@@ -8,7 +8,7 @@ use crate::listing::{
     chats_for_category, day_label_from_key, group_key, highlight_query, local_day, project_chat, updated_of,
     validate_category_format, validate_category_name,
 };
-use crate::server::{api_result, internal_error, Shared};
+use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{get_strip, or_strip, py_int, py_int_str, py_slice, py_strip, py_type_name};
 use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// registers the `/api` chat, stream, input history, settings, library and system routes
 pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
     router
-        .route("/api/chat/load/{chat_id}", get(chat_load))
+        .route("/api/chat/load/{chat_id}", get_only(chat_load))
         .route("/api/chat/current", get(chat_current))
         .route("/api/stream/state", get(stream_state))
         .route("/api/chat/export", get(chat_export))

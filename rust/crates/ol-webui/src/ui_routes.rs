@@ -2,13 +2,14 @@
 //! a request is forwarded to the module's `ui_routes()` entry with the same method, and the result is
 //! wrapped in the api envelope.
 
-use crate::server::{api_result, detail_response, internal_error, module_ui_enabled, Shared};
+use crate::server::{api_result, internal_error, method_not_allowed_allowing, module_ui_enabled, slash_redirect, Shared};
 use crate::util::py_strip_lower;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{Method, StatusCode};
+use axum::handler::Handler;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get, MethodRouter};
 use axum::Json;
 use axum::Router;
 use ol_core::channel::Channel;
@@ -22,11 +23,33 @@ pub fn add_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
     // the handler with route_path "". matchit's `{*catchall}` does not match an empty segment, hence the
     // separate route
     router
-        .route("/api/ext/{module_name}/", get(ext_api_root).post(ext_api_root).put(ext_api_root).delete(ext_api_root))
-        .route(
-            "/api/ext/{module_name}/{*route_path}",
-            get(ext_api).post(ext_api).put(ext_api).delete(ext_api),
-        )
+        .route("/api/ext/{module_name}", any(ext_module_slash))
+        .route("/api/ext/{module_name}/", ext_methods(ext_api_root))
+        .route("/api/ext/{module_name}/{*route_path}", ext_methods(ext_api))
+}
+
+/// python registers `ext_api` for GET/POST/PUT/DELETE only, and FastAPI adds no HEAD to GET, so every other
+/// method (HEAD included) is starlette's 405 with the python `Allow` list
+fn ext_methods<H, T>(handler: H) -> MethodRouter<Arc<Shared>>
+where
+    H: Handler<T, Arc<Shared>> + Clone,
+    T: 'static,
+{
+    get(handler.clone())
+        .post(handler.clone())
+        .put(handler.clone())
+        .delete(handler)
+        .head(ext_not_allowed)
+        .fallback(ext_not_allowed)
+}
+
+async fn ext_not_allowed() -> Response {
+    method_not_allowed_allowing("GET, POST, PUT, DELETE")
+}
+
+/// `/api/ext/<module>` without the trailing slash: starlette's redirect_slashes to the slashed form
+async fn ext_module_slash(headers: HeaderMap, Path(module_name): Path<String>, RawQuery(query): RawQuery) -> Response {
+    slash_redirect(&headers, &format!("/api/ext/{module_name}/"), query.as_deref())
 }
 
 /// python `_ui_api_lookup`: `(module, None)` on a hit, `(None, reason)` on a miss
@@ -93,11 +116,6 @@ async fn dispatch(
     raw_query: Option<String>,
     body: Bytes,
 ) -> Response {
-    // python registers ext_api for GET/POST/PUT/DELETE only, and FastAPI's api_route does not add HEAD
-    // to GET, so starlette answers HEAD on any matching path with its 405 (detail body), whatever the module
-    if method == Method::HEAD {
-        return detail_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
-    }
     let Some(ch) = app.ch() else { return internal_error() };
     let wanted = py_strip_lower(&route_path);
     let method_name = method.as_str();

@@ -325,3 +325,83 @@ async fn ext_api_answers_head_with_405_whatever_the_route_like_python() {
     // the GET route still answers normally
     assert_eq!(h.get("/api/ext/probe/ping").await.json(), json!({"data": "pong", "success": true}));
 }
+
+#[tokio::test]
+async fn get_only_pages_answer_head_with_starlette_405_not_the_body() {
+    // FastAPI's @app.get adds no HEAD, so starlette answers HEAD with its 405 detail body and `Allow: GET`
+    let h = harness(false).await;
+    for uri in ["/", "/login", "/logout", "/api/chat/load/some-id"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "HEAD {uri}");
+        // a HEAD response carries no body
+        assert!(resp.body.is_empty(), "HEAD {uri} body: {}", resp.body);
+    }
+    // GET is unaffected
+    assert_eq!(h.get("/").await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn wrong_methods_on_python_routes_carry_the_allow_header() {
+    let h = harness_with_probe().await;
+    // python's first partial match decides Allow: "/login" has GET first, so PATCH reports GET
+    let root = h.send(request(Method::PATCH, "/", None, None, "")).await;
+    assert_eq!(root.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(root.headers.get(header::ALLOW).unwrap(), "GET");
+    assert_eq!(root.json(), json!({"detail": "Method Not Allowed"}));
+
+    let login = h.send(request(Method::PATCH, "/login", None, None, "")).await;
+    assert_eq!(login.headers.get(header::ALLOW).unwrap(), "GET");
+
+    let ext = h.send(request(Method::PATCH, "/api/ext/probe/ping", None, None, "")).await;
+    assert_eq!(ext.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(ext.headers.get(header::ALLOW).unwrap(), "GET, POST, PUT, DELETE");
+    assert_eq!(ext.json(), json!({"detail": "Method Not Allowed"}));
+}
+
+#[tokio::test]
+async fn trailing_slash_variants_redirect_with_307_like_starlette() {
+    let h = harness(false).await;
+    let with_host = |method: Method, uri: &str| {
+        let mut req = request(method, uri, None, None, "");
+        req.headers_mut().insert(header::HOST, "localhost:8080".parse().unwrap());
+        req
+    };
+
+    let logout = h.send(with_host(Method::GET, "/logout/")).await;
+    assert_eq!(logout.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(logout.headers.get(header::LOCATION).unwrap(), "http://localhost:8080/logout");
+
+    // any method is redirected, and the query string is kept
+    let login = h.send(with_host(Method::POST, "/login/?next=1")).await;
+    assert_eq!(login.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(login.headers.get(header::LOCATION).unwrap(), "http://localhost:8080/login?next=1");
+
+    let module = h.send(with_host(Method::GET, "/api/ext/probe")).await;
+    assert_eq!(module.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(module.headers.get(header::LOCATION).unwrap(), "http://localhost:8080/api/ext/probe/");
+
+    // a request that already matches is not redirected
+    assert_eq!(h.get("/api/ext/probe/").await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn percent_encoded_paths_route_on_the_decoded_path_like_python() {
+    let h = harness_with_probe().await;
+    // "%61" is "a": starlette sees /api/chat/current and /api/ext/probe/ping
+    assert_eq!(h.get("/%61pi/chat/current").await.json(), h.get("/api/chat/current").await.json());
+    assert_eq!(h.get("/api/ext/%70robe/ping").await.json(), json!({"data": "pong", "success": true}));
+    // an encoded slash is a path separator once decoded, so the route does not match
+    let split = h.get("/api/chat/load/a%2Fb").await;
+    assert_eq!(split.status, StatusCode::NOT_FOUND);
+    assert_eq!(split.json(), json!({"detail": "Not Found"}));
+}
+
+#[tokio::test]
+async fn encoded_prefix_is_authenticated_as_the_decoded_api_path() {
+    // with login required, the decoded /api path gets python's 401 (not the 303 to /login of a page)
+    let h = harness(true).await;
+    let resp = h.get("/%61pi/chat/current").await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.json(), json!({"detail": "Unauthorized"}));
+}
