@@ -5,7 +5,8 @@
 //! The webui assets are embedded byte-for-byte from the python tree so there is one source
 //! of truth. Rust does not render the welcome panel or serve /ext-assets yet: the webui port
 //! (rust/PORTING.md, channels/webui) must append `css_urls()` to its css files and render
-//! `WELCOME_TEMPLATE` only when `Tutorial::webui_extension_enabled()` is true.
+//! `WELCOME_TEMPLATE` only when `Tutorial::webui_extension_enabled()` is true. That method
+//! already applies python's enabled-list and loaded-module checks, so callers need no more gating.
 
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase};
@@ -60,8 +61,17 @@ impl Tutorial {
         Self { base }
     }
 
-    /// whether the webui may load this module's templates and assets (python `_ui_extension_enabled`)
+    /// whether the webui may load this module's templates, assets and /ext-assets urls.
+    /// python gates this in two places: `_ui_extension_dirs`/`_ui_asset_dirs` skip a module
+    /// unless it is in its `enabled` config list and loaded by the manager, and then call
+    /// `_ui_extension_enabled`. Both checks are applied here.
     pub fn webui_extension_enabled(&self) -> bool {
+        let section = if self.base.is_user_module { "user_modules" } else { "modules" };
+        let listed = ol_core::config::get_str_list(&[section, "enabled"]).iter().any(|n| n == self.name());
+        let loaded = self.base.manager().is_some_and(|m| m.module(self.name()).is_some());
+        if !listed || !loaded {
+            return false;
+        }
         let settings = ol_core::registry::module_settings(self.name());
         let default = settings.get("enable_webui_extension").and_then(|s| s.get("default"));
         let configured = self.base.config.get1("enable_webui_extension");
@@ -151,6 +161,14 @@ mod tests {
         }
         assert!(!ui_extension_enabled(Some(&json!(0)), None));
         assert!(ui_extension_enabled(Some(&json!(1)), None));
+    }
+
+    #[test]
+    fn webui_extension_is_off_for_a_module_the_manager_has_not_loaded() {
+        // python skips a module that is not in `enabled` or not in manager.modules, whatever
+        // its enable_webui_extension value: a detached base has no manager, so it is off
+        let m = Tutorial::new(ModuleBase::detached("tutorial"));
+        assert!(!m.webui_extension_enabled());
     }
 
     #[test]
