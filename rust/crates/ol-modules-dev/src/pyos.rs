@@ -426,6 +426,15 @@ pub fn which(cmd: &str) -> Option<String> {
     }
     // shutil.which: PATH unset -> os.defpath / confstr CS_PATH
     let path = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".to_string());
+    which_in(cmd, &path)
+}
+
+/// shutil.which(cmd, path=...) for a bare command name
+fn which_in(cmd: &str, path: &str) -> Option<String> {
+    // python 3.14: `if not path: return None` (an empty PATH finds nothing, not even in the cwd)
+    if path.is_empty() {
+        return None;
+    }
     // an empty PATH entry is the current directory, but os.path.join('', cmd) is just cmd
     path.split(':').map(|dir| join(dir, cmd)).find(|candidate| exec_check(candidate))
 }
@@ -1145,6 +1154,22 @@ mod tests {
         makedirs(&dir, true).unwrap();
         makedirs(&join(&dir, "a/b/."), false).unwrap();
         assert!(isdir(&join(&dir, "a/b")));
+    }
+
+    #[test]
+    fn which_in_matches_python_path_rules() {
+        // python 3.14 shutil.which: an empty PATH returns None; an empty entry searches the cwd
+        // as a bare name (os.path.join('', cmd) == cmd)
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let tool = join(&root, "pyos-which-tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(which_in("pyos-which-tool", ""), None);
+        assert_eq!(which_in("pyos-which-tool", &root), Some(tool.clone()));
+        assert_eq!(which_in("pyos-which-tool", "/nonexistent-dir"), None);
+        // a path with a slash bypasses PATH and checks the path itself
+        assert_eq!(which("/nonexistent-dir/tool"), None);
     }
 
     #[test]
