@@ -823,7 +823,8 @@ pub fn rmtree(p: &str) -> Result<(), String> {
 pub fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
     let mut real_dst = dst.to_string();
     if isdir(dst) {
-        if samefile(src, dst) {
+        // python: `_samefile(src, dst) and not os.path.islink(src)`; a link to dst is moved into dst
+        if samefile(src, dst) && !Path::new(src).is_symlink() {
             // python renames (no-op move onto itself)
             return std::fs::rename(src, dst).map_err(|e| os_err2(&e, src, dst));
         }
@@ -859,12 +860,34 @@ pub fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
     }
 }
 
-/// os.makedirs(path, exist_ok)
+/// os.makedirs(path, exist_ok). Mirrors CPython's recursion: the error names the path of the
+/// mkdir that failed, so `file/sub/x` with `file` a regular file reports `file/sub` (ENOTDIR).
 pub fn makedirs(p: &str, exist_ok: bool) -> Result<(), String> {
-    if !exist_ok && lexists(p) {
-        return Err(format!("[Errno 17] File exists: {}", py_quote(p)));
+    makedirs_at(p, exist_ok).map_err(|(e, path)| os_err(&e, &path))
+}
+
+/// returns the io error together with the path that the failing mkdir was called with
+fn makedirs_at(name: &str, exist_ok: bool) -> Result<(), (io::Error, String)> {
+    let (mut head, mut tail) = split(name);
+    if tail.is_empty() {
+        (head, tail) = split(&head);
     }
-    std::fs::create_dir_all(p).map_err(|e| os_err(&e, p))
+    if !head.is_empty() && !tail.is_empty() && !exists(&head) {
+        match makedirs_at(&head, exist_ok) {
+            // python ignores a FileExistsError while creating the parent (race defeat)
+            Err((e, _)) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            other => other?,
+        }
+        // xxx/newdir/. exists if xxx/newdir exists
+        if tail == "." {
+            return Ok(());
+        }
+    }
+    match std::fs::create_dir(name) {
+        Ok(()) => Ok(()),
+        Err(e) if !exist_ok || !isdir(name) => Err((e, name.to_string())),
+        Err(_) => Ok(()),
+    }
 }
 
 /// open(path, 'x').write(content)
@@ -1102,5 +1125,40 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(rmtree(&link).unwrap_err(), format!("[Errno None] None: {}", py_quote(&link)));
         assert!(isdir(&real));
+    }
+
+    #[test]
+    fn makedirs_error_names_the_failing_ancestor() {
+        // python: os.makedirs('file/sub/x') reports the mkdir of 'file/sub', not the leaf
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let file = join(&root, "file");
+        std::fs::write(&file, b"").unwrap();
+        let deep = join(&file, "sub/x");
+        assert_eq!(makedirs(&deep, true).unwrap_err(), format!("[Errno 20] Not a directory: {}", py_quote(&join(&file, "sub"))));
+        let shallow = join(&file, "x");
+        assert_eq!(makedirs(&shallow, true).unwrap_err(), format!("[Errno 20] Not a directory: {}", py_quote(&shallow)));
+        // exist_ok=False on an existing leaf is EEXIST; exist_ok=True on a dir is fine
+        let dir = join(&root, "dir");
+        makedirs(&dir, false).unwrap();
+        assert_eq!(makedirs(&dir, false).unwrap_err(), format!("[Errno 17] File exists: {}", py_quote(&dir)));
+        makedirs(&dir, true).unwrap();
+        makedirs(&join(&dir, "a/b/."), false).unwrap();
+        assert!(isdir(&join(&dir, "a/b")));
+    }
+
+    #[test]
+    fn move_link_into_its_own_target_dir_moves_the_link() {
+        // python: shutil.move(link, dir) with link -> dir skips the rename-onto-self branch
+        // (`_samefile and not islink`) and moves the link to dir/basename(link)
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let dir = join(&root, "D");
+        makedirs(&dir, false).unwrap();
+        let link = join(&root, "L");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        shutil_move(&link, &dir).unwrap();
+        assert!(Path::new(&join(&dir, "L")).is_symlink());
+        assert!(!lexists(&link));
     }
 }

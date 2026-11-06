@@ -1089,9 +1089,8 @@ impl Coder {
                         }
                     }
                 }
-                if truncated {
-                    break;
-                }
+                // python keeps scanning the rest of this directory after the cap: each later file
+                // still appends its first hit, and the walk stops only after the directory
             }
             if truncated {
                 ControlFlow::Break(())
