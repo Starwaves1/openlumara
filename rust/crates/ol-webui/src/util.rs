@@ -114,21 +114,88 @@ pub fn py_slice<T: Clone>(items: &[T], start: i64, stop: i64) -> Vec<T> {
     items[s as usize..e as usize].to_vec()
 }
 
-/// python `str.title()`: the first cased char of each run of cased chars is upper-cased,
-/// the rest lower-cased. uncased chars (CJK, Hebrew, digits, punctuation) only separate words.
-/// (rust has no titlecase mapping in std, so ǆ-style digraphs become their uppercase form)
+/// python `str.title()`: a run of cased characters starts with its titlecase mapping and the
+/// rest of the run is lowercased (capital sigma takes python's final-sigma form when it ends a
+/// word). uncased characters (CJK, digits, punctuation) only separate words.
+/// std has no titlecase table, so `push_titlecase` lists the mappings that differ from uppercase.
+/// known gap: the multi-char Greek/Armenian titlecase specials (e.g. U+0390) stay uppercase.
 pub fn py_title(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut previous_cased = false;
-    for c in s.chars() {
-        if previous_cased {
-            out.extend(c.to_lowercase());
+    for (i, &c) in chars.iter().enumerate() {
+        if !previous_cased {
+            push_titlecase(c, &mut out);
+        } else if c == '\u{3a3}' {
+            let next_cased = chars.get(i + 1).map(|&n| is_cased(n)).unwrap_or(false);
+            out.push(if next_cased { '\u{3c3}' } else { '\u{3c2}' });
         } else {
-            out.extend(c.to_uppercase());
+            out.extend(c.to_lowercase());
         }
-        previous_cased = c.is_uppercase() || c.is_lowercase();
+        previous_cased = is_cased(c);
     }
     out
+}
+
+/// unicode `Cased` property (python `str.title` word material): Lowercase, Uppercase and Lt
+fn is_cased(c: char) -> bool {
+    c.is_lowercase() || c.is_uppercase() || is_titlecase_letter(c)
+}
+
+/// the Lt (titlecase letter) general category: the digraphs and the Greek prosgegrammeni forms
+fn is_titlecase_letter(c: char) -> bool {
+    matches!(c, '\u{1c5}' | '\u{1c8}' | '\u{1cb}' | '\u{1f2}' | '\u{1f88}'..='\u{1f8f}' | '\u{1f98}'..='\u{1f9f}' | '\u{1fa8}'..='\u{1faf}' | '\u{1fbc}' | '\u{1fcc}' | '\u{1ffc}')
+}
+
+/// titlecase mapping of one char (SpecialCasing / UnicodeData titlecase entries that differ from
+/// uppercase), falling back to uppercase
+fn push_titlecase(c: char, out: &mut String) {
+    let mapped: &str = match c {
+        '\u{df}' => "Ss",
+        '\u{1c4}'..='\u{1c6}' => "\u{1c5}",
+        '\u{1c7}'..='\u{1c9}' => "\u{1c8}",
+        '\u{1ca}'..='\u{1cc}' => "\u{1cb}",
+        '\u{1f1}'..='\u{1f3}' => "\u{1f2}",
+        '\u{149}' => "\u{2bc}N",
+        '\u{1f0}' => "J\u{30c}",
+        '\u{1e96}' => "H\u{331}",
+        '\u{1e97}' => "T\u{308}",
+        '\u{1e98}' => "W\u{30a}",
+        '\u{1e99}' => "Y\u{30a}",
+        '\u{1e9a}' => "A\u{2be}",
+        '\u{fb00}' => "Ff",
+        '\u{fb01}' => "Fi",
+        '\u{fb02}' => "Fl",
+        '\u{fb03}' => "Ffi",
+        '\u{fb04}' => "Ffl",
+        '\u{fb05}' | '\u{fb06}' => "St",
+        '\u{1f80}'..='\u{1f87}' | '\u{1f90}'..='\u{1f97}' | '\u{1fa0}'..='\u{1fa7}' => {
+            let base = match c as u32 {
+                x if x < 0x1f90 => 0x1f88,
+                x if x < 0x1fa0 => 0x1f98,
+                _ => 0x1fa8,
+            };
+            out.push(char::from_u32(base + (c as u32 & 7)).unwrap_or(c));
+            return;
+        }
+        '\u{1fb3}' => {
+            out.push('\u{1fbc}');
+            return;
+        }
+        '\u{1fc3}' => {
+            out.push('\u{1fcc}');
+            return;
+        }
+        '\u{1ff3}' => {
+            out.push('\u{1ffc}');
+            return;
+        }
+        c => {
+            out.extend(c.to_uppercase());
+            return;
+        }
+    };
+    out.push_str(mapped);
 }
 
 /// markupsafe `escape` (what jinja2 autoescape applies to plain str values):
@@ -185,21 +252,21 @@ pub fn truthy_opt(v: Option<&Value>) -> bool {
     v.map(truthy).unwrap_or(false)
 }
 
-/// python `Webui` start-up: the bind host for `network_mode` (`local` 127.0.0.1, `internet`
-/// 0.0.0.0, `custom` the configured `custom_host`, anything else 127.0.0.1). python's f-string
-/// renders a missing custom host as "None"
-pub fn bind_host(network_mode: Option<&str>, custom_host: Option<&str>) -> String {
+/// python `Webui.host` for `network_mode` (`local` 127.0.0.1, `internet` 0.0.0.0, `custom` the
+/// configured `custom_host`, anything else 127.0.0.1). `None` when custom mode has no custom_host:
+/// uvicorn passes that None to asyncio.create_server, which binds every interface
+pub fn bind_host(network_mode: Option<&str>, custom_host: Option<&str>) -> Option<String> {
     match network_mode {
-        Some("local") => "127.0.0.1".to_string(),
-        Some("internet") => "0.0.0.0".to_string(),
-        Some("custom") => custom_host.unwrap_or("None").to_string(),
-        _ => "127.0.0.1".to_string(),
+        Some("local") => Some("127.0.0.1".to_string()),
+        Some("internet") => Some("0.0.0.0".to_string()),
+        Some("custom") => custom_host.map(str::to_string),
+        _ => Some("127.0.0.1".to_string()),
     }
 }
 
-/// python `Webui.url`: `http://{host}:{port}`
-pub fn channel_url(host: &str, port: impl std::fmt::Display) -> String {
-    format!("http://{}:{}", host, port)
+/// python `Webui.url`: `http://{self.host}:{self.port}`, where an unset (None) host renders as "None"
+pub fn channel_url(host: Option<&str>, port: impl std::fmt::Display) -> String {
+    format!("http://{}:{}", host.unwrap_or("None"), port)
 }
 
 #[cfg(test)]
@@ -261,18 +328,28 @@ mod tests {
         // python title() only counts cased characters as word material
         assert_eq!(py_title("\u{4e2d}a"), "\u{4e2d}A");
         assert_eq!(py_title("don't"), "Don'T");
+        // titlecase differs from uppercase for these (python: 'ß'.title() == 'Ss')
+        assert_eq!(py_title("\u{df}a"), "Ssa");
+        assert_eq!(py_title("\u{1c6}a b"), "\u{1c5}a B");
+        assert_eq!(py_title("\u{fb01}x"), "Fix");
+        assert_eq!(py_title("\u{149}a"), "\u{2bc}Na");
+        // capital sigma at the end of a word is the final form, as in python
+        assert_eq!(py_title("\u{391}\u{394}\u{39f}\u{3a3}"), "\u{391}\u{3b4}\u{3bf}\u{3c2}");
+        assert_eq!(py_title("a\u{130}y"), "A\u{69}\u{307}y");
     }
 
     #[test]
     fn bind_host_and_url() {
-        assert_eq!(bind_host(Some("local"), Some("10.0.0.5")), "127.0.0.1");
-        assert_eq!(bind_host(Some("internet"), None), "0.0.0.0");
-        assert_eq!(bind_host(Some("custom"), Some("10.0.0.5")), "10.0.0.5");
-        // python: an unset custom_host becomes the string "None" in the url
-        assert_eq!(bind_host(Some("custom"), None), "None");
+        assert_eq!(bind_host(Some("local"), Some("10.0.0.5")), Some("127.0.0.1".to_string()));
+        assert_eq!(bind_host(Some("internet"), None), Some("0.0.0.0".to_string()));
+        assert_eq!(bind_host(Some("custom"), Some("10.0.0.5")), Some("10.0.0.5".to_string()));
+        // python: custom mode without custom_host has host None (every interface is bound)...
+        assert_eq!(bind_host(Some("custom"), None), None);
+        // ...while the url f-string renders that None as "None"
+        assert_eq!(channel_url(bind_host(Some("custom"), None).as_deref(), 8080), "http://None:8080");
         // unknown or missing mode falls back to loopback
-        assert_eq!(bind_host(Some("lan"), Some("10.0.0.5")), "127.0.0.1");
-        assert_eq!(bind_host(None, None), "127.0.0.1");
-        assert_eq!(channel_url(&bind_host(Some("local"), None), 8080), "http://127.0.0.1:8080");
+        assert_eq!(bind_host(Some("lan"), Some("10.0.0.5")), Some("127.0.0.1".to_string()));
+        assert_eq!(bind_host(None, None), Some("127.0.0.1".to_string()));
+        assert_eq!(channel_url(bind_host(Some("local"), None).as_deref(), 8080), "http://127.0.0.1:8080");
     }
 }

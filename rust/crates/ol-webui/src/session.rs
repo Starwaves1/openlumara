@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 pub const COOKIE_NAME: &str = "session";
 pub const DEFAULT_SECRET: &str = "openlumara-default-session-secret-change-me";
-/// python `Webui.__init__`: credential fallbacks when the config has no username/password
+/// python `Webui.__init__` stores `config.get("username", "admin")` on self.username, but nothing
+/// reads it: `_verify_credentials` compares against `config.get("username")` with no fallback
+/// (see `verify_credentials`). these constants are NOT a login fallback
 pub const DEFAULT_USERNAME: &str = "admin";
 pub const DEFAULT_PASSWORD: &str = "admin";
 /// python `login_submit`: failed attempts older than this many seconds are forgotten
@@ -128,10 +130,11 @@ pub fn now() -> i64 {
 
 /// value of a cookie, as starlette's `websocket.cookies.get(name)` sees it: only the first
 /// Cookie header is parsed (`headers.get`), and within it `cookie_parser` overwrites on each
-/// `;` chunk, so the LAST occurrence of a duplicated name wins
+/// `;` chunk, so the LAST occurrence of a duplicated name wins. starlette decodes header bytes as
+/// latin-1, so a non-ASCII byte in any pair cannot hide the session cookie
 pub fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     let header = headers.get(axum::http::header::COOKIE)?;
-    let s = header.to_str().ok()?;
+    let s: String = header.as_bytes().iter().map(|&b| b as char).collect();
     let mut found = None;
     for chunk in s.split(';') {
         let (key, val) = match chunk.split_once('=') {
@@ -149,6 +152,16 @@ pub fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<Strin
         }
     }
     found
+}
+
+/// the `/ws` gate when `require_login` is on. python only checks that the session cookie is
+/// non-empty, which any client can send. here the cookie must unsign under `signer` and its
+/// session must carry a truthy `authenticated` (python `request.session.get("authenticated")`)
+pub fn ws_authorized(headers: &axum::http::HeaderMap, signer: &SessionSigner) -> bool {
+    cookie_value(headers, COOKIE_NAME)
+        .and_then(|v| signer.unsign(&v))
+        .and_then(|session| session.get("authenticated").map(ol_core::pyjson::truthy))
+        .unwrap_or(false)
 }
 
 pub const NON_ASCII_COMPARE: &str = "comparing strings with non-ASCII characters is not supported";
@@ -249,6 +262,31 @@ mod tests {
     }
 
     #[test]
+    fn ws_gate_needs_a_valid_authenticated_session() {
+        let signer = SessionSigner::new("secret", 86400);
+        let cookie = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(axum::http::header::COOKIE, axum::http::HeaderValue::from_bytes(v.as_bytes()).unwrap());
+            h
+        };
+        let auth = json!({"authenticated": true}).as_object().unwrap().clone();
+        let good = signer.sign(&auth);
+        assert!(ws_authorized(&cookie(&format!("session={}", good)), &signer));
+        // python accepts any non-empty value here; an unsigned one must be refused
+        assert!(!ws_authorized(&cookie("session=anything"), &signer));
+        // a validly signed session that was never authenticated
+        let anon = signer.sign(&json!({"x": 1}).as_object().unwrap().clone());
+        assert!(!ws_authorized(&cookie(&format!("session={}", anon)), &signer));
+        // a signed session with a different secret
+        assert!(!ws_authorized(&cookie(&format!("session={}", SessionSigner::new("other", 86400).sign(&auth))), &signer));
+        // a valid session still passes next to a non-ascii cookie from another app
+        let mixed = axum::http::HeaderValue::from_bytes(format!("other=caf\u{e9}; session={}", good).as_bytes()).unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::COOKIE, mixed);
+        assert!(ws_authorized(&h, &signer));
+    }
+
+    #[test]
     fn digest_and_cookies() {
         assert_eq!(compare_digest("admin", "admin"), Ok(true));
         assert_eq!(compare_digest("admin", "admin2"), Ok(false));
@@ -270,6 +308,10 @@ mod tests {
         dup.insert(axum::http::header::COOKIE, "session=first; x=1; session=\"second\"".parse().unwrap());
         assert_eq!(cookie_value(&dup, "session").as_deref(), Some("second"));
         // only the first Cookie header is looked at (starlette uses headers.get)
+        // a non-ascii byte elsewhere in the header does not hide the session (latin-1 decode)
+        let mut na = axum::http::HeaderMap::new();
+        na.insert(axum::http::header::COOKIE, axum::http::HeaderValue::from_bytes(b"theme=caf\xe9; session=abc.def").unwrap());
+        assert_eq!(cookie_value(&na, "session").as_deref(), Some("abc.def"));
         let mut two = axum::http::HeaderMap::new();
         two.append(axum::http::header::COOKIE, "session=one".parse().unwrap());
         two.append(axum::http::header::COOKIE, "session=two".parse().unwrap());

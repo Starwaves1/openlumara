@@ -10,9 +10,9 @@ use serde_json::{Map, Value};
 /// the only chat fields list endpoints send
 pub const CHAT_LIST_FIELDS: [&str; 8] = ["id", "title", "category", "tags", "created", "updated", "messages_found", "message_snippets"];
 
-/// python raises OverflowError (uncaught, so the route fails) for out-of-range
-/// `timedelta(minutes=tz_offset)` arithmetic; the message is python's
-pub const OVERFLOW: &str = "OverflowError: date value out of range";
+/// python's `str()` of the OverflowError raised by datetime arithmetic that leaves years 1..=9999
+/// (the route does not catch it, so only the message text reaches the log)
+pub const OVERFLOW: &str = "date value out of range";
 
 pub fn project_chat(chat: &Value, extra_fields: &[&str]) -> Value {
     let mut projected = Map::new();
@@ -71,7 +71,8 @@ fn parse_key_date(key: &str) -> Option<(NaiveDate, usize)> {
     if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || day < 1 {
         return None;
     }
-    let date = NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)?;
+    // python date() rejects a day outside u32 (ValueError), so the cast must not truncate
+    let date = NaiveDate::from_ymd_opt(year as i32, month as u32, u32::try_from(day).ok()?)?;
     Some((date, parts.len()))
 }
 
@@ -84,12 +85,23 @@ fn in_python_range(dt: NaiveDateTime) -> Result<NaiveDateTime, String> {
     }
 }
 
+/// python `timedelta(minutes=m)`: the constructor's OverflowError text. days are normalised
+/// (floor), then python's C int conversion and its ±999999999 day limit apply
+fn timedelta_minutes(tz_offset_min: i64) -> Result<Duration, String> {
+    let days = tz_offset_min.div_euclid(1440);
+    if i32::try_from(days).is_err() {
+        return Err("Python int too large to convert to C int".to_string());
+    }
+    if days.abs() > 999_999_999 {
+        return Err(format!("days={}; must have magnitude <= 999999999", days));
+    }
+    Duration::try_minutes(tz_offset_min).ok_or_else(|| OVERFLOW.to_string())
+}
+
 /// `dt - tz_offset_min minutes` (python `dt - timedelta(minutes=...)`)
 fn shift_back(dt: NaiveDateTime, tz_offset_min: i64) -> Result<NaiveDateTime, String> {
-    Duration::try_minutes(tz_offset_min)
-        .and_then(|d| dt.checked_sub_signed(d))
-        .ok_or_else(|| OVERFLOW.to_string())
-        .and_then(in_python_range)
+    let delta = timedelta_minutes(tz_offset_min)?;
+    dt.checked_sub_signed(delta).ok_or_else(|| OVERFLOW.to_string()).and_then(in_python_range)
 }
 
 /// human label for a day/week/month group key (see group_key); Err where python raises
@@ -197,7 +209,8 @@ pub fn parse_iso(s: &str) -> Result<Option<NaiveDateTime>, String> {
         return Ok(None);
     };
     let (Some(y), Some(m), Some(d)) = (y, m, d) else { return Ok(None) };
-    let Some(date) = NaiveDate::from_ymd_opt(y as i32, m, d) else { return Ok(None) };
+    // python datetimes start at year 1; fromisoformat raises ValueError for year 0000
+    let Some(date) = NaiveDate::from_ymd_opt(y as i32, m, d).filter(|d| d.year() >= 1) else { return Ok(None) };
     if rest.is_empty() {
         return Ok(date.and_hms_opt(0, 0, 0));
     }
@@ -415,6 +428,17 @@ mod tests {
     }
 
     #[test]
+    fn year_zero_and_huge_day_keys_match_python() {
+        let now = at("2026-10-14T12:00:00");
+        // python fromisoformat raises ValueError for year 0000, which _local_day turns into ''
+        assert_eq!(parse_iso("0000-01-01T00:00:00").unwrap(), None);
+        assert_eq!(local_day("0000-01-01T00:00:00", 0).unwrap(), "");
+        assert_eq!(group_key_at("0000-01-01T00:00:00", 0, now).unwrap(), "");
+        // python date(...) rejects a day past u32 (ValueError -> 'Undated'); it must not wrap to day 1
+        assert_eq!(day_label_from_key_at("2026-10-4294967297", 0, now).unwrap(), "Undated");
+    }
+
+    #[test]
     fn python_iso_offsets() {
         // python 3.11+ fromisoformat accepts these offset spellings
         let want = Some(at("2026-10-13T23:00:00"));
@@ -437,6 +461,11 @@ mod tests {
         // tz_offset comes from the query string: python raises OverflowError (route 500)
         let now = at("2026-10-14T12:00:00");
         assert!(local_day("2026-10-14T01:00:00", i64::MAX).is_err());
+        // python's message for an out-of-range timedelta, and for a value past the C int range
+        assert_eq!(local_day("2026-10-14T01:00:00", 1440 * 1_000_000_000).unwrap_err(), "days=1000000000; must have magnitude <= 999999999");
+        assert_eq!(local_day("2026-10-14T01:00:00", 1440 * (1 << 40)).unwrap_err(), "Python int too large to convert to C int");
+        // a day count inside python's timedelta range still leaves the datetime range: date value out of range
+        assert_eq!(local_day("2026-10-14T01:00:00", 1440 * 999_999_999).unwrap_err(), OVERFLOW);
         assert!(group_key_at("2026-10-14T01:00:00", i64::MAX, now).is_err());
         assert!(day_label_from_key_at("2026-10-14", i64::MIN, now).is_err());
         // a naive value near the year-1 edge overflows when shifted, an aware one when converted

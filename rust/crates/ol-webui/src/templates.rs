@@ -251,6 +251,33 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
     env
 }
 
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+}
+
+/// python `Webui._ui_extension_dirs` (sub "templates") and `_ui_asset_dirs` (sub "assets"): `packages`
+/// holds, per package in python's order ("modules", "user_modules"), its `__path__` entries and the
+/// enabled module names (an unimportable package is passed with no paths). `gate` is python's
+/// `module is loaded and _ui_extension_enabled(module)`. every `<path>/<module>/webui/<sub>`
+/// directory found overwrites the earlier entry for that module, so the last one wins
+pub fn discover_webui_dirs(packages: &[(&[PathBuf], &[String])], sub: &str, gate: impl Fn(&str) -> bool) -> BTreeMap<String, PathBuf> {
+    let mut dirs = BTreeMap::new();
+    for (paths, enabled) in packages {
+        for module in enabled.iter() {
+            if !gate(module) {
+                continue;
+            }
+            for base in paths.iter() {
+                let candidate = base.join(module).join("webui").join(sub);
+                if candidate.is_dir() {
+                    dirs.insert(module.clone(), candidate);
+                }
+            }
+        }
+    }
+    dirs
+}
+
 /// python `Webui._ui_extension_enabled`: the module's configured `enable_webui_extension`
 /// decides, falling back to the declared setting default, and defaulting to enabled when neither
 /// exists. strings are false only for false/0/no/off/'' (after strip and lower)
@@ -297,7 +324,10 @@ pub fn ui_asset_urls(asset_dirs: &BTreeMap<String, PathBuf>, ext: &str) -> Vec<S
             let mut subdirs = Vec::new();
             for path in entries {
                 if path.is_dir() {
-                    subdirs.push(path);
+                    // os.walk(followlinks=False) lists a symlinked directory but never descends into it
+                    if !is_symlink(&path) {
+                        subdirs.push(path);
+                    }
                 } else if path.file_name().map(|n| n.to_string_lossy().ends_with(&format!(".{}", ext))).unwrap_or(false) {
                     files.push(path);
                 }
@@ -484,6 +514,42 @@ mod tests {
         let config = json!({"a": 1}).as_object().unwrap().clone();
         let cfg = ext_module_config(&["a", "b"], &config);
         assert_eq!(cfg, json!({"a": 1, "b": null}).as_object().unwrap().clone());
+    }
+
+    #[test]
+    fn webui_dirs_last_candidate_wins_and_gate_applies() {
+        let root = tempfile::tempdir().unwrap();
+        for rel in ["modules/m1/webui/templates", "user_modules/m1/webui/templates", "modules/m2/webui/templates", "modules/off/webui/templates", "modules/m3/webui/assets"] {
+            std::fs::create_dir_all(root.path().join(rel)).unwrap();
+        }
+        let modules = vec![root.path().join("modules")];
+        let user = vec![root.path().join("user_modules")];
+        let enabled = vec!["m1".to_string(), "m2".to_string(), "off".to_string(), "m3".to_string(), "missing".to_string()];
+        let dirs = discover_webui_dirs(&[(&modules, &enabled), (&user, &enabled)], "templates", |m| m != "off");
+        // m1 exists under both packages: the user_modules candidate replaces the modules one
+        assert_eq!(dirs.get("m1"), Some(&root.path().join("user_modules/m1/webui/templates")));
+        assert_eq!(dirs.get("m2"), Some(&root.path().join("modules/m2/webui/templates")));
+        // gated, unknown or without the sub folder: absent
+        assert!(!dirs.contains_key("off") && !dirs.contains_key("m3") && !dirs.contains_key("missing"));
+        let assets = discover_webui_dirs(&[(&modules, &enabled)], "assets", |_| true);
+        assert_eq!(assets.keys().collect::<Vec<_>>(), ["m3"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asset_walk_does_not_descend_into_symlinked_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let assets = root.path().join("m/webui/assets");
+        std::fs::create_dir_all(assets.join("css")).unwrap();
+        std::fs::create_dir_all(root.path().join("outside")).unwrap();
+        std::fs::write(root.path().join("outside/x.css"), "x").unwrap();
+        std::fs::write(assets.join("css/real.css"), "x").unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside"), assets.join("css/linked")).unwrap();
+        std::os::unix::fs::symlink(assets.join("css/real.css"), assets.join("css/alias.css")).unwrap();
+        let mut dirs = BTreeMap::new();
+        dirs.insert("m".to_string(), assets);
+        // python lists the symlinked directory's contents nowhere, but a symlinked file is a file
+        assert_eq!(ui_asset_urls(&dirs, "css"), ["/ext-assets/m/css/alias.css", "/ext-assets/m/css/real.css"]);
     }
 
     #[test]
