@@ -269,7 +269,7 @@ pub fn listdir(path: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
-    /// passwd lookup stub: a fixed home for the current uid and for "root" only
+    /// passwd lookup fake: a fixed home for the current uid and for "root" only
     fn fake_passwd(name: Option<&str>) -> Option<String> {
         match name {
             None => Some("/home/uid".to_string()),

@@ -212,6 +212,29 @@ mod tests {
     }
 
     #[test]
+    fn set_tool_description_matches_stripped_python_docstring() {
+        // python tool_loader strips the docstring: "\n".join(clean_lines).strip()
+        let set = meta::tools().into_iter().find(|t| t.method == "set").unwrap();
+        let tool = ol_core::tool_loader::tool_dict_from_spec(&set, "identity_set");
+        let desc = tool["function"]["description"].as_str().unwrap();
+        assert_eq!(
+            desc,
+            "Defines who you are as an AI. When defining your identity, ALWAYS start with \"You are\". Give yourself a name. Make one up if user doesn't provide it. Don't use words like \"i\", \"i'm\" or \"i am\". Write in 2nd person when using this tool."
+        );
+        assert_eq!(tool["function"]["parameters"]["required"], json!(["content"]));
+    }
+
+    #[test]
+    fn clear_tool_description_is_python_docstring() {
+        let clear = meta::tools().into_iter().find(|t| t.method == "clear").unwrap();
+        let tool = ol_core::tool_loader::tool_dict_from_spec(&clear, "identity_clear");
+        assert_eq!(
+            tool["function"]["description"].as_str(),
+            Some("Wipes your identity as an AI so you may start from scratch. USE WITH CAUTION!")
+        );
+    }
+
+    #[test]
     fn system_prompt_and_empty_text_rules() {
         assert_eq!(system_prompt_text(Some(json!("You are Ed"))), Some("You are Ed".to_string()));
         assert_eq!(system_prompt_text(Some(json!(""))), None);
