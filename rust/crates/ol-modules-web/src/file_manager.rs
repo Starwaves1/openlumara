@@ -16,7 +16,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
 use serde_json::{json, Map, Value};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -57,23 +57,148 @@ fn read_text(path: &str) -> Result<String, ReadErr> {
     Ok(universal_newlines(&text))
 }
 
-/// python `shutil.copystat` (mode, atime and mtime; follows symlinks)
-fn copystat(src: &str, dst: &str) -> Result<(), String> {
-    let md = fs::metadata(src).map_err(|e| os_err(&e, src))?;
-    fs::set_permissions(dst, md.permissions()).map_err(|e| os_err(&e, dst))?;
-    set_times(dst, &md)
+/// python `shutil.copystat(src, dst, follow_symlinks=follow)`: atime and mtime, then extended
+/// attributes, then mode (a followed link only, since Linux cannot chmod a symlink)
+fn copystat(src: &str, dst: &str, follow: bool) -> Result<(), String> {
+    let md = if follow { fs::metadata(src) } else { fs::symlink_metadata(src) }.map_err(|e| os_err(&e, src))?;
+    set_times(dst, &md, follow)?;
+    copy_xattrs(src, dst, follow)?;
+    if follow {
+        fs::set_permissions(dst, md.permissions()).map_err(|e| os_err(&e, dst))?;
+    }
+    Ok(())
 }
 
-fn set_times(dst: &str, md: &fs::Metadata) -> Result<(), String> {
-    let c = std::ffi::CString::new(dst).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(dst)))?;
+fn set_times(dst: &str, md: &fs::Metadata, follow: bool) -> Result<(), String> {
+    let c = CString::new(dst).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(dst)))?;
     let times = [
         libc::timespec { tv_sec: md.atime() as libc::time_t, tv_nsec: md.atime_nsec() as libc::c_long },
         libc::timespec { tv_sec: md.mtime() as libc::time_t, tv_nsec: md.mtime_nsec() as libc::c_long },
     ];
+    let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
     // SAFETY: `c` is a valid NUL-terminated string and `times` has the two timespecs utimensat reads
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), flags) };
     if rc != 0 {
         return Err(os_err(&io::Error::last_os_error(), dst));
+    }
+    Ok(())
+}
+
+/// errnos python's `shutil._copyxattr` ignores on each attribute get/set (other errors propagate)
+const XATTR_SKIP_ATTR: [i32; 5] = [libc::EPERM, libc::ENOTSUP, libc::ENODATA, libc::EINVAL, libc::EACCES];
+/// errnos python's `shutil._copyxattr` ignores when the attribute list itself cannot be read
+const XATTR_SKIP_LIST: [i32; 3] = [libc::ENOTSUP, libc::ENODATA, libc::EINVAL];
+
+fn errno_in(e: &io::Error, list: &[i32]) -> bool {
+    e.raw_os_error().is_some_and(|code| list.contains(&code))
+}
+
+fn list_xattrs(path: &CStr, follow: bool) -> io::Result<Vec<CString>> {
+    loop {
+        // SAFETY: a null buffer with size 0 only asks the kernel for the required size
+        let size = unsafe {
+            if follow {
+                libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0)
+            } else {
+                libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0)
+            }
+        };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is valid for `buf.len()` bytes, which is what the size argument states
+        let n = unsafe {
+            if follow {
+                libc::listxattr(path.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+            } else {
+                libc::llistxattr(path.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+            }
+        };
+        if n >= 0 {
+            buf.truncate(n as usize);
+            // names are NUL-terminated and never contain NUL themselves
+            return Ok(buf
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| CString::new(s).ok())
+                .collect());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ERANGE) {
+            return Err(err);
+        }
+    }
+}
+
+fn get_xattr(path: &CStr, name: &CStr, follow: bool) -> io::Result<Vec<u8>> {
+    loop {
+        // SAFETY: a null value with size 0 only asks the kernel for the required size
+        let size = unsafe {
+            if follow {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+            } else {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
+            }
+        };
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is valid for `buf.len()` bytes, which is what the size argument states
+        let n = unsafe {
+            if follow {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            } else {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            }
+        };
+        if n >= 0 {
+            buf.truncate(n as usize);
+            return Ok(buf);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ERANGE) {
+            return Err(err);
+        }
+    }
+}
+
+fn set_xattr(path: &CStr, name: &CStr, value: &[u8], follow: bool) -> io::Result<()> {
+    // SAFETY: `value` is valid for `value.len()` bytes and the name/path are NUL-terminated
+    let rc = unsafe {
+        if follow {
+            libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr() as *const libc::c_void, value.len(), 0)
+        } else {
+            libc::lsetxattr(path.as_ptr(), name.as_ptr(), value.as_ptr() as *const libc::c_void, value.len(), 0)
+        }
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// python `shutil._copyxattr`: copy every extended attribute, skipping the ones it cannot set
+fn copy_xattrs(src: &str, dst: &str, follow: bool) -> Result<(), String> {
+    let cs = CString::new(src).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(src)))?;
+    let cd = CString::new(dst).map_err(|_| format!("embedded null byte in path {}", crate::util::py_quote(dst)))?;
+    let names = match list_xattrs(&cs, follow) {
+        Ok(names) => names,
+        Err(e) if errno_in(&e, &XATTR_SKIP_LIST) => return Ok(()),
+        Err(e) => return Err(os_err(&e, src)),
+    };
+    for name in names {
+        let value = match get_xattr(&cs, &name, follow) {
+            Ok(v) => v,
+            Err(e) if errno_in(&e, &XATTR_SKIP_ATTR) => continue,
+            Err(e) => return Err(os_err(&e, src)),
+        };
+        match set_xattr(&cd, &name, &value, follow) {
+            Ok(()) => {}
+            Err(e) if errno_in(&e, &XATTR_SKIP_ATTR) => {}
+            Err(e) => return Err(os_err(&e, dst)),
+        }
     }
     Ok(())
 }
@@ -95,37 +220,87 @@ fn copy2(src: &str, dst: &str) -> Result<(), String> {
     let mut input = File::open(src).map_err(|e| os_err(&e, src))?;
     let mut output = File::create(&real_dst).map_err(|e| os_err(&e, &real_dst))?;
     io::copy(&mut input, &mut output).map_err(|e| os_err_bare(&e))?;
-    copystat(src, &real_dst)
+    copystat(src, &real_dst, true)
 }
 
-/// python `shutil.copytree(src, dst, symlinks=...)` with the default copy2 copy function
+/// `(src, dst, message)` triples python's `shutil.copytree` collects into `shutil.Error`
+type CopyErrors = Vec<(String, String, String)>;
+
+/// how a `_copytree` step fails: a plain OSError (raised as-is by the caller's loop) or the
+/// aggregated `shutil.Error` list from a nested copytree
+enum CopyErr {
+    Os(String),
+    Tree(CopyErrors),
+}
+
+impl CopyErr {
+    /// `str(e)` of the exception python raises to the tool: the message, or the repr of the list
+    fn into_message(self) -> String {
+        match self {
+            CopyErr::Os(m) => m,
+            CopyErr::Tree(errors) => {
+                let items: Vec<String> = errors
+                    .iter()
+                    .map(|(s, d, m)| format!("({}, {}, {})", crate::util::py_quote(s), crate::util::py_quote(d), crate::util::py_quote(m)))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+        }
+    }
+}
+
+/// python `shutil.copytree(src, dst, symlinks=...)` with the default copy2 copy function. A failing
+/// entry is recorded and the rest of the tree is still copied; the collected errors are raised together
 fn copytree(src: &str, dst: &str, symlinks: bool) -> Result<(), String> {
+    copytree_inner(src, dst, symlinks).map_err(CopyErr::into_message)
+}
+
+fn copytree_inner(src: &str, dst: &str, symlinks: bool) -> Result<(), CopyErr> {
     let entries: Vec<fs::DirEntry> = fs::read_dir(src)
-        .map_err(|e| os_err(&e, src))?
+        .map_err(|e| CopyErr::Os(os_err(&e, src)))?
         .collect::<Result<_, _>>()
-        .map_err(|e| os_err(&e, src))?;
-    fs::create_dir(dst).map_err(|e| os_err(&e, dst))?;
+        .map_err(|e| CopyErr::Os(os_err(&e, src)))?;
+    fs::create_dir(dst).map_err(|e| CopyErr::Os(os_err(&e, dst)))?;
+    let mut errors: CopyErrors = Vec::new();
     for ent in entries {
         let name = ent.file_name().to_string_lossy().into_owned();
         let srcname = py_join(src, &name);
         let dstname = py_join(dst, &name);
-        let ft = ent.file_type().map_err(|e| os_err(&e, &srcname))?;
-        if ft.is_symlink() {
-            if symlinks {
-                let target = fs::read_link(&srcname).map_err(|e| os_err(&e, &srcname))?.to_string_lossy().into_owned();
-                std::os::unix::fs::symlink(&target, &dstname).map_err(|e| os_err2(&e, &target, &dstname))?;
-            } else if Path::new(&srcname).is_dir() {
-                copytree(&srcname, &dstname, symlinks)?;
-            } else {
-                copy2(&srcname, &dstname)?;
+        if let Err(err) = copy_entry(&ent, &srcname, &dstname, symlinks) {
+            match err {
+                CopyErr::Os(m) => errors.push((srcname, dstname, m)),
+                CopyErr::Tree(nested) => errors.extend(nested),
             }
-        } else if ft.is_dir() {
-            copytree(&srcname, &dstname, symlinks)?;
-        } else {
-            copy2(&srcname, &dstname)?;
         }
     }
-    copystat(src, dst)
+    if let Err(m) = copystat(src, dst, true) {
+        errors.push((src.to_string(), dst.to_string(), m));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CopyErr::Tree(errors))
+    }
+}
+
+/// one iteration of python `_copytree`'s loop body for a single directory entry
+fn copy_entry(ent: &fs::DirEntry, srcname: &str, dstname: &str, symlinks: bool) -> Result<(), CopyErr> {
+    let ft = ent.file_type().map_err(|e| CopyErr::Os(os_err(&e, srcname)))?;
+    if ft.is_symlink() {
+        if symlinks {
+            let target = fs::read_link(srcname).map_err(|e| CopyErr::Os(os_err(&e, srcname)))?.to_string_lossy().into_owned();
+            std::os::unix::fs::symlink(&target, dstname).map_err(|e| CopyErr::Os(os_err2(&e, &target, dstname)))?;
+            copystat(srcname, dstname, false).map_err(CopyErr::Os)
+        } else if Path::new(srcname).is_dir() {
+            copytree_inner(srcname, dstname, symlinks)
+        } else {
+            copy2(srcname, dstname).map_err(CopyErr::Os)
+        }
+    } else if ft.is_dir() {
+        copytree_inner(srcname, dstname, symlinks)
+    } else {
+        copy2(srcname, dstname).map_err(CopyErr::Os)
+    }
 }
 
 /// python `shutil._destinsrc`
@@ -331,6 +506,34 @@ fn must(a: &Map<String, Value>, name: &str) -> anyhow::Result<String> {
     arg_str(a, name).map_err(|m| anyhow!(m))
 }
 
+/// the keyword parameters of each `FileManager` tool method
+fn tool_params(method: &str) -> Option<&'static [&'static str]> {
+    Some(match method {
+        "list" | "read" | "read_binary" | "get_info" | "remove" | "mkdir" => &["path"][..],
+        "write" | "append" => &["path", "content"][..],
+        "move" | "copy" => &["src", "dst"][..],
+        _ => return None,
+    })
+}
+
+/// python's binding of `func(**tool_args)`: an unexpected keyword is reported before a missing one.
+/// Both are raised at the call boundary, so they come back as `Error while executing tool: ...`
+fn bind_kwargs(method: &str, a: &Map<String, Value>, params: &[&str]) -> anyhow::Result<()> {
+    if let Some(extra) = a.keys().find(|k| !params.contains(&k.as_str())) {
+        anyhow::bail!("FileManager.{}() got an unexpected keyword argument '{}'", method, extra);
+    }
+    let missing: Vec<String> = params.iter().filter(|p| !a.contains_key(**p)).map(|p| format!("'{}'", p)).collect();
+    let n = missing.len();
+    let names = match n {
+        0 => return Ok(()),
+        1 => missing[0].clone(),
+        2 => format!("{} and {}", missing[0], missing[1]),
+        _ => format!("{}, and {}", missing[..n - 1].join(", "), missing[n - 1]),
+    };
+    let noun = if n == 1 { "argument" } else { "arguments" };
+    anyhow::bail!("FileManager.{}() missing {} required positional {}: {}", method, n, noun, names)
+}
+
 impl FileManager {
     pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
         Arc::new(Self::new(base))
@@ -480,6 +683,10 @@ impl Module for FileManager {
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         let a = &args.0;
         let null = Value::Null;
+        let Some(params) = tool_params(method) else {
+            anyhow::bail!("'{}' object has no attribute '{}'", meta::CLASS_NAME, method);
+        };
+        bind_kwargs(method, a, params)?;
         match method {
             // no try block in python: a non-str path raises out of the tool
             "list" => self.list(&must(a, "path")?).await,
@@ -636,6 +843,51 @@ mod tests {
         assert_eq!(content["size_bytes"], 3);
         assert_eq!(content["is_file"], true);
         assert_eq!(content["is_dir"], false);
+    }
+
+    #[tokio::test]
+    async fn copy_keeps_going_past_a_failing_entry_and_reports_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let src = format!("{}/s", root);
+        let dst = format!("{}/t", root);
+        fs::create_dir(&src).unwrap();
+        fs::write(format!("{}/a.txt", src), "x").unwrap();
+        let fifo = format!("{}/f", src);
+        let c = CString::new(fifo.clone()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let r = call(&fm(), "copy", json!({"src": src.clone(), "dst": dst.clone()})).await.unwrap();
+        // python's shutil.copytree copies a.txt, records the named pipe, then raises shutil.Error(list)
+        assert_eq!(
+            r,
+            json!({"status": "error", "content": format!("[('{0}', '{1}/f', '`{0}` is a named pipe')]", fifo, dst)})
+        );
+        assert_eq!(fs::read_to_string(format!("{}/a.txt", dst)).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn missing_and_unexpected_arguments_raise_like_python_call_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        fs::write(&file, "old").unwrap();
+        let fs_ = file.to_str().unwrap().to_string();
+        let m = fm();
+
+        let err = call(&m, "list", json!({})).await.unwrap_err();
+        assert_eq!(err.to_string(), "FileManager.list() missing 1 required positional argument: 'path'");
+        let err = call(&m, "move", json!({"src": fs_.clone()})).await.unwrap_err();
+        assert_eq!(err.to_string(), "FileManager.move() missing 1 required positional argument: 'dst'");
+        let err = call(&m, "move", json!({})).await.unwrap_err();
+        assert_eq!(err.to_string(), "FileManager.move() missing 2 required positional arguments: 'src' and 'dst'");
+        let err = call(&m, "list", json!({"path": dir.path().to_str().unwrap(), "extra": 1})).await.unwrap_err();
+        assert_eq!(err.to_string(), "FileManager.list() got an unexpected keyword argument 'extra'");
+
+        // python raises at the call boundary, before the body runs: no truncation without content
+        let err = call(&m, "write", json!({"path": fs_.clone()})).await.unwrap_err();
+        assert_eq!(err.to_string(), "FileManager.write() missing 1 required positional argument: 'content'");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "old");
     }
 
     #[test]
