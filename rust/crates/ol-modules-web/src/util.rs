@@ -461,3 +461,196 @@ mod tests {
         assert_eq!(urljoin("http://a.com/x", "//b.com/y").unwrap(), "http://b.com/y");
     }
 }
+
+// ==================== python os / pathlib / shutil helpers (file_manager) ====================
+
+/// python `str(OSError)` for an error on one path: `[Errno N] strerror: 'path'`
+pub fn os_err(e: &std::io::Error, path: &str) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}: {}", code, strerror(code), py_quote(path)),
+        None => e.to_string(),
+    }
+}
+
+/// python `str(OSError)` for a two-path error: `[Errno N] strerror: 'src' -> 'dst'`
+pub fn os_err2(e: &std::io::Error, src: &str, dst: &str) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}: {} -> {}", code, strerror(code), py_quote(src), py_quote(dst)),
+        None => e.to_string(),
+    }
+}
+
+/// python `str(OSError)` for an error without a filename: `[Errno N] strerror`
+pub fn os_err_bare(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("[Errno {}] {}", code, strerror(code)),
+        None => e.to_string(),
+    }
+}
+
+/// libc strerror text (what python puts into `OSError.strerror`)
+pub fn strerror(code: i32) -> String {
+    let s = std::io::Error::from_raw_os_error(code).to_string();
+    match s.rfind(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+/// python repr() of a str
+pub fn py_quote(s: &str) -> String {
+    ol_core::pyjson::py_repr(&serde_json::Value::String(s.to_string()))
+}
+
+/// python type name used in TypeError messages ("int", "NoneType", "list", ...)
+pub fn py_type_name(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value;
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// python `str(pathlib.Path(s))` on posix: repeated slashes, trailing slashes and `.` components
+/// are dropped, a leading `//` is kept, and an empty path is `.`
+pub fn py_path(s: &str) -> String {
+    let abs = s.starts_with('/');
+    let lead = if abs && s.starts_with("//") && !s.starts_with("///") {
+        "//"
+    } else if abs {
+        "/"
+    } else {
+        ""
+    };
+    let body = s.split('/').filter(|c| !c.is_empty() && *c != ".").collect::<Vec<_>>().join("/");
+    if abs {
+        format!("{}{}", lead, body)
+    } else if body.is_empty() {
+        ".".to_string()
+    } else {
+        body
+    }
+}
+
+/// python `str(Path(s).parent)`
+pub fn py_parent(s: &str) -> String {
+    let p = py_path(s);
+    if p == "." || p == "/" || p == "//" {
+        return p;
+    }
+    match p.rfind('/') {
+        None => ".".to_string(),
+        Some(i) => {
+            let par = &p[..i];
+            if par.is_empty() {
+                "/".to_string()
+            } else if par == "/" && p.starts_with("//") {
+                "//".to_string()
+            } else {
+                par.to_string()
+            }
+        }
+    }
+}
+
+/// python `Path(s).name`
+pub fn py_name(s: &str) -> String {
+    let p = py_path(s);
+    if p == "." {
+        return String::new();
+    }
+    p.rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// python `Path(s).absolute()` as a string (no symlink resolution, no `..` normalisation)
+pub fn py_absolute(s: &str) -> String {
+    let p = py_path(s);
+    if p.starts_with('/') {
+        return p;
+    }
+    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
+    if p == "." {
+        return cwd;
+    }
+    py_join(&cwd, &p)
+}
+
+/// python `os.path.join(a, b)` for a relative `b`
+pub fn py_join(a: &str, b: &str) -> String {
+    if a.ends_with('/') {
+        format!("{}{}", a, b)
+    } else {
+        format!("{}/{}", a, b)
+    }
+}
+
+/// python `os.path.basename(path.rstrip('/'))`
+pub fn py_basename(s: &str) -> String {
+    s.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string()
+}
+
+/// python `posixpath.normpath`
+pub fn py_normpath(s: &str) -> String {
+    let (lead, rest) = if s.starts_with("//") && !s.starts_with("///") {
+        ("//", &s[2..])
+    } else if s.starts_with('/') {
+        ("/", &s[1..])
+    } else {
+        ("", s)
+    };
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in rest.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if matches!(stack.last(), Some(l) if *l != "..") {
+                    stack.pop();
+                } else if lead.is_empty() {
+                    stack.push("..");
+                }
+            }
+            other => stack.push(other),
+        }
+    }
+    let body = stack.join("/");
+    if lead.is_empty() {
+        if body.is_empty() {
+            ".".to_string()
+        } else {
+            body
+        }
+    } else {
+        format!("{}{}", lead, body)
+    }
+}
+
+/// python `os.path.abspath`
+pub fn py_abspath(s: &str) -> String {
+    if s.starts_with('/') {
+        return py_normpath(s);
+    }
+    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
+    py_normpath(&py_join(&cwd, s))
+}
+
+/// python `os.path.samefile` (False when either stat fails)
+pub fn same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+/// python text-mode newline handling on read: `\r\n` and lone `\r` become `\n`
+pub fn universal_newlines(s: &str) -> String {
+    if !s.contains('\r') {
+        return s.to_string();
+    }
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
