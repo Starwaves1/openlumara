@@ -264,6 +264,11 @@ pub fn bind_host(network_mode: Option<&str>, custom_host: Option<&str>) -> Optio
     }
 }
 
+/// python `str.strip("/").lower()`: the canonical form of a module extension route path
+pub fn py_strip_lower(s: &str) -> String {
+    s.trim_matches('/').to_lowercase()
+}
+
 /// python `Webui.url`: `http://{self.host}:{self.port}`, where an unset (None) host renders as "None"
 pub fn channel_url(host: Option<&str>, port: impl std::fmt::Display) -> String {
     format!("http://{}:{}", host.unwrap_or("None"), port)
