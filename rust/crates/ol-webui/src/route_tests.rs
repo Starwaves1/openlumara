@@ -296,3 +296,32 @@ async fn ext_api_turns_handler_errors_into_a_failed_envelope_with_status_200() {
     let result = h.get("/api/ext/probe/result").await;
     assert_eq!(result.json(), json!({"data": "nope", "success": false}));
 }
+
+#[tokio::test]
+async fn ext_api_with_an_empty_route_path_returns_the_envelope_like_python() {
+    // starlette's `:path` matches an empty remainder, so `/api/ext/<module>/` is the api envelope, not {"detail"}
+    let h = harness_with_probe().await;
+    let no_route = h.get("/api/ext/probe/").await;
+    assert_eq!(no_route.status, StatusCode::NOT_FOUND);
+    assert_eq!(no_route.json(), json!({"data": "route not found", "success": false}));
+
+    let no_module = h.get("/api/ext/nobody/").await;
+    assert_eq!(no_module.status, StatusCode::NOT_FOUND);
+    assert_eq!(no_module.json(), json!({"data": "unknown module", "success": false}));
+
+    let wrong = h.send(request(Method::POST, "/api/ext/probe/", None, None, "")).await;
+    assert_eq!(wrong.status, StatusCode::NOT_FOUND);
+    assert_eq!(wrong.json(), json!({"data": "route not found", "success": false}));
+}
+
+#[tokio::test]
+async fn ext_api_answers_head_with_405_whatever_the_route_like_python() {
+    // python's api_route has GET/POST/PUT/DELETE only, so HEAD is a starlette 405, even for an existing GET route
+    let h = harness_with_probe().await;
+    for uri in ["/api/ext/probe/ping", "/api/ext/nobody/ping", "/api/ext/probe/missing", "/api/ext/probe/"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+    }
+    // the GET route still answers normally
+    assert_eq!(h.get("/api/ext/probe/ping").await.json(), json!({"data": "pong", "success": true}));
+}

@@ -2,7 +2,7 @@
 //! a request is forwarded to the module's `ui_routes()` entry with the same method, and the result is
 //! wrapped in the api envelope.
 
-use crate::server::{api_result, internal_error, module_ui_enabled, Shared};
+use crate::server::{api_result, detail_response, internal_error, module_ui_enabled, Shared};
 use crate::util::py_strip_lower;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -18,10 +18,15 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 pub fn add_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
-    router.route(
-        "/api/ext/{module_name}/{*route_path}",
-        get(ext_api).post(ext_api).put(ext_api).delete(ext_api),
-    )
+    // starlette's `{route_path:path}` also matches an empty remainder, so `/api/ext/<module>/` reaches
+    // the handler with route_path "". matchit's `{*catchall}` does not match an empty segment, hence the
+    // separate route
+    router
+        .route("/api/ext/{module_name}/", get(ext_api_root).post(ext_api_root).put(ext_api_root).delete(ext_api_root))
+        .route(
+            "/api/ext/{module_name}/{*route_path}",
+            get(ext_api).post(ext_api).put(ext_api).delete(ext_api),
+        )
 }
 
 /// python `_ui_api_lookup`: `(module, None)` on a hit, `(None, reason)` on a miss
@@ -66,6 +71,33 @@ async fn ext_api(
     RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Response {
+    dispatch(app, module_name, route_path, method, raw_query, body).await
+}
+
+/// `/api/ext/<module>/` (empty route_path, as in python)
+async fn ext_api_root(
+    State(app): State<Arc<Shared>>,
+    Path(module_name): Path<String>,
+    method: Method,
+    RawQuery(raw_query): RawQuery,
+    body: Bytes,
+) -> Response {
+    dispatch(app, module_name, String::new(), method, raw_query, body).await
+}
+
+async fn dispatch(
+    app: Arc<Shared>,
+    module_name: String,
+    route_path: String,
+    method: Method,
+    raw_query: Option<String>,
+    body: Bytes,
+) -> Response {
+    // python registers ext_api for GET/POST/PUT/DELETE only, and FastAPI's api_route does not add HEAD
+    // to GET, so starlette answers HEAD on any matching path with its 405 (detail body), whatever the module
+    if method == Method::HEAD {
+        return detail_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+    }
     let Some(ch) = app.ch() else { return internal_error() };
     let wanted = py_strip_lower(&route_path);
     let method_name = method.as_str();
