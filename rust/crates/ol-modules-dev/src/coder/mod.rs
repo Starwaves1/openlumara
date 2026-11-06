@@ -9,7 +9,6 @@ use crate::pyos;
 use anyhow::anyhow;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, truthy};
-use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::ops::ControlFlow;
@@ -46,11 +45,53 @@ fn present(m: &Map<String, Value>, key: &str) -> bool {
     m.get(key).map(truthy).unwrap_or(false)
 }
 
-/// python `base64.b64decode`: standard alphabet, and non-zero trailing bits are accepted
-const PY_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
-    &base64::alphabet::STANDARD,
-    base64::engine::general_purpose::PAD.with_decode_allow_trailing_bits(true),
-);
+/// python `base64.b64decode(s)` on a str (validate=False). `None` = python raises.
+/// non-ASCII text is a ValueError; characters outside the alphabet are skipped; '=' is
+/// skipped too and only decides the end: a trailing quad must be completed by padding.
+/// non-zero trailing bits are accepted. checked against python 3.14 (see tests).
+fn py_b64decode(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut quad_pos = 0u8;
+    let mut left = 0u8;
+    let mut pads = 0u8;
+    for c in s.bytes() {
+        if c == b'=' {
+            pads += 1;
+            continue;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        pads = 0;
+        match quad_pos {
+            0 => left = v,
+            1 => {
+                out.push((left << 2) | (v >> 4));
+                left = v & 0x0f;
+            }
+            2 => {
+                out.push((left << 4) | (v >> 2));
+                left = v & 0x03;
+            }
+            _ => out.push((left << 6) | v),
+        }
+        quad_pos = (quad_pos + 1) % 4;
+    }
+    match quad_pos {
+        0 => Some(out),
+        1 => None,
+        q if q + pads >= 4 => Some(out),
+        _ => None,
+    }
+}
 
 const PARSE_FAILED_MSG: &str = "Failed to parse the file for syntax errors. For safety, the file was not written to disk.";
 
@@ -80,11 +121,18 @@ fn compile_regex(pattern: &str, ignore_case: bool) -> R<fancy_regex::Regex> {
     b.build().map_err(|e| e.to_string())
 }
 
-/// `pattern.search(line)`; lines keep their trailing newline in python, where `$` also
-/// matches just before it - search without it so anchors behave the same.
+/// `pattern.search(line)` where `line` keeps its trailing newline, as python's readlines and
+/// line iteration do: patterns such as `return\s` or `\n` can consume it. python's `$` also
+/// matches just before that newline, which fancy_regex's `$` does not, so the line also counts
+/// when the pattern matches it without the newline.
 fn re_search(re: &fancy_regex::Regex, line: &str) -> R<bool> {
-    let l = line.strip_suffix('\n').unwrap_or(line);
-    re.is_match(l).map_err(|e| e.to_string())
+    if re.is_match(line).map_err(|e| e.to_string())? {
+        return Ok(true);
+    }
+    match line.strip_suffix('\n') {
+        Some(l) => re.is_match(l).map_err(|e| e.to_string()),
+        None => Ok(false),
+    }
 }
 
 /// python list slicing helper for possibly negative start
@@ -1047,7 +1095,7 @@ impl Coder {
         if sandbox.is_empty() || needle.is_empty() {
             return Ok(self.result("sandbox and query are both required", false));
         }
-        let root = match self.full_sandbox(&sandbox) {
+        let root = match self.get_full_sandbox_path(&sandbox) {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
@@ -1058,6 +1106,11 @@ impl Coder {
             }
         } else {
             None
+        };
+        // python: with no sandbox_paths the root is None and os.walk(None) raises outside any
+        // try, so the exception escapes the route instead of becoming a result
+        let Some(root) = root else {
+            return Err(err("expected str, bytes or os.PathLike object, not NoneType"));
         };
         let needle_lower = needle.to_lowercase();
         let blacklist = self.blacklist();
@@ -1075,7 +1128,7 @@ impl Coder {
                     Ok(_) => {}
                     Err(_) => continue,
                 }
-                // python streams the file: lines completed before a bad utf-8 chunk still count
+                // python route streams the file (`for line in f`): lines completed before a bad utf-8 chunk still count
                 let Ok((lines, _decode_err)) = pyos::stream_lines(&fpath) else { continue };
                 // python only breaks the line loop here: the file loop has no truncated
                 // check, so later files can still append (and the walk stops per folder)
@@ -1209,12 +1262,37 @@ impl Coder {
         Ok(json!({"is_repo": true, "branch": branch, "log": parse_log(&raw)}))
     }
 
-    fn body_paths(b: &Map<String, Value>) -> Vec<String> {
-        match b.get("paths") {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
-            _ => Vec::new(),
+    /// python `for p in paths` over the request's truthy `paths` value: a list (elements must be
+    /// str, else os.path.join raises), a string (its characters) or a dict (its keys). any other
+    /// value raises when iteration starts. each item is an `Err` when python would raise on it.
+    fn py_path_items(paths: &Value) -> R<Vec<R<String>>> {
+        let not_pathlike = |v: &Value| -> R<String> {
+            Err(format!("join() argument must be str, bytes, or os.PathLike object, not '{}'", py_type(v)))
+        };
+        Ok(match paths {
+            Value::Array(a) => a
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s.clone()),
+                    other => not_pathlike(other),
+                })
+                .collect(),
+            Value::String(s) => s.chars().map(|c| Ok(c.to_string())).collect(),
+            Value::Object(m) => m.keys().map(|k| Ok(k.clone())).collect(),
+            other => return Err(format!("'{}' object is not iterable", py_type(other))),
+        })
+    }
+
+    /// python `_check_git_paths` + `abs_paths` over the request's `paths`, checked in order:
+    /// the first bad item stops with python's error text
+    fn checked_git_paths(root: &str, paths: &Value) -> R<Vec<String>> {
+        let mut out = Vec::new();
+        for item in Self::py_path_items(paths)? {
+            let p = item?;
+            Self::check_git_paths(root, std::slice::from_ref(&p))?;
+            out.push(p);
         }
+        Ok(out)
     }
 
     async fn route_git_stage(&self, b: &Map<String, Value>, unstage: bool) -> Value {
@@ -1222,12 +1300,16 @@ impl Coder {
             return self.result("coder is in read-only mode", false);
         }
         let sandbox = sget(b, "sandbox");
-        let paths = Self::body_paths(b);
         if sandbox.is_empty() || !present(b, "paths") {
             return self.result("sandbox and paths are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &paths).map(|_| r)) {
+        let paths_val = b.get("paths").cloned().unwrap_or(Value::Null);
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
             Ok(r) => r,
+            Err(e) => return self.result(e, false),
+        };
+        let paths = match Self::checked_git_paths(&root, &paths_val) {
+            Ok(p) => p,
             Err(e) => return self.result(e, false),
         };
         let abs: Vec<String> = paths.iter().map(|p| pyos::normpath(&pyos::join(&root, p))).collect();
@@ -1644,11 +1726,16 @@ impl Coder {
         }
         let sandbox = sget(b, "sandbox");
         let rel_path = sget(b, "path");
-        let content_b64 = sget(b, "content");
         let filename = sget(b, "filename");
         if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
             return self.result("sandbox, path and filename are all required", false);
         }
+        // python: body.get("content", ""); b64decode raises for any non-str value (None here)
+        let content_b64: Option<String> = match b.get("content") {
+            None => Some(String::new()),
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => None,
+        };
         let safe_name = filename.replace(['/', '\\'], "_");
         let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
         let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
@@ -1658,11 +1745,9 @@ impl Coder {
         if pyos::exists(&target) {
             return self.result(format!("file already exists: {}", target_rel), false);
         }
-        // python b64decode (non-validating): drop characters outside the alphabet
-        let cleaned: String = content_b64.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
-        let raw = match PY_B64.decode(cleaned.as_bytes()) {
-            Ok(r) => r,
-            Err(_) => return self.result("invalid base64 content", false),
+        let raw = match content_b64.as_deref().and_then(py_b64decode) {
+            Some(r) => r,
+            None => return self.result("invalid base64 content", false),
         };
         if raw.len() > 10_000_000 {
             return self.result("file too large (max 10MB)", false);
@@ -1900,10 +1985,60 @@ mod tests {
     }
 
     #[test]
-    fn upload_base64_is_python_lenient() {
-        // python b64decode ignores non-zero trailing bits; the strict engine rejects "QR=="
-        assert_eq!(PY_B64.decode("QR==").unwrap(), b"A");
-        assert_eq!(PY_B64.decode("aGk=").unwrap(), b"hi");
+    fn upload_base64_matches_python_b64decode() {
+        // expected values are python 3.14 `base64.b64decode(s)` results (None = raises)
+        let cases: [(&str, Option<&[u8]>); 14] = [
+            ("aGk=", Some(b"hi")),
+            ("QR==", Some(b"A")),
+            ("QUJD=REVG", Some(b"ABCDEF")),
+            ("QUJ=", Some(b"AB")),
+            ("=QUJD", Some(b"ABC")),
+            ("QQ==QQ==", Some(b"A\x04\x10")),
+            ("QQ=QQ", Some(b"A\x04\x10")),
+            ("QUJD\n RE VG", Some(b"ABCDEF")),
+            ("QQ=", None),
+            ("Q==", None),
+            ("QUJ=RE", None),
+            ("QUJDRA=A", None),
+            ("QUJ\n", None),
+            ("\u{e9}", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(py_b64decode(input).as_deref(), want, "input {:?}", input);
+        }
+    }
+
+    #[test]
+    fn regex_line_match_matches_python() {
+        // lines keep their '\n' in python: `\s` and `\n` can consume it, `$` matches before it
+        let line = "return\n";
+        assert!(re_search(&compile_regex("return\\s", false).unwrap(), line).unwrap());
+        assert!(re_search(&compile_regex("return$", false).unwrap(), line).unwrap());
+        assert!(re_search(&compile_regex("a\\n", false).unwrap(), "a\n").unwrap());
+        assert!(!re_search(&compile_regex("return\\s", false).unwrap(), "return").unwrap());
+        assert!(!re_search(&compile_regex("^$", false).unwrap(), line).unwrap());
+    }
+
+    #[test]
+    fn git_path_items_match_python_iteration() {
+        // python `for p in paths`: a non-iterable raises at the start of the loop
+        let err = Coder::py_path_items(&json!(5)).err();
+        assert_eq!(err.as_deref(), Some("'int' object is not iterable"));
+        // list elements must be str for os.path.join
+        let items = Coder::py_path_items(&json!(["a.txt", 1])).unwrap();
+        assert_eq!(items[0].as_deref(), Ok("a.txt"));
+        assert_eq!(items[1].as_ref().err().map(String::as_str), Some("join() argument must be str, bytes, or os.PathLike object, not 'int'"));
+        // a dict iterates its keys, a string its characters
+        let mut keys: Vec<String> = Coder::py_path_items(&json!({"x.rs": 1})).unwrap().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(keys.pop().as_deref(), Some("x.rs"));
+        let chars: Vec<String> = Coder::py_path_items(&json!("ab")).unwrap().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(chars, vec!["a".to_string(), "b".to_string()]);
+        // the escape check runs in order and reports python's message
+        let root = "/x/sb/repo";
+        let ok = Coder::checked_git_paths(root, &json!(["a.txt"])).unwrap();
+        assert_eq!(ok, vec!["a.txt".to_string()]);
+        let esc = Coder::checked_git_paths(root, &json!(["../../etc"])).err();
+        assert_eq!(esc.as_deref(), Some("path escapes the sandbox: ../../etc"));
     }
 
     /// one test owns the process-wide config (set_for_tests), so every tool check lives here
