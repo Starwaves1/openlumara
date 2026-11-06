@@ -8,6 +8,7 @@ mod patterns;
 pub mod pytext;
 pub mod sanitize;
 mod util;
+pub mod web_reader;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
 
@@ -30,5 +31,15 @@ pub fn register(r: &mut Registry) {
         unsafe_: file_manager::meta::UNSAFE,
         category: file_manager::meta::CATEGORY,
         factory: file_manager::FileManager::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "web_reader",
+        class_name: web_reader::meta::CLASS_NAME,
+        doc: web_reader::meta::DOC,
+        // python WebReader has no settings of its own, so `self.settings` resolves to Http's
+        settings: http::meta::settings,
+        unsafe_: web_reader::meta::UNSAFE,
+        category: web_reader::meta::CATEGORY,
+        factory: web_reader::WebReader::factory,
     });
 }
