@@ -1448,6 +1448,7 @@ dependencies = [
  "futures",
  "iana-time-zone",
  "indexmap",
+ "libc",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -1462,6 +1463,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "unicode-properties",
  "walkdir",
 ]
 

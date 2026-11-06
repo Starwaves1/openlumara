@@ -26,6 +26,8 @@ iana-time-zone = "0.1"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+libc = "0.2"
+unicode-properties = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
