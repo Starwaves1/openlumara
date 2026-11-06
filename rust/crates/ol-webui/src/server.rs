@@ -31,6 +31,7 @@ use ol_core::module::Module;
 use ol_core::paths::get_path;
 use ol_core::pyjson::{py_str, truthy};
 use ol_core::registry::{module_settings, ChannelDescriptor};
+use ol_core::storage::{StorageList, StorageType};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -148,6 +149,8 @@ pub struct Shared {
     pub signer: SessionSigner,
     /// python `self.logs`: everything passed through channel.log()
     pub logs: Mutex<Vec<(String, String)>>,
+    /// python `self.input_history`: StorageList name=webui_input_history, type=json
+    pub input_history: Mutex<StorageList>,
     pub url: String,
     bind_host: Option<String>,
     bind_port: Value,
@@ -214,6 +217,7 @@ fn build_shared(ch: &Arc<Channel>) -> anyhow::Result<Arc<Shared>> {
         login: Mutex::new(LoginLimiter::default()),
         signer,
         logs: Mutex::new(Vec::new()),
+        input_history: Mutex::new(StorageList::new("webui_input_history", StorageType::Json, None)?),
         url,
         bind_host: bind,
         bind_port: port,

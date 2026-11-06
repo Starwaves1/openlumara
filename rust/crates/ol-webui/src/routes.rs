@@ -1,13 +1,831 @@
-//! Place for the `/api/...` routes that are not part of the static / ui-extension groups
-//! (chats, input history, settings, models, libraries, system). Each API route unit adds its
-//! handlers in [`add_api_routes`]; the layers (auth, sessions, coi headers) are applied to the
-//! whole router afterwards in `server::build_router`, so nothing needs wiring there.
+//! Port of the `/api` routes in channels/webui/channel.py that are not static, ui-extension or
+//! websocket: chat load/current/export/list/days/categories/tags/search/new/rename/delete,
+//! stream state, shell input history, settings, models and connection, module libraries and the
+//! system routes. Each handler follows its python body; every answer goes through
+//! `server::api_result`, and a python exception that would reach starlette becomes the plain 500.
 
-use crate::server::Shared;
+use crate::listing::{
+    chats_for_category, day_label_from_key, group_key, highlight_query, local_day, project_chat, updated_of,
+    validate_category_format, validate_category_name,
+};
+use crate::server::{api_result, internal_error, Shared};
+use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
+use crate::util::{get_strip, or_strip, py_int, py_int_str, py_slice, py_strip, py_type_name};
+use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
+use axum::body::Bytes;
+use axum::extract::{Path, RawQuery, State};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
+use indexmap::IndexMap;
+use ol_core::channel::Channel;
+use ol_core::context::GetOpts;
+use ol_core::pyjson::{py_str, truthy};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// adds the `/api` routes owned by the API route units. nothing is registered yet
+/// registers the `/api` chat, stream, input history, settings, library and system routes
 pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
     router
+        .route("/api/chat/load/{chat_id}", get(chat_load))
+        .route("/api/chat/current", get(chat_current))
+        .route("/api/stream/state", get(stream_state))
+        .route("/api/chat/export", get(chat_export))
+        .route("/api/chats", get(get_chats))
+        .route("/api/chats/days", get(get_chat_days))
+        .route("/api/chats/day", get(get_chats_for_day))
+        .route("/api/chats/categories", get(get_chat_categories))
+        .route("/api/chats/categories/count", get(get_chat_category_counts))
+        .route("/api/chats/tags", get(get_chat_tags))
+        .route("/api/chats/categories/create", post(create_chat_category))
+        .route("/api/chats/categories/delete", post(delete_chat_category))
+        .route("/api/chats/search", post(search_chats))
+        .route("/api/chat/prompt", get(get_prompt))
+        .route("/api/chat/new", post(chat_new))
+        .route("/api/chat/rename/{chat_id}", post(chat_rename))
+        .route("/api/chat/delete/{chat_id}", post(chat_delete_by_id))
+        .route("/api/chat/set-category/{chat_id}", post(chat_set_category))
+        .route("/api/input_history", get(input_history_get).post(input_history_add))
+        .route("/api/settings/load", get(settings_load))
+        .route("/api/check_connection", get(check_connection))
+        .route("/api/models", get(models_get))
+        .route("/api/model/set", post(model_set))
+        .route("/api/settings/save", post(settings_save))
+        .route("/api/reconnect", post(reconnect))
+        .route("/api/libraries/status", get(libraries_status))
+        .route("/api/libraries/sync", post(libraries_sync))
+        .route("/api/libraries/install", post(libraries_install))
+        .route("/api/libraries/update", post(libraries_update))
+        .route("/api/libraries/uninstall", post(libraries_uninstall))
+        .route("/api/system/data", get(system_data))
+        .route("/api/system/context_size", get(system_context_size))
+        .route("/api/system/logs", get(system_logs))
+        .route("/api/system/restart", post(system_restart))
+}
+
+// ------------------
+// helpers
+// ------------------
+
+/// `api_result(data, success)` as a json response
+fn reply(data: Value, success: bool) -> Response {
+    Json(api_result(data, success)).into_response()
+}
+
+/// `request.query_params`: starlette keeps every occurrence, and `.get` answers the last one
+struct QueryParams(Vec<(String, String)>);
+
+impl QueryParams {
+    fn parse(raw: Option<&str>) -> Self {
+        Self(
+            url::form_urlencoded::parse(raw.unwrap_or("").as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect(),
+        )
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// `query_params.getlist(key)`
+    fn get_all(&self, key: &str) -> Vec<String> {
+        self.0.iter().filter(|(k, _)| k == key).map(|(_, v)| v.clone()).collect()
+    }
+
+    /// `int(query_params.get(key, default))`; None where python raises ValueError
+    fn int(&self, key: &str, default: i64) -> Option<i64> {
+        match self.get(key) {
+            Some(s) => py_int_str(s),
+            None => Some(default),
+        }
+    }
+}
+
+/// `await request.json()` for a body that must be a dict; None where python raises
+fn json_object(body: &[u8]) -> Option<Map<String, Value>> {
+    serde_json::from_slice::<Value>(body).ok()?.as_object().cloned()
+}
+
+/// `int(data.get(key) or 0)`; None where python raises
+fn tz_offset_of(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(v) if truthy(v) => py_int(v),
+        _ => Some(0),
+    }
+}
+
+/// `category or None` for a query parameter (python `if category:`)
+fn category_filter(raw: Option<&str>) -> Option<&str> {
+    raw.filter(|c| !c.is_empty())
+}
+
+/// python `_chats_for_category(category, tags)` over `get_all()`
+fn chats_in(ch: &Channel, category: Option<&str>, tags: &[String]) -> Result<Vec<Value>, String> {
+    let all = ch.chat.get_all();
+    chats_for_category(&all, category, tags).map(|v| v.into_iter().cloned().collect())
+}
+
+/// python `chats[offset:offset + limit]` and `has_more`
+fn page_of(chats: &[Value], offset: i64, limit: i64) -> (Vec<Value>, bool) {
+    let stop = offset.saturating_add(limit);
+    (py_slice(chats, offset, stop), stop < chats.len() as i64)
+}
+
+/// python `_group_key` / `_local_day` for every chat: (group key, newest local day, count) in first-seen order
+fn group_counts(chats: &[Value], tz: i64) -> Result<IndexMap<String, (i64, String)>, String> {
+    let mut groups: IndexMap<String, (i64, String)> = IndexMap::new();
+    for chat in chats {
+        let updated = updated_of(chat);
+        let key = group_key(&updated, tz)?;
+        let day = local_day(&updated, tz)?;
+        let entry = groups.entry(key).or_insert((0, String::new()));
+        entry.0 += 1;
+        if day > entry.1 {
+            entry.1 = day;
+        }
+    }
+    Ok(groups)
+}
+
+/// python `chat.get(...)` dict of the loaded chat, with turn history and live token usage
+async fn chat_with_details(ch: &Channel) -> Value {
+    let mut chat = ch.chat.get_chat();
+    chat["turn_history"] = json!(ch.group_history());
+    chat["token_usage"] = json!(ch.context.get_total_tokens().await);
+    chat
+}
+
+/// python `chat_store.get_categories()` mapped through `c or "general"`, sorted, "general" first
+pub fn category_names(categories: &[Value]) -> Vec<String> {
+    let set: BTreeSet<String> = categories
+        .iter()
+        .map(|c| if truthy(c) { py_str(c) } else { "general".to_string() })
+        .collect();
+    let mut out: Vec<String> = set.into_iter().collect();
+    if let Some(pos) = out.iter().position(|c| c == "general") {
+        out.remove(pos);
+        out.insert(0, "general".to_string());
+    }
+    out
+}
+
+/// python `{chat.get("category") or "general": count}` over the chat index
+pub fn category_counts(chats: &[Value]) -> Map<String, Value> {
+    let mut counts = Map::new();
+    for chat in chats {
+        let cat = match chat.get("category") {
+            Some(c) if truthy(c) => py_str(c),
+            _ => "general".to_string(),
+        };
+        let n = counts.get(&cat).and_then(Value::as_i64).unwrap_or(0) + 1;
+        counts.insert(cat, json!(n));
+    }
+    counts
+}
+
+/// python sorted set of every truthy string tag in the chats
+pub fn tag_names(chats: &[Value]) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for chat in chats {
+        if let Some(list) = chat.get("tags").and_then(Value::as_array) {
+            for tag in list.iter().filter(|t| truthy(t)) {
+                tags.insert(py_str(tag));
+            }
+        }
+    }
+    tags.into_iter().collect()
+}
+
+/// python `all(t in (r.get("tags") or []) for t in tags)`
+fn has_all_tags(chat: &Value, tags: &[Value]) -> bool {
+    let have = chat.get("tags").and_then(Value::as_array);
+    tags.iter().all(|t| have.is_some_and(|h| h.iter().any(|x| x == t)))
+}
+
+/// python `re.sub(r'[\\/:*?"<>|]', "_", title).strip() or "chat-export"` + ".txt"
+pub fn export_filename(title: &str) -> String {
+    static UNSAFE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"[\\/:*?"<>|]"#).unwrap());
+    let safe = UNSAFE.replace_all(title, "_");
+    let stripped = py_strip(&safe);
+    let base = if stripped.is_empty() { "chat-export" } else { stripped };
+    format!("{}.txt", base)
+}
+
+/// python `input_history` append: dedupes against the last entry, keeps the newest 100
+pub fn push_input_history(history: &mut Vec<Value>, message: &str) {
+    if history.last().and_then(Value::as_str) == Some(message) {
+        return;
+    }
+    history.push(json!(message));
+    while history.len() > 100 {
+        history.remove(0);
+    }
+}
+
+/// python `_get_module_section(config, key)`: `{"enabled", "disabled"}` of a module section, None where absent
+fn module_section(section: Option<&Value>) -> Value {
+    let obj = match section {
+        Some(v) if truthy(v) => v.clone(),
+        _ => json!({}),
+    };
+    json!({
+        "enabled": obj.get("enabled").cloned().unwrap_or(Value::Null),
+        "disabled": obj.get("disabled").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// python settings-save diff: (requires_restart, requires_reconnect)
+pub fn restart_flags(old: &Map<String, Value>, new: &Map<String, Value>) -> (bool, bool) {
+    let requires_restart = MODULE_CATEGORY_KEYS
+        .iter()
+        .any(|key| module_section(old.get(*key)) != module_section(new.get(*key)));
+    let requires_reconnect = !requires_restart && old.get("api").unwrap_or(&Value::Null) != new.get("api").unwrap_or(&Value::Null);
+    (requires_restart, requires_reconnect)
+}
+
+/// python `round(x, 1)`
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+// ------------------
+// chat load / current / export / stream state
+// ------------------
+
+async fn chat_load(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    if !op_chat_switch(&app, &ch, &chat_id).await {
+        return reply(json!("error while loading chat"), false);
+    }
+    reply(chat_with_details(&ch).await, true)
+}
+
+async fn chat_current(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    reply(chat_with_details(&ch).await, true)
+}
+
+async fn stream_state(State(app): State<Arc<Shared>>) -> Response {
+    reply(json!({"state": app.ws.stream_state()}), true)
+}
+
+async fn chat_export(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Ok(content) = ch.chat.export().await else { return internal_error() };
+    let title = ch.chat.get_str("title").unwrap_or_default();
+    reply(json!({"content": content, "filename": export_filename(&title)}), true)
+}
+
+// ------------------
+// chat listings
+// ------------------
+
+async fn get_chats(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let q = QueryParams::parse(raw.as_deref());
+    let (Some(offset), Some(limit)) = (q.int("offset", 0), q.int("limit", 50)) else { return internal_error() };
+    let category = category_filter(q.get("category"));
+    let all = match category {
+        Some(c) => ch.chat.get_all().into_iter().filter(|x| x.get("category") == Some(&json!(c))).collect(),
+        None => ch.chat.get_all(),
+    };
+    let (page, has_more) = page_of(&all, offset, limit);
+    let messages: Vec<Value> = page.iter().map(|c| project_chat(c, &[])).collect();
+    reply(json!({"messages": messages, "has_more": has_more}), true)
+}
+
+async fn get_chat_days(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let q = QueryParams::parse(raw.as_deref());
+    let Some(tz) = q.int("tz_offset", 0) else { return internal_error() };
+    let tags = q.get_all("tags");
+    let Ok(chats) = chats_in(&ch, category_filter(q.get("category")), &tags) else { return internal_error() };
+    let Ok(groups) = group_counts(&chats, tz) else { return internal_error() };
+
+    let mut entries: Vec<(String, i64, String)> = groups.into_iter().map(|(k, (c, newest))| (k, c, newest)).collect();
+    // python: groups ordered by their newest member, newest first (stable)
+    entries.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut out = Vec::new();
+    for (key, count, _) in entries {
+        let Ok(label) = day_label_from_key(&key, tz) else { return internal_error() };
+        out.push(json!({"key": key, "count": count, "label": label}));
+    }
+    reply(json!(out), true)
+}
+
+async fn get_chats_for_day(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let q = QueryParams::parse(raw.as_deref());
+    let day = q.get("day").unwrap_or("").to_string();
+    let (Some(offset), Some(limit), Some(tz)) = (q.int("offset", 0), q.int("limit", 50), q.int("tz_offset", 0)) else {
+        return internal_error();
+    };
+    let tags = q.get_all("tags");
+    let Ok(chats) = chats_in(&ch, category_filter(q.get("category")), &tags) else { return internal_error() };
+
+    let mut day_chats = Vec::new();
+    for chat in chats {
+        match group_key(&updated_of(&chat), tz) {
+            Ok(key) if key == day => day_chats.push(chat),
+            Ok(_) => {}
+            Err(_) => return internal_error(),
+        }
+    }
+    let (page, has_more) = page_of(&day_chats, offset, limit);
+    let messages: Vec<Value> = page.iter().map(|c| project_chat(c, &[])).collect();
+    reply(json!({"messages": messages, "has_more": has_more, "count": day_chats.len()}), true)
+}
+
+async fn get_chat_categories(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    reply(json!(category_names(&ch.chat.get_categories())), true)
+}
+
+async fn get_chat_category_counts(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    reply(Value::Object(category_counts(&ch.chat.data())), true)
+}
+
+async fn get_chat_tags(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let q = QueryParams::parse(raw.as_deref());
+    let Ok(chats) = chats_in(&ch, category_filter(q.get("category")), &[]) else { return internal_error() };
+    reply(json!(tag_names(&chats)), true)
+}
+
+// ------------------
+// categories
+// ------------------
+
+async fn create_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let name = match obj.get("name") {
+        Some(v) if truthy(v) => match v.as_str() {
+            Some(s) => s.to_string(),
+            None => return internal_error(),
+        },
+        _ => String::new(),
+    };
+    let category = match validate_category_name(&name, &ch.chat.data()) {
+        Ok(c) => c,
+        Err(error) => return reply(json!(error), false),
+    };
+    let new_id = op_chat_new(&app, &ch, &category).await;
+    reply(json!({"id": new_id}), true)
+}
+
+async fn delete_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
+    if name.is_empty() || name == "general" {
+        return reply(json!("'general' cannot be deleted"), false);
+    }
+    let target = Value::String(name.clone());
+    let general = json!("general");
+    let moved = ch.chat.with_data_mut(|chats| {
+        let mut moved = 0usize;
+        for chat in chats.iter_mut() {
+            if chat.get("category") == Some(&target) {
+                chat["category"] = general.clone();
+                moved += 1;
+            }
+        }
+        moved
+    });
+    if moved > 0 {
+        ch.chat.save_index();
+    }
+    reply(json!({"moved": moved}), true)
+}
+
+// ------------------
+// search
+// ------------------
+
+/// python `search_chats` projection of one hit: group fields and highlighted title/snippets
+fn search_entry(chat: &Value, query: &str, tz: i64) -> Result<Value, String> {
+    let group = group_key(&updated_of(chat), tz)?;
+    let mut entry = project_chat(chat, &["title_match"]);
+    entry["group_key"] = json!(if group.is_empty() { "undated".to_string() } else { group.clone() });
+    entry["group_label"] = json!(day_label_from_key(&group, tz)?);
+    entry["title_highlighted"] = json!(highlight_query(Some(chat.get("title").and_then(Value::as_str).unwrap_or("")), query).unwrap_or_default());
+    let snippets: Vec<Value> = chat
+        .get("message_snippets")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|s| json!(highlight_query(Some(s.as_str().unwrap_or("")), query).unwrap_or_default()))
+                .collect()
+        })
+        .unwrap_or_default();
+    entry["snippets_highlighted"] = json!(snippets);
+    Ok(entry)
+}
+
+async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Ok(query) = get_strip(obj.get("query"), "") else { return internal_error() };
+    let search_in_content = obj.get("search_in_content").map(truthy).unwrap_or(true);
+    let category = obj.get("category").cloned().unwrap_or(Value::Null);
+    let Some(tz) = tz_offset_of(obj.get("tz_offset")) else { return internal_error() };
+    if query.is_empty() {
+        return reply(json!([]), true);
+    }
+
+    let mut results = ch.chat.search(&query, 100, search_in_content);
+    let general = json!("general");
+    if truthy(&category) && category != general {
+        results.retain(|r| r.get("category") == Some(&category));
+    } else if category == general {
+        results.retain(|r| {
+            let c = r.get("category").cloned().unwrap_or(Value::Null);
+            !truthy(&c) || c == general
+        });
+    }
+
+    let tags: Vec<Value> = match obj.get("tags") {
+        Some(Value::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    if !tags.is_empty() {
+        results.retain(|r| has_all_tags(r, &tags));
+    }
+
+    // python: updated-descending unless sort=relevance (the BM25 order is kept then)
+    let sort = obj.get("sort").filter(|v| truthy(v)).cloned().unwrap_or(json!("updated"));
+    if sort != json!("relevance") {
+        results.sort_by(|a, b| updated_of(b).cmp(&updated_of(a)));
+    }
+
+    let mut projected = Vec::new();
+    for chat in &results {
+        match search_entry(chat, &query, tz) {
+            Ok(entry) => projected.push(entry),
+            Err(_) => return internal_error(),
+        }
+    }
+    reply(json!(projected), true)
+}
+
+// ------------------
+// prompt / new / rename / delete / set-category
+// ------------------
+
+async fn get_prompt(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let opts = GetOpts { system_prompt: true, end_prompt: false, history: false, ..Default::default() };
+    match ch.context.get(opts).await {
+        Ok(Some(messages)) => match messages.last() {
+            Some(last) => reply(last.get("content").cloned().unwrap_or(Value::Null), true),
+            None => internal_error(),
+        },
+        Ok(None) => internal_error(),
+        Err(e) => reply(json!(e.to_string()), false),
+    }
+}
+
+async fn chat_new(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    // python: any failure reading the body keeps the category at 'general'
+    let mut category = "general".to_string();
+    if let Some(obj) = json_object(&body) {
+        if let Ok(c) = or_strip(obj.get("category"), "general") {
+            category = if c.is_empty() { "general".to_string() } else { c };
+        }
+    }
+    if category != "general" {
+        match validate_category_format(&category) {
+            Ok(c) => category = c,
+            Err(error) => return reply(json!(error), false),
+        }
+    }
+    let new_id = op_chat_new(&app, &ch, &category).await;
+    reply(json!({"id": new_id}), true)
+}
+
+async fn chat_rename(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let data = match serde_json::from_slice::<Value>(&body) {
+        Ok(v) => v,
+        Err(e) => return reply(json!(e.to_string()), false),
+    };
+    let Some(obj) = data.as_object() else {
+        return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);
+    };
+    let new_title = match get_strip(obj.get("title"), "") {
+        Ok(t) => t,
+        Err(message) => return reply(json!(message), false),
+    };
+    if new_title.is_empty() {
+        return reply(json!("Title cannot be empty"), false);
+    }
+    match op_chat_rename(&app, &ch, json!(new_title), Some(&chat_id)).await {
+        Ok(true) => reply(Value::Null, true),
+        Ok(false) => reply(json!("Chat not found"), false),
+        Err(e) => reply(json!(e.to_string()), false),
+    }
+}
+
+async fn chat_delete_by_id(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    op_chat_delete(&app, &ch, &chat_id).await;
+    reply(Value::Null, true)
+}
+
+async fn chat_set_category(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let data = match serde_json::from_slice::<Value>(&body) {
+        Ok(v) => v,
+        Err(e) => return reply(json!(e.to_string()), false),
+    };
+    let Some(obj) = data.as_object() else {
+        return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);
+    };
+    let category = match or_strip(obj.get("category"), "") {
+        Ok(c) => c,
+        Err(message) => return reply(json!(message), false),
+    };
+    if category.is_empty() {
+        return reply(json!("Category cannot be empty"), false);
+    }
+    let Some(index) = ch.chat.find_index(&chat_id) else {
+        return reply(json!("Chat not found"), false);
+    };
+    match ch.chat.set("category", json!(category), Some(index)) {
+        Ok(_) => {
+            ch.chat.save_index();
+            reply(Value::Null, true)
+        }
+        Err(e) => reply(json!(e.to_string()), false),
+    }
+}
+
+// ------------------
+// input history
+// ------------------
+
+async fn input_history_get(State(app): State<Arc<Shared>>) -> Response {
+    let history = app.input_history.lock().data.clone();
+    reply(Value::Array(history), true)
+}
+
+async fn input_history_add(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Ok(message) = or_strip(obj.get("message"), "") else { return internal_error() };
+    if message.is_empty() {
+        return reply(Value::Null, true);
+    }
+    let mut history = app.input_history.lock();
+    history.load();
+    push_input_history(&mut history.data, &message);
+    let _ = history.save();
+    reply(Value::Array(history.data.clone()), true)
+}
+
+// ------------------
+// settings / models / connection
+// ------------------
+
+async fn settings_load(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let (module_info, core_sections) = get_module_info();
+    let Ok(structure) = build_settings_structure(&ol_core::config::snapshot(), &module_info, &core_sections) else {
+        return internal_error();
+    };
+    let show_unsafe = truthy(&ch.config.get1("show_unsafe_settings").unwrap_or(Value::Null));
+    reply(json!({"categories": structure, "show_unsafe_settings": show_unsafe}), true)
+}
+
+async fn check_connection(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    if ch.manager().api().connected() {
+        reply(json!(true), true)
+    } else {
+        reply(json!("not connected"), false)
+    }
+}
+
+async fn models_get(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    match ch.manager().api().list_models().await {
+        Ok(models) => reply(json!(models), true),
+        Err(e) => reply(json!(e.to_string()), false),
+    }
+}
+
+async fn model_set(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
+    if name.is_empty() {
+        return reply(json!("Model name cannot be empty"), false);
+    }
+    ch.manager().api().set_model(&name);
+    reply(json!({"name": name}), true)
+}
+
+async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let changed_modules: Vec<String> = match obj.get("changed_modules") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items.iter().map(py_str).collect(),
+        Some(_) => return internal_error(),
+    };
+    let categories = match obj.get("categories") {
+        None => Map::new(),
+        Some(Value::Object(m)) => m.clone(),
+        Some(_) => return internal_error(),
+    };
+    let Ok(flattened) = flatten_categories(&categories) else { return internal_error() };
+
+    let old_config = ol_core::config::snapshot();
+    ol_core::config::replace(flattened.clone());
+    let (requires_restart, requires_reconnect) = restart_flags(&old_config, &flattened);
+
+    let manager = ch.manager();
+    for name in &changed_modules {
+        // python logs a failed reload and carries on with the next module
+        let _ = manager.reload_module(name).await;
+    }
+    app.setup_ui_extensions();
+
+    reply(json!({"requires_restart": requires_restart, "requires_reconnect": requires_reconnect}), true)
+}
+
+async fn reconnect(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    match ch.manager().api().reconnect().await {
+        Ok(()) => reply(Value::Null, true),
+        Err(e) => reply(json!(e.to_string()), false),
+    }
+}
+
+// ------------------
+// module libraries
+// ------------------
+
+async fn libraries_status(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let manager = ch.manager();
+    let mm = manager.module_manager();
+    let libraries: Vec<String> = mm.list_libraries().keys().cloned().collect();
+    reply(json!({"repos": mm.list_repos(), "libraries": libraries, "modules": mm.list_available()}), true)
+}
+
+async fn libraries_sync(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let manager = ch.manager();
+    let mm = manager.module_manager();
+    if mm.list_repos().is_empty() {
+        return reply(json!("No module libraries configured. Add github repo urls under Core settings first."), false);
+    }
+    let synced = mm.load().await;
+    reply(json!({"synced": synced, "modules": mm.list_available()}), true)
+}
+
+async fn libraries_install(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let (Ok(library), Ok(name)) = (or_strip(obj.get("library"), ""), or_strip(obj.get("name"), "")) else {
+        return internal_error();
+    };
+    let manager = ch.manager();
+    match manager.module_manager().install(&library, &name) {
+        Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
+        Err(message) => reply(json!(message), false),
+    }
+}
+
+async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let (Ok(library), Ok(name)) = (or_strip(obj.get("library"), ""), or_strip(obj.get("name"), "")) else {
+        return internal_error();
+    };
+    let manager = ch.manager();
+    match manager.module_manager().update(&library, &name).await {
+        Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
+        Err(message) => reply(json!(message), false),
+    }
+}
+
+async fn libraries_uninstall(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
+    let manager = ch.manager();
+    match manager.module_manager().uninstall(&name) {
+        Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
+        Err(message) => reply(json!(message), false),
+    }
+}
+
+// ------------------
+// system
+// ------------------
+
+async fn system_data(State(app): State<Arc<Shared>>) -> Response {
+    let Some(_ch) = app.ch() else { return internal_error() };
+    let max_context = ol_core::config::get(&["api", "max_context"]).unwrap_or(Value::Null);
+    reply(json!({"max_context": max_context}), true)
+}
+
+async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let mut size = ch.context.get_size().await;
+    let threshold = ol_core::config::get_f64(&["model", "context_compression_threshold"], 0.0);
+    size["compression_threshold"] = json!(round1(threshold * 100.0));
+    let auto = ol_core::config::get(&["model", "automatically_compress_context"]).unwrap_or(Value::Null);
+    size["auto_compress"] = json!(truthy(&auto));
+    reply(size, true)
+}
+
+async fn system_logs(State(app): State<Arc<Shared>>) -> Response {
+    let logs: Vec<Value> = app.logs.lock().iter().map(|(category, message)| json!({"category": category, "message": message})).collect();
+    reply(json!(logs), true)
+}
+
+async fn system_restart(State(app): State<Arc<Shared>>) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    ch.manager().restart();
+    Json(Value::Null).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categories_put_general_first_and_map_falsy_to_general() {
+        let cats = vec![json!("work"), Value::Null, json!("general"), json!("alpha"), json!("")];
+        assert_eq!(category_names(&cats), vec!["general", "alpha", "work"]);
+    }
+
+    #[test]
+    fn category_counts_group_missing_and_empty_under_general() {
+        let chats = vec![json!({"category": "work"}), json!({}), json!({"category": ""}), json!({"category": "work"})];
+        let counts = category_counts(&chats);
+        assert_eq!(counts.get("work"), Some(&json!(2)));
+        assert_eq!(counts.get("general"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn export_filename_replaces_unsafe_characters() {
+        assert_eq!(export_filename("a/b:c*?\"<>|d"), "a_b_c______d.txt");
+        assert_eq!(export_filename("   "), "chat-export.txt");
+    }
+
+    #[test]
+    fn input_history_dedupes_last_and_caps_at_100() {
+        let mut history: Vec<Value> = Vec::new();
+        push_input_history(&mut history, "ls");
+        push_input_history(&mut history, "ls");
+        assert_eq!(history, vec![json!("ls")]);
+        for i in 0..105 {
+            push_input_history(&mut history, &format!("cmd {}", i));
+        }
+        assert_eq!(history.len(), 100);
+        assert_eq!(history.first(), Some(&json!("cmd 5")));
+        assert_eq!(history.last(), Some(&json!("cmd 104")));
+    }
+
+    #[test]
+    fn restart_flags_follow_module_lists_then_api() {
+        let old = json!({"modules": {"enabled": ["a"]}, "api": {"model": "x"}});
+        let same = json!({"modules": {"enabled": ["a"]}, "api": {"model": "y"}});
+        let moved = json!({"modules": {"enabled": ["a", "b"]}, "api": {"model": "y"}});
+        let old = old.as_object().unwrap();
+        assert_eq!(restart_flags(old, same.as_object().unwrap()), (false, true));
+        assert_eq!(restart_flags(old, moved.as_object().unwrap()), (true, false));
+    }
+
+    #[test]
+    fn query_params_follow_starlette_get_and_getlist() {
+        let q = QueryParams::parse(Some("tags=a&tags=b&offset=3&offset=7&offset=x"));
+        assert_eq!(q.get_all("tags"), vec!["a", "b"]);
+        assert_eq!(q.get("offset"), Some("x"));
+        assert_eq!(q.int("limit", 50), Some(50));
+        assert_eq!(QueryParams::parse(Some("offset=7")).int("offset", 0), Some(7));
+    }
+
+    #[test]
+    fn page_of_matches_python_slicing_and_has_more() {
+        let chats: Vec<Value> = (0..5).map(|i| json!(i)).collect();
+        let (page, more) = page_of(&chats, 1, 2);
+        assert_eq!(page, vec![json!(1), json!(2)]);
+        assert!(more);
+        let (page, more) = page_of(&chats, 4, 10);
+        assert_eq!(page, vec![json!(4)]);
+        assert!(!more);
+    }
 }

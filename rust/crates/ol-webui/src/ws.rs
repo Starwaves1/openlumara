@@ -194,7 +194,11 @@ async fn serve_connection(app: Arc<Shared>, socket: WebSocket) {
                 break;
             }
             Ok(_) => {}
-            Err(_) => break,
+            // python: a transport error that is not a clean disconnect is logged before the close
+            Err(e) => {
+                ch.log(&ch.name, &format!("WebSocket error: {}", e));
+                break;
+            }
         }
     }
     app.ws.remove_connection(id);
@@ -285,25 +289,45 @@ fn message_at(ch: &Channel, index: i64) -> anyhow::Result<Value> {
     ch.chat.messages_get_at(i).map_err(|_| anyhow!("list index out of range"))
 }
 
-/// python `_stream_task` file decoding: `{f["name"]: base64.b64decode(f["data"])}`
+/// python `base64.b64decode(data)` (validate=False): characters outside the base64 alphabet are
+/// discarded before decoding, so line wraps and spaces are accepted. non-ASCII text is a TypeError
+fn b64decode_lenient(text: &str) -> anyhow::Result<Vec<u8>> {
+    if !text.is_ascii() {
+        anyhow::bail!("string argument should contain only ASCII characters");
+    }
+    let cleaned: String = text
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|_| anyhow!("Incorrect padding"))
+}
+
+/// python `_stream_task` file decoding: `{f["name"]: base64.b64decode(f["data"])}`. the error texts
+/// are the ones python raises for the same wrong shapes (a string or dict is iterated, and each
+/// element is then subscripted with "name")
 fn decode_files(files_data: &Value) -> anyhow::Result<Files> {
-    let Value::Array(items) = files_data else {
-        anyhow::bail!("'{}' object is not iterable", py_type_name(files_data));
+    let items: Vec<&Value> = match files_data {
+        Value::Array(items) => items.iter().collect(),
+        Value::String(s) if !s.is_empty() => anyhow::bail!("string indices must be integers, not 'str'"),
+        Value::Object(map) if !map.is_empty() => anyhow::bail!("string indices must be integers, not 'str'"),
+        other => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
     };
     let mut files: Files = IndexMap::new();
     for item in items {
-        let Some(obj) = item.as_object() else {
-            anyhow::bail!("'{}' object is not subscriptable", py_type_name(item));
+        let obj = match item {
+            Value::Object(obj) => obj,
+            Value::String(_) => anyhow::bail!("string indices must be integers, not 'str'"),
+            Value::Array(_) => anyhow::bail!("list indices must be integers or slices, not str"),
+            other => anyhow::bail!("'{}' object is not subscriptable", py_type_name(other)),
         };
         let name = obj.get("name").ok_or_else(|| anyhow!("'name'"))?;
         let data = obj.get("data").ok_or_else(|| anyhow!("'data'"))?;
         let encoded = data.as_str().ok_or_else(|| {
             anyhow!("argument should be a bytes-like object or ASCII string, not '{}'", py_type_name(data))
         })?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| anyhow!("Incorrect padding"))?;
-        files.insert(py_str(name), bytes);
+        files.insert(py_str(name), b64decode_lenient(encoded)?);
     }
     Ok(files)
 }
@@ -574,6 +598,26 @@ mod tests {
             py_index(Some(&json!("3"))).unwrap_err().to_string(),
             "'<' not supported between instances of 'str' and 'int'"
         );
+    }
+
+    #[test]
+    fn base64_decoding_discards_non_alphabet_characters_like_python() {
+        // python base64.encodebytes output wraps lines with newlines
+        let files = decode_files(&json!([{"name": "wrapped", "data": "aGVs\nbG8=\n"}])).unwrap();
+        assert_eq!(files.get("wrapped").unwrap(), b"hello");
+        assert_eq!(decode_files(&json!([{"name": "x", "data": "a G k="}])).unwrap().get("x").unwrap(), b"hi");
+        assert_eq!(
+            decode_files(&json!([{"name": "x", "data": "aé"}])).unwrap_err().to_string(),
+            "string argument should contain only ASCII characters"
+        );
+    }
+
+    #[test]
+    fn file_upload_iteration_errors_match_python_text() {
+        assert_eq!(decode_files(&json!("ab")).unwrap_err().to_string(), "string indices must be integers, not 'str'");
+        assert_eq!(decode_files(&json!(5)).unwrap_err().to_string(), "'int' object is not iterable");
+        assert_eq!(decode_files(&json!([1])).unwrap_err().to_string(), "'int' object is not subscriptable");
+        assert_eq!(decode_files(&json!(["x"])).unwrap_err().to_string(), "string indices must be integers, not 'str'");
     }
 
     #[test]
