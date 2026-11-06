@@ -169,10 +169,22 @@ fn context_lists(all_lines: &[&str], line_num: usize, context: i64) -> (Vec<Valu
     (before.into_iter().map(Value::String).collect(), after.into_iter().map(Value::String).collect())
 }
 
-/// run git; returns (returncode, raw stdout)
-async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
+/// python's `os.path` error for a None root (`_git_root` is None when no sandbox_paths are set)
+const NONE_ROOT_ERR: &str = "expected str, bytes or os.PathLike object, not NoneType";
+
+/// python `subprocess.run(cwd=None)`: no root runs git in the server's own working directory
+fn git_command(root: Option<&str>, args: &[impl AsRef<std::ffi::OsStr>]) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+    cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
+    if let Some(root) = root {
+        cmd.current_dir(root);
+    }
+    cmd
+}
+
+/// run git; returns (returncode, raw stdout)
+async fn run_git_bytes(root: Option<&str>, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
+    let mut cmd = git_command(root, args);
     match tokio::time::timeout(Duration::from_secs(timeout), cmd.output()).await {
         Err(_) => (124, b"git command timed out".to_vec()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (127, b"git executable not found".to_vec()),
@@ -182,17 +194,25 @@ async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u
 }
 
 /// run git; returns (ok, output)
-async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+async fn run_git(root: Option<&str>, args: &[&str], accept: &[i32]) -> (bool, String) {
+    let mut cmd = git_command(root, args);
     let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Err(_) => return (false, "git command timed out".into()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return (false, "git executable not found".into()),
         Ok(Err(e)) => return (false, e.to_string()),
         Ok(Ok(o)) => o,
     };
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    // python runs this in text mode: strict utf-8 (stdout is decoded before stderr, and a
+    // decode error wins over the return code) and universal newlines
+    let decode = |bytes: &[u8]| pyos::decode_utf8(bytes).map(|s| pyos::universal_newlines(&s));
+    let stdout = match decode(&out.stdout) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => return (false, e),
+    };
+    let stderr = match decode(&out.stderr) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => return (false, e),
+    };
     let rc = out.status.code().unwrap_or(-1);
     if !accept.contains(&rc) {
         let msg = if !stderr.is_empty() {
@@ -207,7 +227,7 @@ async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
     (true, if stdout.is_empty() { stderr } else { stdout })
 }
 
-async fn git(root: &str, args: &[&str]) -> (bool, String) {
+async fn git(root: Option<&str>, args: &[&str]) -> (bool, String) {
     run_git(root, args, &[0]).await
 }
 
@@ -1161,15 +1181,27 @@ impl Coder {
 
     // ---------------- git
 
-    fn git_root(&self, sandbox: &str, subpath: &str) -> R<String> {
-        let full = self.full_sandbox(sandbox)?;
+    /// python `_git_root`: the folder git runs in, `None` when no sandbox_paths are configured
+    /// (python's `_get_full_sandbox_path` returns None and git then runs in the server's cwd)
+    fn git_root(&self, sandbox: &str, subpath: &str) -> R<Option<String>> {
+        let full = self.get_full_sandbox_path(sandbox)?;
         if subpath.is_empty() {
             return Ok(full);
         }
-        ol_core::paths::sandbox_path(&full, Some(subpath)).map_err(|e| e.to_string())
+        // python: core.sandbox_path(None, subpath) fails on `None.replace`
+        let base = full.ok_or_else(|| "'NoneType' object has no attribute 'replace'".to_string())?;
+        ol_core::paths::sandbox_path(&base, Some(subpath)).map(Some).map_err(|e| e.to_string())
     }
 
-    fn check_git_paths(root: &str, paths: &[String]) -> R<()> {
+    /// the root as a path for `os.path` calls: python raises TypeError on a None root
+    fn root_str(root: &Option<String>) -> R<&str> {
+        root.as_deref().ok_or_else(|| NONE_ROOT_ERR.to_string())
+    }
+
+    /// python `_check_git_paths`: `os.path.dirname(root)` runs before the loop, so a None root
+    /// raises even when there are no paths
+    fn check_git_paths(root: Option<&str>, paths: &[String]) -> R<()> {
+        let root = root.ok_or_else(|| NONE_ROOT_ERR.to_string())?;
         let sandbox_root = pyos::dirname(root);
         for p in paths {
             let full = pyos::normpath(&pyos::join(root, p));
@@ -1180,14 +1212,19 @@ impl Coder {
         Ok(())
     }
 
-    fn route_git_repos(&self, q: &Map<String, Value>) -> Value {
+    fn route_git_repos(&self, q: &Map<String, Value>) -> anyhow::Result<Value> {
         let sandbox = sget(q, "sandbox");
         if sandbox.is_empty() {
-            return self.result("no sandbox given", false);
+            return Ok(self.result("no sandbox given", false));
         }
-        let root = match self.full_sandbox(&sandbox) {
+        let root = match self.get_full_sandbox_path(&sandbox) {
             Ok(r) => r,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        // python: with no sandbox_paths the root is None and os.path.join(None, '.git') raises
+        // outside any try, so the exception escapes the route
+        let Some(root) = root else {
+            return Err(err(NONE_ROOT_ERR));
         };
         let blacklist = self.blacklist();
         let max_depth = 6usize;
@@ -1216,7 +1253,7 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
-        json!({"repos": repos})
+        Ok(json!({"repos": repos}))
     }
 
     async fn route_git_status(&self, q: &Map<String, Value>) -> Value {
@@ -1228,14 +1265,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let (ok, _) = git(root.as_deref(), &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return json!({"is_repo": false, "read_only": self.read_only()});
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (ok_b, b_out) = git(&root, &["branch", "--format=%(refname:short)"]).await;
+        let (_, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok_b, b_out) = git(root.as_deref(), &["branch", "--format=%(refname:short)"]).await;
         let branches: Vec<String> = if ok_b { b_out.split('\n').map(|b| b.trim()).filter(|b| !b.is_empty()).map(String::from).collect() } else { Vec::new() };
-        let (rc, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1", "-z"]), 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["status", "--porcelain=v1", "-z"]), 15).await;
         let changes = if rc == 0 { parse_porcelain_z(&raw) } else { Vec::new() };
         json!({"is_repo": true, "branch": branch, "branches": branches, "changes": changes, "read_only": self.read_only()})
     }
@@ -1250,12 +1287,12 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let (ok, _) = git(root.as_deref(), &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return Ok(json!({"is_repo": false}));
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (_, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             return Ok(json!({"is_repo": true, "branch": branch, "log": []}));
         }
@@ -1285,7 +1322,11 @@ impl Coder {
 
     /// python `_check_git_paths` + `abs_paths` over the request's `paths`, checked in order:
     /// the first bad item stops with python's error text
-    fn checked_git_paths(root: &str, paths: &Value) -> R<Vec<String>> {
+    fn checked_git_paths(root: Option<&str>, paths: &Value) -> R<Vec<String>> {
+        // python's dirname(root) inside _check_git_paths runs before the paths are iterated
+        if root.is_none() {
+            return Err(NONE_ROOT_ERR.to_string());
+        }
         let mut out = Vec::new();
         for item in Self::py_path_items(paths)? {
             let p = item?;
@@ -1308,14 +1349,17 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let paths = match Self::checked_git_paths(&root, &paths_val) {
+        let paths = match Self::checked_git_paths(root.as_deref(), &paths_val) {
             Ok(p) => p,
             Err(e) => return self.result(e, false),
         };
-        let abs: Vec<String> = paths.iter().map(|p| pyos::normpath(&pyos::join(&root, p))).collect();
+        let abs: Vec<String> = match Self::root_str(&root) {
+            Ok(r) => paths.iter().map(|p| pyos::normpath(&pyos::join(r, p))).collect(),
+            Err(e) => return self.result(e, false),
+        };
         let mut args: Vec<&str> = if unstage { vec!["restore", "--staged", "--"] } else { vec!["add", "--"] };
         args.extend(abs.iter().map(|s| s.as_str()));
-        let (ok, out) = git(&root, &args).await;
+        let (ok, out) = git(root.as_deref(), &args).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1335,7 +1379,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = git(&root, &["commit", "-m", &message]).await;
+        let (ok, out) = git(root.as_deref(), &["commit", "-m", &message]).await;
         self.result(out, ok)
     }
 
@@ -1352,14 +1396,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = git(&root, &["switch", &name]).await;
+        let (ok, out) = git(root.as_deref(), &["switch", &name]).await;
         if !ok {
             return self.result(out, false);
         }
         self.result(if out.is_empty() { format!("switched to {}", name) } else { out }, true)
     }
 
-    async fn pick_remote(root: &str) -> Option<String> {
+    async fn pick_remote(root: Option<&str>) -> Option<String> {
         let (ok, out) = git(root, &["remote"]).await;
         let remotes: Vec<String> = if ok { out.split_whitespace().map(String::from).collect() } else { Vec::new() };
         if remotes.is_empty() {
@@ -1377,23 +1421,23 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
         if branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let has_upstream = upstream.contains('/');
         let (target, (rc, raw)) = if has_upstream {
-            (upstream.clone(), run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
+            (upstream.clone(), run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
         } else {
-            (format!("{}/{}", remote, branch), run_git_bytes(&root, &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
+            (format!("{}/{}", remote, branch), run_git_bytes(root.as_deref(), &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
         };
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
@@ -1402,13 +1446,13 @@ impl Coder {
         let ahead = parse_log(&raw);
         let mut behind = 0i64;
         if has_upstream {
-            let (ok, out) = git(&root, &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
+            let (ok, out) = git(root.as_deref(), &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
             let o = out.trim();
             if ok && !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()) {
                 behind = o.parse().unwrap_or(0);
             }
         }
-        let (_, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1"]), 15).await;
+        let (_, raw) = run_git_bytes(root.as_deref(), &s(&["status", "--porcelain=v1"]), 15).await;
         let dirty = !String::from_utf8_lossy(&raw).trim().is_empty();
         json!({
             "branch": branch,
@@ -1434,21 +1478,21 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let args: Vec<String> = if let Some((up_remote, up_branch)) = upstream.split_once('/') {
             vec!["push".into(), up_remote.into(), format!("{}:{}", branch, up_branch)]
         } else {
             vec!["push".into(), "-u".into(), remote, branch]
         };
-        let (rc, raw) = run_git_bytes(&root, &args, 180).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &args, 180).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git push failed".into() } else { out }, false);
@@ -1466,7 +1510,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
             return Ok(self.result(if t.is_empty() { "git log failed".into() } else { t }, false));
@@ -1483,17 +1527,20 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return Err(self.result("sandbox and path are both required", false));
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return Err(self.result(e, false)),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return Err(self.result(e, false)),
+        };
         let (rc, raw) = if untracked {
-            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
         } else if staged {
-            run_git_bytes(&root, &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
         } else {
-            run_git_bytes(&root, &[String::from("diff"), "--".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--".into(), abs], 15).await
         };
         Ok((rc, raw, untracked))
     }
@@ -1536,22 +1583,22 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes", false);
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("fetch"), remote, "--prune".into()], 120).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("fetch"), remote, "--prune".into()], 120).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git fetch failed".into() } else { out }, false);
         }
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let mut incoming = Vec::new();
         if ok && upstream.trim().contains('/') {
-            let (rc2, raw2) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream.trim()), "-n100".into()], 15).await;
+            let (rc2, raw2) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream.trim()), "-n100".into()], 15).await;
             if rc2 == 0 {
                 incoming = parse_log(&raw2);
             }
@@ -1571,14 +1618,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pulling", false);
         }
-        let (rc, raw) = run_git_bytes(&root, &s(&["pull"]), 120).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["pull"]), 120).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
-            let (_, craw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+            let (_, craw) = run_git_bytes(root.as_deref(), &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
             let craw = String::from_utf8_lossy(&craw).to_string();
             let conflicts: Vec<&str> = py_splitlines(&craw).into_iter().filter(|l| !l.trim().is_empty()).collect();
             if !conflicts.is_empty() {
@@ -1607,7 +1654,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = if checkout { git(&root, &["switch", "-c", &name]).await } else { git(&root, &["branch", &name]).await };
+        let (ok, out) = if checkout { git(root.as_deref(), &["switch", "-c", &name]).await } else { git(root.as_deref(), &["branch", &name]).await };
         if !ok {
             return self.result(out, false);
         }
@@ -1628,11 +1675,11 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (_, current) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (_, current) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if current.trim() == name {
             return self.result("cannot delete the branch you are currently on", false);
         }
-        let (ok, out) = git(&root, &["branch", if force { "-D" } else { "-d" }, &name]).await;
+        let (ok, out) = git(root.as_deref(), &["branch", if force { "-D" } else { "-d" }, &name]).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1648,7 +1695,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (rc, raw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
         if rc != 0 {
             return json!({"conflicts": []});
         }
@@ -1670,14 +1717,17 @@ impl Coder {
         if !matches!(strategy.as_str(), "ours" | "theirs" | "both") {
             return self.result("strategy must be 'ours', 'theirs', or 'both'", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return self.result(e, false),
+        };
         let (ok, out) = match strategy.as_str() {
-            "ours" => git(&root, &["checkout", "--ours", "--", &rel_path]).await,
-            "theirs" => git(&root, &["checkout", "--theirs", "--", &rel_path]).await,
+            "ours" => git(root.as_deref(), &["checkout", "--ours", "--", &rel_path]).await,
+            "theirs" => git(root.as_deref(), &["checkout", "--theirs", "--", &rel_path]).await,
             _ => {
                 let re = regex::Regex::new(r"(?s)<<<<<<< [^\n]*\n(.*?)=======\n(.*?)>>>>>>> [^\n]*\n").unwrap();
                 match pyos::read_text(&abs) {
@@ -1695,7 +1745,7 @@ impl Coder {
         if !ok {
             return self.result(out, false);
         }
-        git(&root, &["add", "--", &abs]).await;
+        git(root.as_deref(), &["add", "--", &abs]).await;
         self.result(format!("resolved {} ({})", rel_path, strategy), true)
     }
 
@@ -1708,12 +1758,15 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
-        let (ok, out) = git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return self.result(e, false),
+        };
+        let (ok, out) = git(root.as_deref(), &["restore", "--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1900,7 +1953,7 @@ impl Module for Coder {
             "delete" => self.route_delete(&b),
             "duplicate" => self.route_duplicate(&b),
             "search" => self.route_search(&b)?,
-            "git_repos" => self.route_git_repos(q),
+            "git_repos" => self.route_git_repos(q)?,
             "git_status" => self.route_git_status(q).await,
             "git_recent" => self.route_git_recent(q).await?,
             "git_stage" => self.route_git_stage(&b, false).await,
@@ -2035,10 +2088,41 @@ mod tests {
         assert_eq!(chars, vec!["a".to_string(), "b".to_string()]);
         // the escape check runs in order and reports python's message
         let root = "/x/sb/repo";
-        let ok = Coder::checked_git_paths(root, &json!(["a.txt"])).unwrap();
+        let ok = Coder::checked_git_paths(Some(root), &json!(["a.txt"])).unwrap();
         assert_eq!(ok, vec!["a.txt".to_string()]);
-        let esc = Coder::checked_git_paths(root, &json!(["../../etc"])).err();
+        let esc = Coder::checked_git_paths(Some(root), &json!(["../../etc"])).err();
         assert_eq!(esc.as_deref(), Some("path escapes the sandbox: ../../etc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_output_is_decoded_strictly_like_python_text_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let git_in = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&root).args(args).status().unwrap();
+        assert!(git_in(&["init", "-q"]).success());
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.txt")), "x").unwrap();
+        assert!(git_in(&["add", "--", "."]).success());
+        // `ls-files -z` prints the raw name bytes: python's text-mode decode raises, and that
+        // error is what the route reports
+        let (ok, out) = rt.block_on(run_git(Some(&root), &["ls-files", "-z"], &[0]));
+        assert!(!ok);
+        assert_eq!(out, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte");
+        // without a root, git runs in the server's own working directory (python cwd=None)
+        let (ok, out) = rt.block_on(run_git(None, &["--version"], &[0]));
+        assert!(ok && out.starts_with("git version"), "{out}");
+    }
+
+    #[test]
+    fn none_root_raises_python_os_path_error() {
+        // python: with no sandbox_paths `_check_git_paths` fails in os.path.dirname even when
+        // there is nothing to check
+        assert_eq!(Coder::check_git_paths(None, &[]).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::checked_git_paths(None, &json!([])).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::root_str(&None).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::root_str(&Some("/x".into())).unwrap(), "/x");
     }
 
     /// one test owns the process-wide config (set_for_tests), so every tool check lives here
@@ -2093,5 +2177,17 @@ mod tests {
             .unwrap();
         assert_eq!(out["truncated"], false);
         assert_eq!(out["results"][0], json!({"file": "a.py", "line": 2, "text": "# foo bar"}));
+
+        // no sandbox_paths: python's _git_root is None (git runs in the server's cwd), and
+        // the repo listing dies on os.path.join(None, '.git') outside any try
+        ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
+            "sandbox_paths": [],
+            "folder_blacklist": [],
+            "read-only": false,
+        }}}}));
+        assert!(matches!(c.git_root("sb", ""), Ok(None)));
+        assert_eq!(c.git_root("sb", "repo").err().as_deref(), Some("'NoneType' object has no attribute 'replace'"));
+        let q = Map::from_iter([("sandbox".to_string(), json!("sb"))]);
+        assert_eq!(c.route_git_repos(&q).err().map(|e| e.to_string()).as_deref(), Some(NONE_ROOT_ERR));
     }
 }

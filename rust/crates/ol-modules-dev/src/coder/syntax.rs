@@ -15,7 +15,8 @@ use tree_sitter::{Language, Node, Parser};
 pub fn detect_language_from_path(path: &str) -> Option<&'static str> {
     let file_name = std::path::Path::new(path).file_name()?.to_str()?;
     let lower = file_name.to_ascii_lowercase();
-    for (suffix, lang) in [(".app.src", "erlang"), (".rs.html", "rshtml"), ("kitty.conf", "kitty"), (".env", "dotenv")] {
+    // tree-sitter-language-pack checks these compound suffixes before the plain extension
+    for (suffix, lang) in [(".app.src", "erlang"), (".j2.sql", "jinja2"), (".rs.html", "rshtml"), ("kitty.conf", "kitty"), (".env", "dotenv")] {
         if lower.ends_with(suffix) {
             return Some(lang);
         }
@@ -67,7 +68,8 @@ pub fn detect_language_from_path(path: &str) -> Option<&'static str> {
         "vim" => "vim",
         "proto" => "proto",
         "graphql" | "gql" => "graphql",
-        "tf" | "hcl" => "hcl",
+        "tf" => "terraform",
+        "hcl" => "hcl",
         "cmake" => "cmake",
         "mk" => "make",
         "dockerfile" => "dockerfile",
@@ -327,6 +329,9 @@ mod tests {
         assert_eq!(detect_language_from_path("/a/b.py"), Some("python"));
         assert_eq!(detect_language_from_path("/a/b.txt"), Some("vimdoc"));
         assert_eq!(detect_language_from_path("/a/Makefile"), None);
+        assert_eq!(detect_language_from_path("/a/main.tf"), Some("terraform"));
+        assert_eq!(detect_language_from_path("/a/query.j2.sql"), Some("jinja2"));
+        assert_eq!(detect_language_from_path("/a/query.sql"), Some("sql"));
     }
 
     #[test]
