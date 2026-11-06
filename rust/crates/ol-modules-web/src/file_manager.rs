@@ -348,15 +348,13 @@ fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
     }
 }
 
-fn move_inner(src: &str, dst: &str) -> Result<(), String> {
+/// python `Path(dst).parent.mkdir(parents=True, exist_ok=True)`, which move and copy run before their body
+fn make_parent(dst: &str) -> Result<(), String> {
     let parent = py_parent(dst);
-    fs::create_dir_all(&parent).map_err(|e| os_err(&e, &parent))?;
-    shutil_move(src, dst)
+    fs::create_dir_all(&parent).map_err(|e| os_err(&e, &parent))
 }
 
 fn copy_inner(src: &str, dst: &str) -> Result<(), String> {
-    let parent = py_parent(dst);
-    fs::create_dir_all(&parent).map_err(|e| os_err(&e, &parent))?;
     if Path::new(src).is_dir() {
         copytree(src, dst, false)
     } else {
@@ -492,18 +490,42 @@ pub fn system_info() -> String {
     out.trim().to_string()
 }
 
-/// the `(name, value)` pair of a required tool argument; the python TypeError text when it is not a str
-fn arg_str(a: &Map<String, Value>, name: &str) -> Result<String, String> {
+/// python 3.14 `Path(x)` TypeError text for a non-str path argument (pathlib's own message, not `os.fspath`'s)
+fn path_type_err(other: &Value) -> String {
+    format!("argument should be a str or an os.PathLike object where __fspath__ returns a str, not '{}'", py_type_name(other))
+}
+
+fn missing_arg(name: &str) -> String {
+    format!("missing argument '{}'", name)
+}
+
+/// the value of a path argument as `Path(value)` accepts it
+fn path_arg(a: &Map<String, Value>, name: &str) -> Result<String, String> {
     match a.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
-        Some(other) => Err(format!("expected str, bytes or os.PathLike object, not {}", py_type_name(other))),
-        None => Err(format!("missing argument '{}'", name)),
+        Some(other) => Err(path_type_err(other)),
+        None => Err(missing_arg(name)),
     }
 }
 
-/// `arg_str` for tools whose python body has no try block (the TypeError escapes the tool)
+/// `path_arg` for tools whose python body has no try block (the TypeError escapes the tool)
 fn must(a: &Map<String, Value>, name: &str) -> anyhow::Result<String> {
-    arg_str(a, name).map_err(|m| anyhow!(m))
+    path_arg(a, name).map_err(|m| anyhow!(m))
+}
+
+/// python `shutil.move(src, dst)` with a non-str `src`: the error depends on whether `dst` is a directory,
+/// because `shutil.move` only calls `os.stat(src)` / `os.fspath(src)` on that branch
+fn move_src_type_err(dst: &str, src: &Value) -> String {
+    let t = py_type_name(src);
+    if !Path::new(dst).is_dir() {
+        return format!("rename: src should be string, bytes or os.PathLike, not {}", t);
+    }
+    match src {
+        // an int is taken as a file descriptor by os.stat, then os.fspath rejects it
+        Value::Bool(_) => format!("expected str, bytes or os.PathLike object, not {}", t),
+        Value::Number(n) if !n.is_f64() => format!("expected str, bytes or os.PathLike object, not {}", t),
+        _ => format!("stat: path should be string, bytes, os.PathLike or integer, not {}", t),
+    }
 }
 
 /// the keyword parameters of each `FileManager` tool method
@@ -579,7 +601,8 @@ impl FileManager {
         match fs::read(path) {
             Err(e) => Ok(self.fail(os_err(&e, path))),
             // python returns the raw bytes inside result(), and the tool loop's json.dumps() of that
-            // result raises TypeError outside its try block. This mirrors that failure.
+            // result raises TypeError outside its try block, which escapes the loop. A module cannot
+            // reproduce that escape: ol-core turns this Err into an "Error while executing tool" result.
             Ok(_) => Err(anyhow!("Object of type bytes is not JSON serializable")),
         }
     }
@@ -620,15 +643,41 @@ impl FileManager {
         }
     }
 
-    fn move_path(&self, src: &str, dst: &str) -> Value {
-        match move_inner(src, dst) {
+    /// python `move`: `Path(dst)` and its parent mkdir run before `shutil.move`, so dst is checked first
+    fn move_tool(&self, a: &Map<String, Value>) -> Value {
+        let dst = match path_arg(a, "dst") {
+            Ok(d) => d,
+            Err(m) => return self.fail(m),
+        };
+        if let Err(m) = make_parent(&dst) {
+            return self.fail(m);
+        }
+        let src = match a.get("src") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => return self.fail(move_src_type_err(&dst, other)),
+            None => return self.fail(missing_arg("src")),
+        };
+        match shutil_move(&src, &dst) {
             Ok(()) => self.base.result(format!("Moved {} -> {}", src, dst), true),
             Err(m) => self.fail(m),
         }
     }
 
-    fn copy_path(&self, src: &str, dst: &str) -> Value {
-        match copy_inner(src, dst) {
+    /// python `copy`: `Path(dst)` and its parent mkdir run before `Path(src).is_dir()`
+    fn copy_tool(&self, a: &Map<String, Value>) -> Value {
+        let dst = match path_arg(a, "dst") {
+            Ok(d) => d,
+            Err(m) => return self.fail(m),
+        };
+        if let Err(m) = make_parent(&dst) {
+            return self.fail(m);
+        }
+        let src = match a.get("src") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => return self.fail(path_type_err(other)),
+            None => return self.fail(missing_arg("src")),
+        };
+        match copy_inner(&src, &dst) {
             Ok(()) => self.base.result(format!("Copied {} -> {}", src, dst), true),
             Err(m) => self.fail(m),
         }
@@ -697,23 +746,17 @@ impl Module for FileManager {
             // try blocks in python: a bad argument comes back as an error result
             "write" | "append" => {
                 let mode = if method == "append" { "a" } else { "w" };
-                Ok(match arg_str(a, "path") {
+                Ok(match path_arg(a, "path") {
                     Ok(p) => self.write_file(&p, a.get("content").unwrap_or(&null), mode),
                     Err(m) => self.fail(m),
                 })
             }
-            "mkdir" => Ok(match arg_str(a, "path") {
+            "mkdir" => Ok(match path_arg(a, "path") {
                 Ok(p) => self.mkdir(&p),
                 Err(m) => self.fail(m),
             }),
-            "move" => Ok(match (arg_str(a, "src"), arg_str(a, "dst")) {
-                (Ok(src), Ok(dst)) => self.move_path(&src, &dst),
-                (Err(m), _) | (_, Err(m)) => self.fail(m),
-            }),
-            "copy" => Ok(match (arg_str(a, "src"), arg_str(a, "dst")) {
-                (Ok(src), Ok(dst)) => self.copy_path(&src, &dst),
-                (Err(m), _) | (_, Err(m)) => self.fail(m),
-            }),
+            "move" => Ok(self.move_tool(a)),
+            "copy" => Ok(self.copy_tool(a)),
             _ => anyhow::bail!("'{}' object has no attribute '{}'", meta::CLASS_NAME, method),
         }
     }
@@ -782,7 +825,44 @@ mod tests {
         assert_eq!(bytes_err.to_string(), "Object of type bytes is not JSON serializable");
         // a non-str path escapes the tool as a TypeError (no try block in list)
         let type_err = call(&m, "list", json!({"path": 5})).await.unwrap_err();
-        assert_eq!(type_err.to_string(), "expected str, bytes or os.PathLike object, not int");
+        assert_eq!(
+            type_err.to_string(),
+            "argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int'"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_and_copy_check_dst_and_make_its_parent_before_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let m = fm();
+
+        // python makes dst's parent before shutil.move sees the non-str src, then os.rename rejects it
+        let mv = call(&m, "move", json!({"src": 5, "dst": format!("{}/new/parent/x.txt", root)})).await.unwrap();
+        assert_eq!(
+            mv,
+            json!({"status": "error", "content": "rename: src should be string, bytes or os.PathLike, not int"})
+        );
+        assert!(Path::new(&format!("{}/new/parent", root)).is_dir());
+
+        // a bad dst is reported first when src is bad too
+        let both = call(&m, "move", json!({"src": 5, "dst": null})).await.unwrap();
+        assert_eq!(
+            both,
+            json!({"status": "error", "content": "argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'NoneType'"})
+        );
+
+        // copy: dst's parent is created, then Path(src) rejects the int
+        let cp = call(&m, "copy", json!({"src": 5, "dst": format!("{}/c/d/y.txt", root)})).await.unwrap();
+        assert_eq!(
+            cp,
+            json!({"status": "error", "content": "argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int'"})
+        );
+        assert!(Path::new(&format!("{}/c/d", root)).is_dir());
+
+        // into an existing directory, shutil.move's os.fspath wording applies
+        let into = call(&m, "move", json!({"src": 5, "dst": root.clone()})).await.unwrap();
+        assert_eq!(into, json!({"status": "error", "content": "expected str, bytes or os.PathLike object, not int"}));
     }
 
     #[tokio::test]
