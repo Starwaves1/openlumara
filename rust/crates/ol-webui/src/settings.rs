@@ -435,8 +435,10 @@ mod tests {
             keys,
             ["appearance", "audio", "system_prompt", "system_logs", "core", "api", "model", "module_library", "channels", "user_channels", "modules", "user_modules"]
         );
-        assert_eq!(cats["core"]["order"], 0);
-        assert_eq!(cats["api"]["order"], 1);
+        // python: appearance takes 0, audio takes 1 without advancing the counter, so the first
+        // config section (core) gets 1 and the next one 2
+        assert_eq!(cats["core"]["order"], 1);
+        assert_eq!(cats["api"]["order"], 2);
         assert_eq!(cats["channels"]["order"], 10);
         assert_eq!(cats["module_library"]["order"], 12);
         assert_eq!(cats["user_modules"]["title"], "Installed Modules");

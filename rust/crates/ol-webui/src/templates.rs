@@ -86,7 +86,9 @@ fn render_slot(
     let module = template_name.split('/').next().unwrap_or("");
     let module_config = JValue::from_serialize(host.module_config(module));
     let tmpl = env.get_template(template_name)?;
-    let module_state = tmpl.eval_to_state(minijinja::context! { module_config => module_config })?;
+    // python `make_module(vars=...)`: runs the module template and keeps its top-level names
+    let captured = tmpl.render_captured(minijinja::context! { module_config => module_config })?;
+    let module_state = captured.state();
     if !module_state.exports().contains(&slot_name) {
         return Ok(None);
     }
@@ -98,9 +100,9 @@ fn render_slot(
         .unwrap_or(false);
     let out = if wants_ctx {
         let kwargs = Kwargs::from_iter([("ctx", context_snapshot(state))]);
-        mac.call(&module_state, &[JValue::from(kwargs)])?
+        mac.call(module_state, &[JValue::from(kwargs)])?
     } else {
-        mac.call(&module_state, &[])?
+        mac.call(module_state, &[])?
     };
     Ok(Some(out.to_string()))
 }
@@ -126,11 +128,12 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
         Ok(None)
     });
 
-    env.add_function("url_for", |name: String, kwargs: Kwargs| -> Result<String, Error> {
+    // starlette's url_for returns a str subclass that jinja2 autoescapes with markupsafe
+    env.add_function("url_for", |name: String, kwargs: Kwargs| -> Result<JValue, Error> {
         let path: String = kwargs.get("path")?;
         kwargs.assert_all_used()?;
         if name == "assets" {
-            Ok(format!("/assets/{}", path))
+            Ok(JValue::from_safe_string(crate::util::markup_escape(&format!("/assets/{}", path))))
         } else {
             Err(Error::new(ErrorKind::InvalidOperation, format!("No route exists for name \"{}\" and params \"path\".", name)))
         }
@@ -379,7 +382,8 @@ mod tests {
                 minijinja::context! { config => JValue::from_serialize(serde_json::json!({"title": "T<"})), version => 2.0 },
             )
             .unwrap();
-        assert_eq!(out, "A<b>m1top true</b>|Pctx:hi|MODALtrue|[My Panel:<svg/>]|/assets/js/x.js|T&lt;|true|2.0");
+        // jinja2 renders python bools as True/False; url_for output is markupsafe-escaped (keeps '/')
+        assert_eq!(out, "A<b>m1top True</b>|Pctx:hi|MODALTrue|[My Panel:<svg/>]|/assets/js/x.js|T&lt;|True|2.0");
         let logs = host.logs.lock().join("\n");
         assert!(logs.contains("skipping UI extension 'm2/page.html'"), "{}", logs);
 

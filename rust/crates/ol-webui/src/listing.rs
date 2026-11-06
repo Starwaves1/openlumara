@@ -68,6 +68,12 @@ fn parse_key_date(key: &str) -> Option<(NaiveDate, usize)> {
     Some((date, parts.len()))
 }
 
+/// `dt - tz_offset_min minutes`; None where python would raise OverflowError
+/// (the offset comes straight from the query string)
+fn shift_back(dt: NaiveDateTime, tz_offset_min: i64) -> Option<NaiveDateTime> {
+    dt.checked_sub_signed(Duration::try_minutes(tz_offset_min)?)
+}
+
 /// human label for a day/week/month group key (see group_key)
 pub fn day_label_from_key_at(key: &str, tz_offset_min: i64, now: NaiveDateTime) -> String {
     if key.is_empty() {
@@ -80,7 +86,7 @@ pub fn day_label_from_key_at(key: &str, tz_offset_min: i64, now: NaiveDateTime) 
     if nparts == 2 {
         return format!("{} {}", month_name(date.month()), date.year());
     }
-    let today = (now - Duration::minutes(tz_offset_min)).date();
+    let Some(today) = shift_back(now, tz_offset_min).map(|d| d.date()) else { return "Undated".into() };
     let diff_days = (today - date).num_days();
     if diff_days == 0 {
         return "Today".into();
@@ -133,7 +139,8 @@ pub fn local_day(updated: &str, tz_offset_min: i64) -> String {
         return String::new();
     }
     let Some(dt) = parse_iso(updated) else { return String::new() };
-    (dt - Duration::minutes(tz_offset_min)).date().format("%Y-%m-%d").to_string()
+    let Some(local) = shift_back(dt, tz_offset_min) else { return String::new() };
+    local.date().format("%Y-%m-%d").to_string()
 }
 
 /// sidebar grouping tiers (ISO weeks, Monday start): this week -> 'YYYY-MM-DD',
@@ -143,7 +150,7 @@ pub fn group_key_at(updated: &str, tz_offset_min: i64, now: NaiveDateTime) -> St
     if day.is_empty() {
         return String::new();
     }
-    let today = (now - Duration::minutes(tz_offset_min)).date();
+    let Some(today) = shift_back(now, tz_offset_min).map(|d| d.date()) else { return String::new() };
     let this_monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
     let last_monday = this_monday - Duration::days(7);
     let iso = |d: NaiveDate| d.format("%Y-%m-%d").to_string();
@@ -234,5 +241,16 @@ mod tests {
         assert_eq!(local_day("2026-10-14T01:00:00+02:00", 0), "2026-10-13");
         assert_eq!(local_day("2026-10-14T01:00:00", 120), "2026-10-13");
         assert_eq!(local_day("2026-10-14", 0), "2026-10-14");
+    }
+
+    #[test]
+    fn hostile_tz_offset_does_not_panic() {
+        // tz_offset comes from the query string: out-of-range values must not panic
+        let now = at("2026-10-14T12:00:00");
+        assert_eq!(local_day("2026-10-14T01:00:00", i64::MAX), "");
+        assert_eq!(group_key_at("2026-10-14T01:00:00", i64::MAX, now), "");
+        assert_eq!(day_label_from_key_at("2026-10-14", i64::MIN, now), "Undated");
+        // a sane offset still works
+        assert_eq!(day_label_from_key_at("2026-10-14", 0, now), "Today");
     }
 }

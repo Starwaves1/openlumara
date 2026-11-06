@@ -85,6 +85,23 @@ pub fn py_slice<T: Clone>(items: &[T], start: i64, stop: i64) -> Vec<T> {
     items[s as usize..e as usize].to_vec()
 }
 
+/// markupsafe `escape` (what jinja2 autoescape applies to plain str values):
+/// `& < > " '` become `&amp; &lt; &gt; &#34; &#39;`, nothing else is touched
+pub fn markup_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// python `html.escape(text, quote=True)`
 pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -156,5 +173,6 @@ mod tests {
         assert_eq!(or_strip(Some(&json!(0)), "").unwrap(), "");
         assert_eq!(or_strip(Some(&json!(5)), "").unwrap_err(), "'int' object has no attribute 'strip'");
         assert!(py_eq(&json!({"a": [1, 2.0]}), &json!({"a": [1.0, 2]})));
+        assert_eq!(markup_escape("/assets/a&b'<\"x\">"), "/assets/a&amp;b&#39;&lt;&#34;x&#34;&gt;");
     }
 }

@@ -53,7 +53,9 @@ impl SessionSigner {
         let sig = URL_SAFE_NO_PAD.decode(sig).ok()?;
         self.mac(msg).verify_slice(&sig).ok()?;
         let ts: i64 = ts.parse().ok()?;
-        if now - ts > self.max_age {
+        // itsdangerous: an age beyond max_age is expired, a future timestamp is rejected
+        let age = now - ts;
+        if age < 0 || age > self.max_age {
             return None;
         }
         match serde_json::from_slice::<Value>(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()? {
@@ -101,9 +103,8 @@ pub fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<Strin
 /// timing-safe string comparison (python secrets.compare_digest)
 pub fn compare_digest(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
+    // python returns False immediately for different lengths too
     if a.len() != b.len() {
-        // still do a comparison of equal work so the timing doesn't leak much
-        let _ = a.as_bytes().ct_eq(a.as_bytes());
         return false;
     }
     a.as_bytes().ct_eq(b.as_bytes()).into()
@@ -122,6 +123,8 @@ mod tests {
         assert_eq!(s.unsign_at(&v, 1000 + 86400).unwrap(), sess);
         // expired
         assert!(s.unsign_at(&v, 1000 + 86401).is_none());
+        // signed in the future (clock skew or forgery) is rejected
+        assert!(s.unsign_at(&v, 999).is_none());
         // wrong secret
         assert!(SessionSigner::new("other", 86400).unsign_at(&v, 1000).is_none());
         // tampered payload
