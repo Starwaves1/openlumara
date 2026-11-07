@@ -129,21 +129,52 @@ pub fn filter_categories(values: &[Value]) -> anyhow::Result<Vec<String>> {
     Ok(cats)
 }
 
+/// python `_extract` keeps a bool inside a list-valued field (bool is an int subclass) as str(True) = "True".
+/// ol-core's extract keeps only strings and numbers, so the bools are spelled out for ranking only.
+fn spell_list_bools(v: &Value) -> Value {
+    match v {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| match i {
+                    Value::Bool(b) => Value::String(if *b { "True" } else { "False" }.to_string()),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// python `search` ranking + line formatting over the flattened chat entries.
 /// an empty query (python `not query`) and an empty entry list both give no lines.
+/// ranking runs on copies that carry the entry's position in "idx", so lines are formatted from the original values.
 pub fn search_lines(entries: &[Value], query: &str) -> Vec<String> {
     let mut weights = IndexMap::new();
     weights.insert("title".to_string(), 2.0);
     weights.insert("category".to_string(), 1.0);
     weights.insert("text".to_string(), 1.0);
-    let results = ol_core::search::search(entries, query, "id", Some(&weights), 20);
+    let ranking_entries: Vec<Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            json!({
+                "id": e["id"],
+                "idx": i,
+                "title": spell_list_bools(&e["title"]),
+                "category": spell_list_bools(&e["category"]),
+                "text": e["text"],
+            })
+        })
+        .collect();
+    let results = ol_core::search::search(&ranking_entries, query, "id", Some(&weights), 20);
     let mut lines = Vec::new();
     for hit in results {
-        let e = &hit.entry;
+        let Some(e) = hit.entry["idx"].as_u64().and_then(|i| entries.get(i as usize)) else { continue };
         let mut line = format!("[{}] \"{}\" (score {:.2})", py_str(&e["category"]), py_str(&e["title"]), hit.score);
         let text = e["text"].as_str().unwrap_or("");
         if !text.is_empty() {
-            if let Some(first) = ol_core::search::make_snippets(text, query, 1, 50).first() {
+            if let Some(first) = util::make_snippets(text, query, 1, 50).first() {
                 line.push_str(&format!("\n  {}", first));
             }
         }
@@ -196,6 +227,10 @@ impl Module for Chats {
         let mut output = Vec::new();
         if self.base.config.get_bool("insert_chat_id") {
             let ch = self.base.channel().ok_or_else(util::no_channel)?;
+            // python Chat.get() raises before the key lookup when no chat is loaded
+            if ch.chat.current().is_none() {
+                anyhow::bail!("No chat is currently loaded!");
+            }
             match ch.chat.get("id") {
                 Some(Value::String(id)) => output.push(format!("current chat ID: {}", id)),
                 other => anyhow::bail!(
@@ -359,6 +394,20 @@ mod tests {
         assert!(search_lines(&entries, "").is_empty());
         assert!(search_lines(&entries, "   ").is_empty());
         assert!(search_lines(&entries, "zebra").is_empty());
+    }
+
+    #[test]
+    fn search_ranks_bools_in_list_title_as_python_strings() {
+        // python _extract keeps True inside a list title as "True", so "true" finds this chat and "false" does not
+        let entries = vec![json!({"id": "c1", "title": ["alpha", true], "category": "", "text": "nothing here"})];
+        assert_eq!(search_lines(&entries, "true").len(), 1);
+        assert!(search_lines(&entries, "false").is_empty());
+    }
+
+    #[test]
+    fn snippet_slices_original_text_at_python_lowercase_position() {
+        // python lowers 'İ' to two code points, so the match position is one past the real one and the slice shifts
+        assert_eq!(util::make_snippets("İxyz", "xyz", 1, 1), vec!["...xyz".to_string()]);
     }
 
     #[test]
