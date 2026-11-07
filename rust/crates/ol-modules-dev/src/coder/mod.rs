@@ -161,15 +161,59 @@ fn parse_py_int(s: &str) -> Option<i64> {
     if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
         return None;
     }
-    if !body.chars().all(|c| c.is_ascii_digit() || c == '_') {
+    if !body.chars().all(|c| py_decimal_value(c).is_some() || c == '_') {
         return None;
     }
     let mut n: i128 = 0;
     for d in body.chars().filter(|c| *c != '_') {
-        n = (n * 10 + d.to_digit(10)? as i128).min(BIG);
+        n = (n * 10 + py_decimal_value(d)? as i128).min(BIG);
     }
     let n = if neg { -n } else { n };
     Some(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
+/// the value of a unicode decimal digit (general category Nd), the characters python's `int()`
+/// accepts: ASCII `0`-`9`, Arabic-Indic `٥`, fullwidth `５`, mathematical bold `𝟓` and so on.
+/// None for every other character.
+fn py_decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii() {
+        return c.to_digit(10);
+    }
+    static ND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let nd = ND.get_or_init(|| regex::Regex::new(r"^\p{Nd}$").expect("static regex"));
+    let is_nd = |ch: char| {
+        let mut buf = [0u8; 4];
+        nd.is_match(ch.encode_utf8(&mut buf))
+    };
+    if !is_nd(c) {
+        return None;
+    }
+    // unicode lays every decimal digit run out as 0..9 starting at a zero, so the offset from the
+    // start of the contiguous run of Nd characters that holds `c` is its digit value
+    let mut start = c as u32;
+    while let Some(prev) = start.checked_sub(1).and_then(char::from_u32) {
+        if !is_nd(prev) {
+            break;
+        }
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// python's returncode for a finished process: the exit status, or -N when the process was
+/// killed by signal N (`subprocess` reports signals as negative numbers)
+fn py_returncode(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return -sig;
+        }
+    }
+    -1
 }
 
 /// python's `(body or {}).get("content", "")` passed on unchanged: only a str can be written or
@@ -422,7 +466,7 @@ async fn run_git_bytes_in(cwd: Option<&str>, args: &[String], timeout: u64) -> (
         Err(_) => (124, b"git command timed out".to_vec()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (127, b"git executable not found".to_vec()),
         Ok(Err(e)) => (1, e.to_string().into_bytes()),
-        Ok(Ok(out)) => (out.status.code().unwrap_or(-1), out.stdout),
+        Ok(Ok(out)) => (py_returncode(out.status), out.stdout),
     }
 }
 
@@ -453,7 +497,7 @@ async fn run_git_in(cwd: Option<&str>, args: &[&str], accept: &[i32]) -> (bool, 
         Ok(s) => pyos::strip(&pyos::universal_newlines(&s)).to_string(),
         Err(e) => return (false, e),
     };
-    let rc = out.status.code().unwrap_or(-1);
+    let rc = py_returncode(out.status);
     if !accept.contains(&rc) {
         let msg = if !stderr.is_empty() {
             stderr
@@ -2519,5 +2563,28 @@ mod tests {
         let out = coder.route_git_log(q.as_object().unwrap()).await.unwrap();
         assert!(out["log"].is_array(), "{out}");
         assert!(out.get("status").is_none(), "{out}");
+    }
+
+    #[test]
+    fn py_int_accepts_unicode_decimal_digits_like_python() {
+        // python int() maps every Nd digit to its value: Arabic-Indic, fullwidth, mathematical bold
+        assert_eq!(parse_py_int("\u{0665}"), Some(5));
+        assert_eq!(parse_py_int(" \u{0665}\u{0665} "), Some(55));
+        assert_eq!(parse_py_int("\u{FF15}"), Some(5));
+        assert_eq!(parse_py_int("\u{1D7D1}"), Some(3));
+        assert_eq!(parse_py_int("\u{0665}_\u{0666}"), Some(56));
+        // letters and other numerics (roman numeral, superscript) are not decimal digits
+        assert_eq!(parse_py_int("\u{2164}"), None);
+        assert_eq!(parse_py_int("\u{00B2}"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_death_reports_negative_returncode_like_python() {
+        // subprocess reports a signal-killed process as -N; a plain exit keeps its code
+        let killed = std::process::Command::new("sh").args(["-c", "kill -9 $$"]).status().unwrap();
+        assert_eq!(py_returncode(killed), -9);
+        let exited = std::process::Command::new("sh").args(["-c", "exit 3"]).status().unwrap();
+        assert_eq!(py_returncode(exited), 3);
     }
 }
