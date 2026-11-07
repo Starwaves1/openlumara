@@ -25,8 +25,8 @@ pub fn parse(text: &str) -> Html {
 const KEEPS_BLANK_TEXT: &[&str] = &[
     "a", "abbr", "acronym", "address", "applet", "b", "bdo", "big", "blockquote", "body", "button", "caption",
     "center", "cite", "code", "dd", "del", "dfn", "div", "dt", "em", "font", "form", "h1", "h2", "h3", "h4", "h5",
-    "h6", "i", "ins", "kbd", "label", "legend", "li", "noscript", "object", "p", "pre", "q", "s", "samp", "small",
-    "span", "strike", "strong", "td", "th", "tt", "u", "var",
+    "h6", "i", "iframe", "ins", "kbd", "label", "legend", "li", "noframes", "noscript", "object", "p", "pre", "q", "s",
+    "samp", "small", "span", "strike", "strong", "td", "th", "tt", "u", "var",
 ];
 
 /// lxml's `remove_blank_text`: libxml2 drops a whitespace-only text node when a tag (or the end of input)
@@ -232,6 +232,13 @@ mod tests {
         assert_eq!(text_of(&all_elements(&parse("<p><img src=x> <b>q</b></p>"))), "q");
         assert_eq!(text_of(&all_elements(&parse("<dl> <dt>a</dt></dl>"))), "a");
         assert_eq!(text_of(&all_elements(&parse("<div><img><!--c--> <b>x</b></div>"))), "x");
+    }
+
+    #[test]
+    fn blank_text_after_iframe_and_noframes_is_kept_like_lxml() {
+        // lxml (libxml2 remove_blank_text) keeps the blank after these: "<div><iframe></iframe> <b>q</b></div>" -> [' ', 'q']
+        assert_eq!(text_of(&all_elements(&parse("<div><iframe></iframe> <b>q</b></div>"))), " q");
+        assert_eq!(text_of(&all_elements(&parse("<div><noframes></noframes> <b>q</b></div>"))), " q");
     }
 
     #[test]

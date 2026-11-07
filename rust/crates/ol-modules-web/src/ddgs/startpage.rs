@@ -26,7 +26,7 @@ static LXML_NON_ELEMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<!--.*?-
 /// lxml's `etree.fromstring` yields no root (ParserError `Document is empty`) when the input holds only
 /// whitespace, comments, processing instructions or a doctype; any text or tag gives a root.
 fn lxml_document_is_empty(page: &str) -> bool {
-    LXML_NON_ELEMENT_RE.replace_all(page, "").trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r')).is_empty()
+    LXML_NON_ELEMENT_RE.replace_all(page, "").trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')).is_empty()
 }
 
 /// the `sc` value of a start page body; a body with no element at all is lxml's `Document is empty`
@@ -130,6 +130,11 @@ mod tests {
     fn empty_start_page_body_raises_lxml_document_is_empty() {
         assert_eq!(sc_from_page("").unwrap_err().message(), "Document is empty");
         assert_eq!(sc_from_page(" \n\t").unwrap_err().message(), "Document is empty");
+        // lxml probe (lxml 6.1.3): form feed alone, with comments, or repeated is "Document is empty"; with text it is a root
+        assert_eq!(sc_from_page("\x0c").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0c<!--x-->").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0c\x0c").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0cplain").unwrap(), "");
         assert_eq!(sc_from_page("<!-- only a comment -->").unwrap_err().message(), "Document is empty");
         assert_eq!(sc_from_page("<!DOCTYPE html>\n<?pi x?>").unwrap_err().message(), "Document is empty");
         assert_eq!(sc_from_page("<html></html>").unwrap(), "");
