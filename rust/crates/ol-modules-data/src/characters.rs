@@ -37,6 +37,17 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
     normalize_card(stored_key, ch).ok().flatten()
 }
 
+/// a python TypeError raised by a builtin (json.loads on a non-str); Debug mirrors the exception
+/// repr so `ol_core::detail_error` renders it the same way it renders other errors
+#[derive(Debug)]
+struct PyTypeError(String);
+
+impl std::fmt::Display for PyTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// python `_normalize_character`. the error is the TypeError python raises when a truthy non-str
 /// profile is concatenated with the personality or example-conversation text
 pub fn normalize_card(stored_key: &str, ch: &Value) -> Result<Option<Value>, String> {
@@ -914,10 +925,11 @@ impl Characters {
         match raw {
             Value::Object(_) | Value::Array(_) => self.import_json(&ol_core::pyjson::dumps(&raw)).await,
             Value::String(code) => self.import_json(&code).await,
-            other => Ok(self.base.result(
-                format!("error: the JSON object must be str, bytes or bytearray, not {}", py_type(&other)),
-                false,
-            )),
+            other => {
+                // python: import_json's `except Exception as e` -> `core.detail_error(e)`
+                let e = PyTypeError(format!("the JSON object must be str, bytes or bytearray, not {}", py_type(&other)));
+                Ok(self.base.result(format!("error: {}", ol_core::detail_error(&e)), false))
+            }
         }
     }
 
