@@ -26,6 +26,11 @@ pub fn evaluate(expression: &str) -> anyhow::Result<Result<eval::Val, eval::PyEr
     handle.join().map_err(|_| anyhow::anyhow!("calculator evaluation panicked"))
 }
 
+/// `json.dumps(self.result(f))` for a non-finite float: `{"status": "success", "content": Infinity}`
+fn non_finite_response(f: f64) -> String {
+    format!("{{\"status\": \"success\", \"content\": {}}}", ol_core::pyjson::float_repr(f))
+}
+
 pub struct Calculator {
     base: ModuleBase,
 }
@@ -46,6 +51,10 @@ impl Calculator {
     /// here and the dispatcher reports it as a tool error.
     pub async fn calculate(&self, expression: &str) -> anyhow::Result<Value> {
         Ok(match evaluate(expression)? {
+            // json.dumps writes a non-finite float as a bare Infinity / -Infinity / NaN token, which a
+            // serde_json Value cannot hold. The whole response is returned as its json text instead; the
+            // dispatcher passes a string response through unchanged (python's `isinstance(str)` path).
+            Ok(eval::Val::Float(f)) if !f.is_finite() => Value::String(non_finite_response(f)),
             Ok(v) => match eval::to_json(&v) {
                 Ok(content) => self.base.result(content, true),
                 Err(e) => anyhow::bail!("{e}"),
@@ -277,6 +286,20 @@ mod tests {
         // a missing argument is a TypeError at the call site, outside the module's try, so it escapes
         let missing = call(serde_json::json!({})).unwrap_err().to_string();
         assert_eq!(missing, "Calculator.calculate() missing 1 required positional argument: 'expression'");
+    }
+
+    #[test]
+    fn non_finite_results_serialise_as_bare_json_tokens_like_python() {
+        // python: json.dumps(self.result(inf)) -> {"status": "success", "content": Infinity}
+        assert_eq!(call(serde_json::json!({"expression": "1e308*10"})).unwrap(), Value::String("{\"status\": \"success\", \"content\": Infinity}".into()));
+        assert_eq!(call(serde_json::json!({"expression": "-1e308*10"})).unwrap(), Value::String("{\"status\": \"success\", \"content\": -Infinity}".into()));
+        assert_eq!(call(serde_json::json!({"expression": "1e308*10 - 1e308*10"})).unwrap(), Value::String("{\"status\": \"success\", \"content\": NaN}".into()));
+        // the dispatcher returns a string response verbatim, so the model sees the bare token
+        let text = match call(serde_json::json!({"expression": "1e308*10"})).unwrap() {
+            Value::String(s) => s,
+            other => panic!("expected raw text, got {other}"),
+        };
+        assert!(text.ends_with("\"content\": Infinity}"));
     }
 
     #[test]

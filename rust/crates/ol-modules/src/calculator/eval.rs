@@ -12,7 +12,8 @@
 //! would return as complex numbers. Unicode decimal digits are not accepted by `int()`.
 //!
 //! Results that python serializes as bare JSON numbers but serde_json cannot hold are sent as strings:
-//! ints outside the u64/i64 range and the non-finite floats (python's `Infinity` / `NaN`).
+//! ints outside the u64/i64 range. Non-finite floats are carried as python's `Infinity` / `-Infinity` / `NaN`
+//! text, which `calculator::calculate` emits unquoted.
 
 use crate::util::py_strip;
 use num_bigint::{BigInt, BigUint};
@@ -187,7 +188,8 @@ fn py_str(v: &Val) -> Res<String> {
 /// python `json.dumps(value)` of the raw value a successful evaluation returns, which the
 /// dispatcher serializes. Ints and floats stay JSON numbers when serde_json can hold them.
 /// Ints outside the u64/i64 range and non-finite floats are carried as their python `str()` text
-/// because serde_json cannot represent them (python would emit bare digits / Infinity / NaN).
+/// because serde_json cannot represent them (python would emit bare digits). Non-finite floats are carried
+/// as the json token text (`Infinity`, `-Infinity`, `NaN`), which `calculator::calculate` emits unquoted.
 /// Values python cannot serialize (functions, classes) fail with json's TypeError text.
 pub fn to_json(v: &Val) -> Res<Json> {
     Ok(match v {
@@ -204,7 +206,7 @@ pub fn to_json(v: &Val) -> Res<Json> {
         Val::Bool(b) => Json::Bool(*b),
         Val::Float(f) => match serde_json::Number::from_f64(*f) {
             Some(n) => Json::Number(n),
-            None => Json::String(float_str(*f)),
+            None => Json::String(float_repr(*f)),
         },
         Val::Str(s) => Json::String(s.clone()),
         Val::None => Json::Null,
