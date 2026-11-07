@@ -3,11 +3,11 @@
 use crate::util;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase};
-use ol_core::pyjson::py_str;
 use serde_json::Value;
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/channel.rs"]
-pub(crate) mod meta;
+pub mod meta;
 
 /// `Channel.instructions` (verbatim python strings; `.strip()`ped when used)
 pub const INSTRUCTIONS: &[(&str, &str)] = &[
@@ -60,8 +60,42 @@ pub struct ChannelModule {
 }
 
 impl ChannelModule {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base }
+    }
+}
+
+/// python type name used in `TypeError` messages
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "int",
+        Value::Number(_) => "float",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// the operand of `", ".join(...)`: a list of str, a str (its characters) or a dict (its keys)
+fn join_items(v: &Value) -> anyhow::Result<Vec<String>> {
+    match v {
+        Value::String(s) => Ok(s.chars().map(|c| c.to_string()).collect()),
+        Value::Array(a) => a
+            .iter()
+            .enumerate()
+            .map(|(i, item)| match item {
+                Value::String(s) => Ok(s.clone()),
+                other => anyhow::bail!("sequence item {}: expected str instance, {} found", i, py_type_name(other)),
+            })
+            .collect(),
+        Value::Object(m) => Ok(m.keys().cloned().collect()),
+        _ => anyhow::bail!("can only join an iterable"),
     }
 }
 
@@ -103,10 +137,8 @@ impl Module for ChannelModule {
             return Ok(None);
         }
         let available: Vec<String> = match ol_core::config::get(&["channels", "enabled"]) {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
+            Some(v) => join_items(&v)?,
             None => Vec::new(),
-            Some(_) => anyhow::bail!("can only join an iterable"),
         };
         Ok(Some(build_prompt(&ch.name, &available, self.base.config.get_bool("enable_tutorial_prompts"))))
     }
@@ -127,5 +159,28 @@ mod tests {
         let p = build_prompt("webui", &["webui".into()], true);
         assert!(p.contains("Instructions for the user:\nDesktop & Mobile:\n        - Input bar (at bottom):\n"), "{}", p);
         assert_eq!(build_prompt("ntfy", &[], true), "Current channel: ntfy\nAvailable channels: ");
+    }
+
+    #[test]
+    fn matrix_prompt_has_markdown_rule_and_no_instructions() {
+        let p = build_prompt("matrix", &["matrix".into()], true);
+        assert_eq!(p, "Current channel: Matrix\n**DO NOT USE MARKDOWN IN YOUR MESSAGES**.\nAvailable channels: matrix");
+    }
+
+    #[test]
+    fn tutorial_prompts_off_drops_instructions() {
+        let p = build_prompt("cli", &["cli".into()], false);
+        assert_eq!(p, "Current channel: Command Line Interface (CLI)\n**DO NOT USE MARKDOWN IN YOUR MESSAGES**.\nAvailable channels: cli");
+    }
+
+    #[test]
+    fn join_items_matches_python_join_operands() {
+        assert_eq!(join_items(&serde_json::json!(["cli", "webui"])).unwrap(), vec!["cli", "webui"]);
+        assert_eq!(join_items(&serde_json::json!("ab")).unwrap(), vec!["a", "b"]);
+        assert_eq!(join_items(&serde_json::json!({"discord": 1})).unwrap(), vec!["discord"]);
+        let err = join_items(&serde_json::json!(["cli", 3])).unwrap_err().to_string();
+        assert_eq!(err, "sequence item 1: expected str instance, int found");
+        let err = join_items(&Value::Null).unwrap_err().to_string();
+        assert_eq!(err, "can only join an iterable");
     }
 }

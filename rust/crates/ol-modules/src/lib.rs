@@ -1,5 +1,6 @@
 //! (being ported - see rust/PORTING.md)
 
+pub mod channel;
 pub mod chats;
 pub mod identity;
 pub mod lists;
@@ -105,5 +106,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: modules::meta::UNSAFE,
         category: modules::meta::CATEGORY,
         factory: modules::Modules::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "channel",
+        class_name: channel::meta::CLASS_NAME,
+        doc: channel::meta::DOC,
+        settings: channel::meta::settings,
+        unsafe_: channel::meta::UNSAFE,
+        category: channel::meta::CATEGORY,
+        factory: channel::ChannelModule::factory,
     });
 }
