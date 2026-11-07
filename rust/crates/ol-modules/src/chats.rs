@@ -18,42 +18,118 @@ pub mod meta;
 /// Caches flattened chat history text per file, keyed by mtime, so unchanged histories skip re-reading.
 static HISTORY_CACHE: Lazy<Mutex<HashMap<String, (SystemTime, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// python `json` accepts the non-standard NaN, Infinity and -Infinity literals outside strings; serde_json
-/// does not. Each one is rewritten to `0.0`: a float, which python's flatten loop also treats as neither
-/// str, list nor dict. The file then parses and fails or skips exactly as the python does.
-fn py_json_nonfinite_as_float(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
+static JSON_NUMBER_RX: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?$").unwrap());
+
+/// the `\uXXXX` escape starting at `i`, if there is one with four hex digits
+fn unicode_escape(b: &[u8], i: usize) -> Option<u32> {
+    if b.get(i) != Some(&b'\\') || b.get(i + 1) != Some(&b'u') {
+        return None;
+    }
+    let hex = std::str::from_utf8(b.get(i + 2..i + 6)?).ok()?;
+    if !hex.bytes().all(|d| d.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// python's json accepts NaN, Infinity and -Infinity outside strings; each is rewritten to `0.0`, a float that
+/// python's flatten loop also treats as neither str, list nor dict
+fn non_json_literal(b: &[u8], i: usize) -> Option<(usize, &'static str)> {
+    let after_ok = |j: usize| b.get(j).map_or(true, |n| b" \t\r\n,]}".contains(n));
+    for t in [&b"-Infinity"[..], b"Infinity", b"NaN"] {
+        if b[i..].starts_with(t) && after_ok(i + t.len()) {
+            return Some((t.len(), "0.0"));
+        }
+    }
+    None
+}
+
+/// a number literal outside strings that serde_json rejects but python reads: a float that overflows f64 is
+/// inf in python (rewritten to `0.0`), and an integer too big for i64/u64 is a big int in python (rewritten
+/// to `0`). the replacement keeps the python type name, which the flatten-loop errors print.
+fn out_of_range_number(b: &[u8], i: usize) -> Option<(usize, &'static str)> {
+    if b[i] != b'-' && !b[i].is_ascii_digit() {
+        return None;
+    }
+    let end = (i..b.len()).find(|&j| !(b[j].is_ascii_digit() || b"+-.eE".contains(&b[j]))).unwrap_or(b.len());
+    let tok = std::str::from_utf8(&b[i..end]).ok()?;
+    if !JSON_NUMBER_RX.is_match(tok) {
+        return None;
+    }
+    if tok.bytes().any(|d| matches!(d, b'.' | b'e' | b'E')) {
+        if tok.parse::<f64>().ok()?.is_infinite() {
+            return Some((tok.len(), "0.0"));
+        }
+    } else if tok.parse::<i64>().is_err() && tok.parse::<u64>().is_err() {
+        return Some((tok.len(), "0"));
+    }
+    None
+}
+
+/// rewrites what python's json module accepts and serde_json rejects, so the same file parses and then fails or
+/// skips in the flatten loop exactly as python does:
+/// - NaN, Infinity, -Infinity and out-of-range number literals outside strings (see the helpers above)
+/// - a lone UTF-16 surrogate escape inside a string: python keeps it as one code point, which is rewritten to
+///   `�`. both are one char, and both split words the same way, so searches match; only a snippet that
+///   shows the char can differ. a high surrogate followed by a low one is a valid pair and is left alone.
+fn py_json_compat(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
     let mut in_str = false;
-    let mut escaped = false;
-    let mut rest = src;
-    while let Some(c) = rest.chars().next() {
+    while i < b.len() {
+        let c = b[i];
         if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
+            if c == b'"' {
                 in_str = false;
+                out.push(c);
+                i += 1;
+            } else if c == b'\\' {
+                if let Some(cp) = unicode_escape(b, i) {
+                    let pair = (0xD800..0xDC00).contains(&cp)
+                        && unicode_escape(b, i + 6).is_some_and(|lo| (0xDC00..0xE000).contains(&lo));
+                    if pair {
+                        out.extend_from_slice(&b[i..i + 12]);
+                        i += 12;
+                    } else if (0xD800..0xE000).contains(&cp) {
+                        out.extend_from_slice(b"\\uFFFD");
+                        i += 6;
+                    } else {
+                        out.extend_from_slice(&b[i..i + 6]);
+                        i += 6;
+                    }
+                } else {
+                    // any other escape: copy the backslash and the escaped char together
+                    let take = if i + 1 < b.len() { 2 } else { 1 };
+                    out.extend_from_slice(&b[i..i + take]);
+                    i += take;
+                }
+            } else {
+                out.push(c);
+                i += 1;
             }
+        } else if c == b'"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
         } else {
-            let after_ok = |s: &str| s.chars().next().map_or(true, |n| " \t\r\n,]}".contains(n));
-            let before_ok = out.chars().last().map_or(true, |p| " \t\r\n[,:".contains(p));
-            let token = ["-Infinity", "Infinity", "NaN"]
-                .into_iter()
-                .find(|t| rest.starts_with(t) && before_ok && after_ok(&rest[t.len()..]));
-            if let Some(t) = token {
-                out.push_str("0.0");
-                rest = &rest[t.len()..];
-                continue;
-            }
-            if c == '"' {
-                in_str = true;
+            let before_ok = out.last().map_or(true, |p| b" \t\r\n[,:".contains(p));
+            let rewrite = if before_ok { non_json_literal(b, i).or_else(|| out_of_range_number(b, i)) } else { None };
+            match rewrite {
+                Some((len, rep)) => {
+                    out.extend_from_slice(rep.as_bytes());
+                    i += len;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
             }
         }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
     }
-    out
+    // only ASCII tokens were replaced and every other byte was copied as is, so the output is still UTF-8
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// reads a chat history file and flattens its message contents into one searchable string, using the mtime cache.
@@ -67,7 +143,7 @@ pub fn history_text(path: &str) -> anyhow::Result<String> {
         }
     }
     let Ok(text) = std::fs::read_to_string(path) else { return Ok(String::new()) };
-    let Ok(parsed) = serde_json::from_str::<Value>(&py_json_nonfinite_as_float(&text)) else { return Ok(String::new()) };
+    let Ok(parsed) = serde_json::from_str::<Value>(&py_json_compat(&text)) else { return Ok(String::new()) };
     let messages = match parsed {
         Value::Array(items) => items,
         // python iterates a dict's keys or a str's characters: none for an empty one, a str for a non-empty one
@@ -146,10 +222,16 @@ fn spell_list_bools(v: &Value) -> Value {
     }
 }
 
-/// python `search` ranking + line formatting over the flattened chat entries.
-/// an empty query (python `not query`) and an empty entry list both give no lines.
+/// python `search` ranking + line formatting over the flattened chat entries. `query` is the tool argument as
+/// python receives it, not converted: core search ranks on str(query), but python's make_snippets calls
+/// query.strip() on the raw value, so a non-str query with a hit that has text raises.
+/// a falsy query (python `not query`: None, "", 0, false, [], {}) and an empty entry list both give no lines.
 /// ranking runs on copies that carry the entry's position in "idx", so lines are formatted from the original values.
-pub fn search_lines(entries: &[Value], query: &str) -> Vec<String> {
+pub fn search_lines(entries: &[Value], query: &Value) -> anyhow::Result<Vec<String>> {
+    if !truthy(query) {
+        return Ok(Vec::new());
+    }
+    let query_text = py_str(query);
     let mut weights = IndexMap::new();
     weights.insert("title".to_string(), 2.0);
     weights.insert("category".to_string(), 1.0);
@@ -167,20 +249,24 @@ pub fn search_lines(entries: &[Value], query: &str) -> Vec<String> {
             })
         })
         .collect();
-    let results = ol_core::search::search(&ranking_entries, query, "id", Some(&weights), 20);
+    let results = ol_core::search::search(&ranking_entries, &query_text, "id", Some(&weights), 20);
     let mut lines = Vec::new();
     for hit in results {
         let Some(e) = hit.entry["idx"].as_u64().and_then(|i| entries.get(i as usize)) else { continue };
         let mut line = format!("[{}] \"{}\" (score {:.2})", py_str(&e["category"]), py_str(&e["title"]), hit.score);
         let text = e["text"].as_str().unwrap_or("");
         if !text.is_empty() {
-            if let Some(first) = util::make_snippets(text, query, 1, 50).first() {
+            // python make_snippets calls query.strip() on the raw query, which only a str has
+            let Value::String(q) = query else {
+                anyhow::bail!("'{}' object has no attribute 'strip'", util::py_type_name(query));
+            };
+            if let Some(first) = util::make_snippets(text, q, 1, 50).first() {
                 line.push_str(&format!("\n  {}", first));
             }
         }
         lines.push(line);
     }
-    lines
+    Ok(lines)
 }
 
 pub struct Chats {
@@ -274,8 +360,8 @@ impl Module for Chats {
                 Ok(self.base.result(json!("chat organised!"), true))
             }
             "search" => {
-                // python passes query=None through; core search returns [] for `not query`
-                let query = args.str("query").unwrap_or_default();
+                // python passes the raw query value through, so it is not converted here (see search_lines)
+                let query = args.raw("query").cloned().unwrap_or(Value::Null);
                 let ch = self.base.channel().ok_or_else(util::no_channel)?;
                 let mut entries = Vec::new();
                 for meta in ch.chat.get_all() {
@@ -289,7 +375,7 @@ impl Module for Chats {
                     }
                     entries.push(json!({"id": chat_id, "title": title, "category": category, "text": text}));
                 }
-                let lines = search_lines(&entries, &query);
+                let lines = search_lines(&entries, &query)?;
                 if lines.is_empty() {
                     return Ok(self.base.result(json!("no results found"), true));
                 }
@@ -365,6 +451,36 @@ mod tests {
     }
 
     #[test]
+    fn history_text_accepts_out_of_range_numbers_like_python() {
+        // python reads 1e400 as inf and a 400-digit integer as a big int, so the file parses and the other messages count
+        let dir = tempfile::tempdir().unwrap();
+        let big = "1".repeat(400);
+        let body = format!(
+            r#"[{{"content": "ok", "w": 1e400}}, {{"content": "x", "w": -1E400, "v": {big}, "u": 1e-400}}]"#
+        );
+        let path = history_file(&dir, &body);
+        assert_eq!(history_text(&path).unwrap(), "ok\nx");
+        // the replacement keeps the python type name, so the flatten-loop error reads the same
+        let inf_top = history_file(&dir, "1e400");
+        assert_eq!(history_text(&inf_top).unwrap_err().to_string(), "'float' object is not iterable");
+        let big_top = history_file(&dir, &big);
+        assert_eq!(history_text(&big_top).unwrap_err().to_string(), "'int' object is not iterable");
+        // not a JSON number, so it stays a parse failure (python: "Expecting value" or delimiter error)
+        let bad_number = history_file(&dir, r#"[{"content": "a", "w": 1.e400}]"#);
+        assert_eq!(history_text(&bad_number).unwrap(), "");
+    }
+
+    #[test]
+    fn history_text_handles_lone_surrogate_escapes_like_python() {
+        // python keeps a lone \uD800 as one code point that is searchable text; a valid pair is one emoji
+        let dir = tempfile::tempdir().unwrap();
+        let path = history_file(&dir, r#"[{"content": "a\uD800b vitamin \uD83D\uDE00 \\uD800 \uDC00"}]"#);
+        assert_eq!(history_text(&path).unwrap(), "a\u{FFFD}b vitamin \u{1F600} \\uD800 \u{FFFD}");
+        let found = search_lines(&[json!({"id": "c1", "title": "", "category": "", "text": history_text(&path).unwrap()})], &json!("vitamin")).unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
     fn history_text_accepts_python_nonfinite_literals_and_leaves_strings_alone() {
         let dir = tempfile::tempdir().unwrap();
         let body = r#"[{"role": "user", "content": "NaN Infinity", "w": NaN},
@@ -384,24 +500,38 @@ mod tests {
     #[test]
     fn search_lines_format_category_title_score_and_snippet() {
         let entries = vec![json!({"id": "c1", "title": "Diet", "category": "food", "text": "I take vitamins daily"})];
-        let lines = search_lines(&entries, "vitamins");
+        let lines = search_lines(&entries, &json!("vitamins")).unwrap();
         assert_eq!(lines.len(), 1);
         let parts: Vec<&str> = lines[0].split('\n').collect();
         assert_eq!(parts.len(), 2, "{}", lines[0]);
         assert!(parts[0].starts_with("[food] \"Diet\" (score "), "{}", parts[0]);
         assert!(parts[0].ends_with(')'), "{}", parts[0]);
         assert_eq!(parts[1], "  I take vitamins daily");
-        assert!(search_lines(&entries, "").is_empty());
-        assert!(search_lines(&entries, "   ").is_empty());
-        assert!(search_lines(&entries, "zebra").is_empty());
+        assert!(search_lines(&entries, &json!("")).unwrap().is_empty());
+        assert!(search_lines(&entries, &json!("   ")).unwrap().is_empty());
+        assert!(search_lines(&entries, &json!("zebra")).unwrap().is_empty());
     }
 
     #[test]
-    fn search_ranks_bools_in_list_title_as_python_strings() {
-        // python _extract keeps True inside a list title as "True", so "true" finds this chat and "false" does not
-        let entries = vec![json!({"id": "c1", "title": ["alpha", true], "category": "", "text": "nothing here"})];
-        assert_eq!(search_lines(&entries, "true").len(), 1);
-        assert!(search_lines(&entries, "false").is_empty());
+    fn search_falsy_non_string_query_finds_nothing_like_python() {
+        // python core search returns [] for `not query`, so a 0 or false never matches the "0" or "false" in a chat
+        let entries = vec![json!({"id": "c1", "title": "Notes", "category": "", "text": "chapter 0 and false alarms"})];
+        for query in [json!(0), json!(0.0), json!(false), json!([]), json!({}), Value::Null] {
+            assert!(search_lines(&entries, &query).unwrap().is_empty(), "{}", query);
+        }
+    }
+
+    #[test]
+    fn search_truthy_non_string_query_raises_at_snippet_like_python() {
+        // python ranks on str(5) = "5", and the hit's text is then sent through make_snippets, which calls 5.strip()
+        let with_text = vec![json!({"id": "c1", "title": "Room", "category": "", "text": "room 5 is ready"})];
+        let err = search_lines(&with_text, &json!(5)).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'strip'");
+        // a hit with no text has no snippet call, so python returns the line
+        let title_only = vec![json!({"id": "c2", "title": "Room 5", "category": "", "text": ""})];
+        let lines = search_lines(&title_only, &json!(5)).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("[] \"Room 5\" (score "), "{}", lines[0]);
     }
 
     #[test]
