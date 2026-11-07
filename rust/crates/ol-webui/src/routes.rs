@@ -490,12 +490,9 @@ fn search_entry(chat: &Value, query: &str, tz: i64) -> Result<Value, String> {
     let mut entry = project_chat(chat, &["title_match"]);
     entry["group_key"] = json!(if group.is_empty() { "undated".to_string() } else { group.clone() });
     entry["group_label"] = json!(day_label_from_key(&group, tz)?);
-    // python `highlight_query(chat.get("title") or "", query)`: a truthy non-string title is str()-ed
-    let title = match chat.get("title") {
-        Some(v) if truthy(v) => py_str(v),
-        _ => String::new(),
-    };
-    entry["title_highlighted"] = json!(highlight_query(Some(title.as_str()), query));
+    // python `highlight_query(chat.get("title") or "", query)`; a truthy non-string title is rejected in search_chats first
+    let title = chat.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    entry["title_highlighted"] = json!(highlight_query(Some(title), query));
     // python `[highlight_query(s, query) for s in (chat.get("message_snippets") or [])]`: a null snippet stays null
     let snippets = match chat.get("message_snippets") {
         Some(v) if truthy(v) => py_iter(v)?,
@@ -527,6 +524,11 @@ async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     }
 
     let mut results = ch.chat.search(&query, 100, search_in_content);
+    // python core ChatStore.search runs `(entry.get("title") or "").lower()` for every ranked hit, before any
+    // filter, so a truthy non-string title raises AttributeError: the plain 500
+    if results.iter().any(|r| matches!(r.get("title"), Some(v) if truthy(v) && !v.is_string())) {
+        return internal_error();
+    }
     let general = json!("general");
     if truthy(&category) && category != general {
         results.retain(|r| r.get("category") == Some(&category));

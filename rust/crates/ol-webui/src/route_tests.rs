@@ -839,6 +839,33 @@ async fn search_chats_escapes_html_and_rejects_a_non_string_query_like_python() 
 }
 
 #[tokio::test]
+async fn search_chats_500s_when_a_ranked_hit_has_a_non_string_title() {
+    let h = harness(false).await;
+    let hit = chat_at(&h, "work", "Budget", "2026-11-01T09:00:00", &[]).await;
+    let other = chat_at(&h, "work", "Recipes", "2026-11-02T09:00:00", &[]).await;
+    // message text makes both chats searchable through their history
+    h.ch.chat.load(&hit).await.unwrap();
+    h.ch.chat.messages_add(&json!({"role": "user", "content": "budget notes"}), false, false).await;
+    h.ch.chat.messages_save().await;
+    h.ch.chat.load(&other).await.unwrap();
+    h.ch.chat.messages_add(&json!({"role": "user", "content": "dinner ideas"}), false, false).await;
+    h.ch.chat.messages_save().await;
+    let before = h.send(post_json("/api/chats/search", r#"{"query": "budget"}"#)).await;
+    assert_eq!(before.json()["data"].as_array().unwrap().len(), 1);
+    // python raises AttributeError on `.lower()` for the ranked hit, so the whole search is the plain 500
+    h.ch.chat.with_data_mut(|data| {
+        for chat in data.iter_mut().filter(|c| c["id"] == json!(hit)) {
+            chat["title"] = json!(5);
+        }
+    });
+    let resp = h.send(post_json("/api/chats/search", r#"{"query": "budget"}"#)).await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // a non-string title on a chat that is not a hit does not reach `.lower()`
+    let miss = h.send(post_json("/api/chats/search", r#"{"query": "zzz-nothing"}"#)).await;
+    assert_eq!(miss.json(), json!({"data": [], "success": true}));
+}
+
+#[tokio::test]
 async fn category_and_search_routes_reject_a_non_json_body_with_the_plain_500() {
     let h = harness(false).await;
     for uri in ["/api/chats/categories/create", "/api/chats/categories/delete", "/api/chats/search"] {
