@@ -10,6 +10,7 @@ pub mod models;
 pub mod modules;
 pub mod notes;
 pub mod replacer;
+pub mod skills;
 pub mod token_threshold;
 pub mod time;
 pub mod tutorial;
@@ -155,5 +156,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: time::meta::UNSAFE,
         category: time::meta::CATEGORY,
         factory: time::Time::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "skills",
+        class_name: skills::meta::CLASS_NAME,
+        doc: skills::meta::DOC,
+        settings: skills::meta::settings,
+        unsafe_: skills::meta::UNSAFE,
+        category: skills::meta::CATEGORY,
+        factory: skills::Skills::factory,
     });
 }
