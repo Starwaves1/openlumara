@@ -11,8 +11,8 @@ use crate::listing::{
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
-    export_chat_text, get_strip, or_strip, parse_body, py_contains, py_int, py_int_str, py_iter, py_json_loads_lenient,
-    py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip, py_type_name,
+    export_chat_text, get_strip, or_strip, parse_body, py_contains, py_eq, py_int, py_int_str, py_iter,
+    py_json_loads_lenient, py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip, py_type_name,
 };
 use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
@@ -24,7 +24,7 @@ use axum::Router;
 use indexmap::IndexMap;
 use ol_core::channel::Channel;
 use ol_core::context::GetOpts;
-use ol_core::pyjson::{py_str, truthy};
+use ol_core::pyjson::{py_repr, py_str, truthy};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -277,25 +277,34 @@ pub fn push_input_history(history: &mut Vec<Value>, message: &str) {
     }
 }
 
-/// python `_get_module_section(config, key)`: `{"enabled", "disabled"}` of a module section, None where absent
-fn module_section(section: Option<&Value>) -> Value {
+/// python `(config.get(key) or {}).get(k)` for `k` in enabled and disabled: `{"enabled", "disabled"}` of a
+/// module section, None where python raises AttributeError (a truthy section that is not a dict)
+fn module_section(section: Option<&Value>) -> Option<Value> {
     let obj = match section {
         Some(v) if truthy(v) => v.clone(),
         _ => json!({}),
     };
-    json!({
-        "enabled": obj.get("enabled").cloned().unwrap_or(Value::Null),
-        "disabled": obj.get("disabled").cloned().unwrap_or(Value::Null),
-    })
+    let Value::Object(map) = &obj else { return None };
+    Some(json!({
+        "enabled": map.get("enabled").cloned().unwrap_or(Value::Null),
+        "disabled": map.get("disabled").cloned().unwrap_or(Value::Null),
+    }))
 }
 
-/// python settings-save diff: (requires_restart, requires_reconnect)
-pub fn restart_flags(old: &Map<String, Value>, new: &Map<String, Value>) -> (bool, bool) {
-    let requires_restart = MODULE_CATEGORY_KEYS
-        .iter()
-        .any(|key| module_section(old.get(*key)) != module_section(new.get(*key)));
-    let requires_reconnect = !requires_restart && old.get("api").unwrap_or(&Value::Null) != new.get("api").unwrap_or(&Value::Null);
-    (requires_restart, requires_reconnect)
+/// python settings-save diff: (requires_restart, requires_reconnect). None where python raises while
+/// reading a module section. python's `any()` stops at the first differing module key, so a bad section
+/// after that key is never read
+pub fn restart_flags(old: &Map<String, Value>, new: &Map<String, Value>) -> Option<(bool, bool)> {
+    let mut requires_restart = false;
+    for key in MODULE_CATEGORY_KEYS {
+        if !py_eq(&module_section(old.get(key))?, &module_section(new.get(key))?) {
+            requires_restart = true;
+            break;
+        }
+    }
+    let requires_reconnect =
+        !requires_restart && !py_eq(old.get("api").unwrap_or(&Value::Null), new.get("api").unwrap_or(&Value::Null));
+    Some((requires_restart, requires_reconnect))
 }
 
 /// python `round(x, 1)`
@@ -722,50 +731,97 @@ async fn check_connection(State(app): State<Arc<Shared>>) -> Response {
 
 async fn models_get(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    match ch.manager().api().list_models().await {
+    let manager = ch.manager();
+    let api = manager.api();
+    // python list_models() returns the attempt_connect() result when disconnected: True once the connect
+    // succeeds (sent as data, with no model list), or the error as the failure string
+    if !api.connected() {
+        return match api.attempt_connect().await {
+            Ok(()) => reply(json!(true), true),
+            Err(e) => reply(json!(e.to_string()), false),
+        };
+    }
+    match api.list_models().await {
         Ok(models) => reply(json!(models), true),
         Err(e) => reply(json!(e.to_string()), false),
     }
 }
 
+/// python `data = await request.json()` then `(data.get("name") or "").strip()`. None where python raises:
+/// a body that is not an object, or a truthy name that is not a string (NaN and Infinity are truthy)
+fn model_name_of(body: &[u8]) -> Option<String> {
+    let obj = py_json_loads_python_only_true(body).ok()?.as_object().cloned()?;
+    or_strip(obj.get("name"), "").ok()
+}
+
 async fn model_set(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let Some(obj) = json_object(&body) else { return internal_error() };
-    let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
+    let Some(name) = model_name_of(&body) else { return internal_error() };
     if name.is_empty() {
         return reply(json!("Model name cannot be empty"), false);
+    }
+    // python set_model() does config["model"]["name"] = name: a missing or non-dict model section raises
+    // there, a plain 500 that leaves the config as it was
+    if !matches!(ol_core::config::get(&["model"]), Some(Value::Object(_))) {
+        return internal_error();
     }
     ch.manager().api().set_model(&name);
     reply(json!({"name": name}), true)
 }
 
-async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
-    let Some(ch) = app.ch() else { return internal_error() };
-    let Some(obj) = json_object(&body) else { return internal_error() };
-    // python: list(data.get("changed_modules", [])). list() of a string is its characters and of a dict its keys;
-    // list() of a number, bool or null raises, which is a plain 500
-    let changed_modules: Vec<String> = match obj.get("changed_modules") {
-        None => Vec::new(),
-        Some(Value::Array(items)) => items.iter().map(py_str).collect(),
-        Some(Value::String(s)) => s.chars().map(String::from).collect(),
-        Some(Value::Object(m)) => m.keys().cloned().collect(),
-        Some(_) => return internal_error(),
-    };
+/// python `list(data.get("changed_modules", []))`. list() of a string is its characters and of a dict its
+/// keys; list() of a number, bool or null raises (None here), which is a plain 500
+fn changed_modules_of(obj: &Map<String, Value>) -> Option<Vec<Value>> {
+    match obj.get("changed_modules") {
+        None => Some(Vec::new()),
+        Some(Value::Array(items)) => Some(items.clone()),
+        Some(Value::String(s)) => Some(s.chars().map(|c| json!(c.to_string())).collect()),
+        Some(Value::Object(m)) => Some(m.keys().map(|k| json!(k)).collect()),
+        Some(_) => None,
+    }
+}
+
+/// the body of settings/save: `(changed_modules, categories)`. python's `await request.json()` takes
+/// NaN and Infinity, which the lenient reader reads as null (a plain 500 where python raises on them)
+fn settings_save_request(body: &[u8]) -> Option<(Vec<Value>, Map<String, Value>)> {
+    let obj = py_json_loads_lenient(body).ok()?.as_object().cloned()?;
+    let changed_modules = changed_modules_of(&obj)?;
     let categories = match obj.get("categories") {
         None => Map::new(),
         Some(Value::Object(m)) => m.clone(),
-        Some(_) => return internal_error(),
+        Some(_) => return None,
     };
+    Some((changed_modules, categories))
+}
+
+async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
+    let Some(ch) = app.ch() else { return internal_error() };
+    let Some((changed_modules, categories)) = settings_save_request(&body) else { return internal_error() };
     let Ok(flattened) = flatten_categories(&categories) else { return internal_error() };
 
     let old_config = ol_core::config::snapshot();
     ol_core::config::replace(flattened.clone());
-    let (requires_restart, requires_reconnect) = restart_flags(&old_config, &flattened);
+    // python reads the module sections after the save, so a bad section is a 500 with the config saved
+    let Some((requires_restart, requires_reconnect)) = restart_flags(&old_config, &flattened) else {
+        return internal_error();
+    };
 
     let manager = ch.manager();
-    for name in &changed_modules {
-        // python logs a failed reload and carries on with the next module
-        let _ = manager.reload_module(name).await;
+    for item in &changed_modules {
+        match item {
+            // python: reload_module(name) logs a failed reload itself and carries on with the next module
+            Value::String(name) => {
+                manager.reload_module(name).await;
+            }
+            // python's `name not in self.modules` raises for an unhashable list or dict, which settings_save
+            // logs as its reload error and carries on past
+            Value::Array(_) | Value::Object(_) => ch.log(
+                &ch.name,
+                &format!("Error reloading module {}: unhashable type: '{}'", py_repr(item), py_type_name(item)),
+            ),
+            // any other value is not a loaded module name: python logs that and returns False
+            other => manager.log("core", &format!("Module {} not loaded, cannot reload", py_str(other))),
+        }
     }
     app.setup_ui_extensions();
 
@@ -929,8 +985,71 @@ mod tests {
         let same = json!({"modules": {"enabled": ["a"]}, "api": {"model": "y"}});
         let moved = json!({"modules": {"enabled": ["a", "b"]}, "api": {"model": "y"}});
         let old = old.as_object().unwrap();
-        assert_eq!(restart_flags(old, same.as_object().unwrap()), (false, true));
-        assert_eq!(restart_flags(old, moved.as_object().unwrap()), (true, false));
+        assert_eq!(restart_flags(old, same.as_object().unwrap()), Some((false, true)));
+        assert_eq!(restart_flags(old, moved.as_object().unwrap()), Some((true, false)));
+    }
+
+    #[test]
+    fn restart_flags_compare_numbers_the_python_way() {
+        // python: 1 == 1.0, so an integral float in the api section is no reconnect
+        let old = json!({"api": {"timeout": 1, "retries": 0.0}});
+        let new = json!({"api": {"timeout": 1.0, "retries": 0}});
+        assert_eq!(restart_flags(old.as_object().unwrap(), new.as_object().unwrap()), Some((false, false)));
+        let changed = json!({"api": {"timeout": 2.0, "retries": 0}});
+        assert_eq!(restart_flags(old.as_object().unwrap(), changed.as_object().unwrap()), Some((false, true)));
+    }
+
+    #[test]
+    fn restart_flags_fail_on_a_truthy_non_dict_module_section_only_when_read() {
+        // python `(section or {}).get(k)` raises on a truthy list or string section
+        let bad = json!({"modules": ["x"]});
+        let fine = json!({});
+        assert_eq!(restart_flags(bad.as_object().unwrap(), fine.as_object().unwrap()), None);
+        // falsy non-dicts read as {} and are no error
+        let falsy = json!({"modules": 0, "channels": ""});
+        assert_eq!(restart_flags(falsy.as_object().unwrap(), fine.as_object().unwrap()), Some((false, false)));
+        // python's any() stops at the first differing key, so a bad section after it is never read
+        let old = json!({"modules": {"enabled": ["a"]}, "channels": "bad"});
+        let new = json!({"modules": {"enabled": ["b"]}});
+        assert_eq!(restart_flags(old.as_object().unwrap(), new.as_object().unwrap()), Some((true, false)));
+    }
+
+    #[test]
+    fn model_name_follows_python_strip_and_nan_truthiness() {
+        assert_eq!(model_name_of(br#"{"name": "  qwen-3  "}"#), Some("qwen-3".to_string()));
+        // NaN elsewhere in the body is accepted, like python's json.loads
+        assert_eq!(model_name_of(br#"{"name": "m", "x": NaN}"#), Some("m".to_string()));
+        // a NaN name is truthy and has no .strip(): a plain 500
+        assert_eq!(model_name_of(br#"{"name": NaN}"#), None);
+        assert_eq!(model_name_of(br#"{"name": 5}"#), None);
+        assert_eq!(model_name_of(b"[]"), None);
+        assert_eq!(model_name_of(br#"{}"#), Some(String::new()));
+    }
+
+    #[test]
+    fn changed_modules_coerce_like_python_list() {
+        let obj = json!({"changed_modules": "ab"});
+        assert_eq!(changed_modules_of(obj.as_object().unwrap()), Some(vec![json!("a"), json!("b")]));
+        // non-string entries are kept as they are, not converted to strings
+        let obj = json!({"changed_modules": [5, null, "m"]});
+        assert_eq!(changed_modules_of(obj.as_object().unwrap()), Some(vec![json!(5), Value::Null, json!("m")]));
+        let obj = json!({"changed_modules": {"k": 1}});
+        assert_eq!(changed_modules_of(obj.as_object().unwrap()), Some(vec![json!("k")]));
+        // list() of a number, bool or null raises
+        for bad in [json!(5), json!(true), Value::Null] {
+            assert_eq!(changed_modules_of(json!({"changed_modules": bad}).as_object().unwrap()), None);
+        }
+        assert_eq!(changed_modules_of(&Map::new()), Some(vec![]));
+    }
+
+    #[test]
+    fn settings_save_body_accepts_nan_like_python_json_loads() {
+        let (modules, categories) = settings_save_request(br#"{"categories": {}, "x": NaN}"#).unwrap();
+        assert!(modules.is_empty() && categories.is_empty());
+        // a NaN changed_modules is a list() error in python: a plain 500
+        assert!(settings_save_request(br#"{"changed_modules": NaN, "categories": {}}"#).is_none());
+        assert!(settings_save_request(b"[]").is_none());
+        assert!(settings_save_request(br#"{"categories": 3}"#).is_none());
     }
 
     #[test]
