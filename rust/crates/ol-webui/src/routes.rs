@@ -820,13 +820,13 @@ fn changed_modules_of(obj: &Map<String, Value>) -> Option<Vec<Value>> {
     }
 }
 
-/// the body of settings/save: `(changed_modules, categories)`. python's `await request.json()` takes
-/// NaN and Infinity, which the lenient reader reads as null (a plain 500 where python raises on them)
 /// python settings_save's except branch: `channel.log(channel.name, f"Error reloading module {module_name}: {core.detail_error(e)}")`
 fn reload_error_line(module_name: &str, e: &anyhow::Error) -> String {
     format!("Error reloading module {}: {}", module_name, ol_core::detail_error(e))
 }
 
+/// the body of settings/save: `(changed_modules, categories)`. python's `await request.json()` takes
+/// NaN and Infinity, which the lenient reader reads as null (a plain 500 where python raises on them)
 fn settings_save_request(body: &[u8]) -> Option<(Vec<Value>, Map<String, Value>)> {
     let obj = py_json_loads_lenient(body).ok()?.as_object().cloned()?;
     let changed_modules = changed_modules_of(&obj)?;
