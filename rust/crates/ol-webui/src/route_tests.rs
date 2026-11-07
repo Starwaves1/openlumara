@@ -2469,3 +2469,319 @@ async fn coder_git_routes_keep_their_python_methods() {
         assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}), "GET {path}");
     }
 }
+
+// ---------------- /api/ext/coder git sync routes (git_fetch, git_pull, git_branch_create, git_branch_delete, git_conflicts, git_resolve) ----------------
+
+/// `repo` on `main` whose a.txt conflicts with branch `topic`: the merge stopped and left the conflict markers
+fn repo_in_merge_conflict(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "base\n", "base");
+    run_git(&repo, &["switch", "-q", "-c", "topic"]);
+    commit_file(&repo, "a.txt", "topic\n", "topic edit");
+    run_git(&repo, &["switch", "-q", "main"]);
+    commit_file(&repo, "a.txt", "main\n", "main edit");
+    let merge = std::process::Command::new("git")
+        .args(["merge", "-q", "--no-edit", "topic"])
+        .current_dir(&repo)
+        .output()
+        .expect("git runs");
+    assert!(!merge.status.success(), "the merge must conflict");
+    repo
+}
+
+/// clones `bare` into `root/other`, commits `file` there and pushes it to origin/main
+fn push_from_other_clone(root: &Path, bare: &Path, file: &str, content: &str, message: &str) {
+    let other = root.join("other");
+    run_git(root, &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    commit_file(&other, file, content, message);
+    run_git(&other, &["push", "-q", "origin", "main"]);
+}
+
+fn keys_of(value: &Value) -> Vec<&str> {
+    value.as_object().unwrap().keys().map(String::as_str).collect()
+}
+
+#[tokio::test]
+async fn git_fetch_lists_the_incoming_commits_without_merging() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let (repo, bare) = repo_with_remote(root.path());
+    let local_head = run_git(&repo, &["rev-parse", "HEAD"]);
+    push_from_other_clone(root.path(), &bare, "c.txt", "three\n", "third");
+    let h = harness_with_coder(&repo).await;
+
+    let resp = post_coder(&h, "git_fetch", json!({"sandbox": "repo"})).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true), "{body}");
+    let body = body["data"].clone();
+    assert_eq!(keys_of(&body), vec!["output", "incoming", "branch"], "{body}");
+    assert_eq!(body["branch"], json!("main"));
+    // git fetch writes its report to stderr, so the stdout answer is empty
+    assert_eq!(body["output"], json!(""));
+    let incoming = body["incoming"].as_array().unwrap();
+    assert_eq!(incoming.len(), 1, "{body}");
+    assert_eq!(keys_of(&incoming[0]), vec!["hash", "msg"]);
+    assert_eq!(incoming[0]["msg"], json!("third"));
+    assert!(run_git(&bare, &["rev-parse", "main"]).starts_with(incoming[0]["hash"].as_str().unwrap()));
+    // the fetch does not move the local branch
+    assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]), local_head);
+}
+
+#[tokio::test]
+async fn git_fetch_checks_its_sandbox_and_remote() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+    assert_eq!(
+        post_coder(&h, "git_fetch", json!({})).await.json(),
+        json!({"data": "no sandbox given", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "git_fetch", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "this repo has no remotes", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn git_pull_fast_forwards_and_refuses_detached_heads() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let (repo, bare) = repo_with_remote(root.path());
+    run_git(&repo, &["config", "pull.rebase", "false"]);
+    push_from_other_clone(root.path(), &bare, "c.txt", "three\n", "third");
+    let h = harness_with_coder(&repo).await;
+
+    let resp = post_coder(&h, "git_pull", json!({"sandbox": "repo"})).await;
+    assert_eq!(resp.json()["success"], json!(true), "{}", resp.body);
+    assert!(repo.join("c.txt").exists(), "the pull brought c.txt in");
+
+    run_git(&repo, &["checkout", "-q", "--detach"]);
+    assert_eq!(
+        post_coder(&h, "git_pull", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "detached HEAD: switch to a branch before pulling", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn git_pull_reports_conflicted_files_when_the_merge_stops() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let (repo, bare) = repo_with_remote(root.path());
+    run_git(&repo, &["config", "pull.rebase", "false"]);
+    push_from_other_clone(root.path(), &bare, "a.txt", "remote\n", "remote edit");
+    commit_file(&repo, "a.txt", "local\n", "local edit");
+    let h = harness_with_coder(&repo).await;
+
+    let resp = post_coder(&h, "git_pull", json!({"sandbox": "repo"})).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true), "{body}");
+    let body = body["data"].clone();
+    assert_eq!(keys_of(&body), vec!["conflicts", "output", "pull_failed"], "{body}");
+    assert_eq!(body["conflicts"], json!(["a.txt"]));
+    assert_eq!(body["pull_failed"], json!(true));
+    assert!(body["output"].as_str().unwrap().contains("CONFLICT"), "{body}");
+}
+
+#[tokio::test]
+async fn git_pull_without_a_tracking_branch_answers_git_pull_failed() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+    // git's "no tracking information" goes to stderr, so the stdout answer is empty and python says so
+    assert_eq!(
+        post_coder(&h, "git_pull", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "git pull failed", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn git_branch_create_validates_the_name_and_checks_out_by_default() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+
+    let required = json!({"data": "sandbox and name are both required", "success": false});
+    assert_eq!(post_coder(&h, "git_branch_create", json!({"sandbox": "repo", "name": "   "})).await.json(), required);
+    assert_eq!(post_coder(&h, "git_branch_create", json!({"name": "topic"})).await.json(), required);
+    assert_eq!(
+        post_coder(&h, "git_branch_create", json!({"sandbox": "repo", "name": "bad name!"})).await.json(),
+        json!({
+            "data": "invalid branch name: use letters, digits, dots, slashes, hyphens, underscores",
+            "success": false
+        })
+    );
+
+    // git switch -c writes "Switched to a new branch" to stderr, and python answers stderr when stdout is empty
+    let resp = post_coder(&h, "git_branch_create", json!({"sandbox": "repo", "name": " feat/one "})).await;
+    assert_eq!(resp.json(), json!({"data": "Switched to a new branch 'feat/one'", "success": true}), "{}", resp.body);
+    assert_eq!(run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/one");
+
+    // checkout false creates the branch with git branch and leaves HEAD where it was
+    let resp = post_coder(&h, "git_branch_create", json!({"sandbox": "repo", "name": "plain", "checkout": false})).await;
+    assert_eq!(resp.json(), json!({"data": "created branch plain", "success": true}), "{}", resp.body);
+    assert_eq!(run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "feat/one");
+    assert_eq!(run_git(&repo, &["branch", "--list", "plain", "--format=%(refname:short)"]), "plain");
+
+    let resp = post_coder(&h, "git_branch_create", json!({"sandbox": "repo", "name": "plain", "checkout": false})).await;
+    assert_eq!(resp.json()["success"], json!(false));
+    assert!(resp.json()["data"].as_str().unwrap().contains("already exists"), "{}", resp.body);
+}
+
+#[tokio::test]
+async fn git_branch_delete_refuses_the_current_branch_and_needs_force_for_unmerged_work() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    run_git(&repo, &["branch", "merged"]);
+    run_git(&repo, &["switch", "-q", "-c", "wip"]);
+    commit_file(&repo, "b.txt", "two\n", "unmerged work");
+    run_git(&repo, &["switch", "-q", "main"]);
+    let h = harness_with_coder(&repo).await;
+
+    assert_eq!(
+        post_coder(&h, "git_branch_delete", json!({"sandbox": "repo", "name": "main"})).await.json(),
+        json!({"data": "cannot delete the branch you are currently on", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "git_branch_delete", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "sandbox and name are both required", "success": false})
+    );
+
+    // git branch -d prints "Deleted branch" on stdout
+    let resp = post_coder(&h, "git_branch_delete", json!({"sandbox": "repo", "name": "merged"})).await;
+    assert_eq!(resp.json()["success"], json!(true), "{}", resp.body);
+    assert!(resp.json()["data"].as_str().unwrap().starts_with("Deleted branch merged (was "), "{}", resp.body);
+    assert_eq!(run_git(&repo, &["branch", "--list", "merged"]), "");
+
+    // -d refuses unmerged work, git's refusal is on stderr
+    let resp = post_coder(&h, "git_branch_delete", json!({"sandbox": "repo", "name": "wip"})).await;
+    assert_eq!(resp.json()["success"], json!(false));
+    assert!(resp.json()["data"].as_str().unwrap().contains("not fully merged"), "{}", resp.body);
+
+    let resp = post_coder(&h, "git_branch_delete", json!({"sandbox": "repo", "name": "wip", "force": true})).await;
+    assert_eq!(resp.json()["success"], json!(true), "{}", resp.body);
+    assert!(resp.json()["data"].as_str().unwrap().starts_with("Deleted branch wip (was "), "{}", resp.body);
+}
+
+#[tokio::test]
+async fn git_conflicts_lists_unmerged_files_and_answers_empty_lists_otherwise() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = repo_in_merge_conflict(root.path());
+    let h = harness_with_coder(&repo).await;
+
+    // the python answer is the bare dict, not the success envelope
+    assert_eq!(h.get("/api/ext/coder/git_conflicts?sandbox=repo").await.json(), json!({"data": {"conflicts": ["a.txt"]}, "success": true}));
+    assert_eq!(h.get("/api/ext/coder/git_conflicts").await.json(), json!({"data": "no sandbox given", "success": false}));
+}
+
+#[tokio::test]
+async fn git_conflicts_answers_an_empty_list_when_git_fails() {
+    // a sandbox outside any repository: git diff fails, so python answers an empty list
+    let root = tempfile::tempdir().expect("sandbox root");
+    let plain = root.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let h = harness_with_coder(&plain).await;
+    assert_eq!(h.get("/api/ext/coder/git_conflicts?sandbox=plain").await.json(), json!({"data": {"conflicts": []}, "success": true}));
+}
+
+#[tokio::test]
+async fn git_conflicts_is_a_read_so_read_only_mode_still_answers() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = repo_in_merge_conflict(root.path());
+    let h = harness_with_coder(&repo).await;
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    assert_eq!(h.get("/api/ext/coder/git_conflicts?sandbox=repo").await.json(), json!({"data": {"conflicts": ["a.txt"]}, "success": true}));
+    assert_eq!(
+        post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "a.txt"})).await.json(),
+        json!({"data": "coder is in read-only mode", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn git_resolve_takes_one_side_or_keeps_both_and_stages_the_file() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = repo_in_merge_conflict(root.path());
+    let h = harness_with_coder(&repo).await;
+
+    assert_eq!(
+        post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "a.txt", "strategy": "sideways"})).await.json(),
+        json!({"data": "strategy must be 'ours', 'theirs', or 'both'", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "git_resolve", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "sandbox and path are both required", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "../../outside.txt"})).await.json(),
+        json!({"data": "path escapes the sandbox: ../../outside.txt", "success": false})
+    );
+
+    // the default strategy is ours, and the answer names the strategy
+    let resp = post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "a.txt"})).await;
+    assert_eq!(resp.json(), json!({"data": "resolved a.txt (ours)", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "main\n");
+    assert_eq!(h.get("/api/ext/coder/git_conflicts?sandbox=repo").await.json(), json!({"data": {"conflicts": []}, "success": true}));
+}
+
+#[tokio::test]
+async fn git_resolve_theirs_takes_the_incoming_side() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = repo_in_merge_conflict(root.path());
+    let h = harness_with_coder(&repo).await;
+    let resp = post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "a.txt", "strategy": "theirs"})).await;
+    assert_eq!(resp.json(), json!({"data": "resolved a.txt (theirs)", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "topic\n");
+}
+
+#[tokio::test]
+async fn git_resolve_both_concatenates_the_sides_without_markers() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = repo_in_merge_conflict(root.path());
+    let h = harness_with_coder(&repo).await;
+    let resp = post_coder(&h, "git_resolve", json!({"sandbox": "repo", "path": "a.txt", "strategy": "both"})).await;
+    assert_eq!(resp.json(), json!({"data": "resolved a.txt (both)", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "main\ntopic\n");
+    assert_eq!(h.get("/api/ext/coder/git_conflicts?sandbox=repo").await.json(), json!({"data": {"conflicts": []}, "success": true}));
+}
+
+#[tokio::test]
+async fn coder_git_sync_routes_keep_their_python_methods() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+    let resp = h.send(post_json("/api/ext/coder/git_conflicts", "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "POST git_conflicts");
+    assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
+    for path in ["git_fetch", "git_pull", "git_branch_create", "git_branch_delete", "git_resolve"] {
+        let resp = h.get(&format!("/api/ext/coder/{path}")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "GET {path}");
+        assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}), "GET {path}");
+    }
+}
+
+#[tokio::test]
+async fn coder_git_sync_writes_are_refused_in_read_only_mode() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    for (route, body) in [
+        ("git_fetch", json!({"sandbox": "repo"})),
+        ("git_pull", json!({"sandbox": "repo"})),
+        ("git_branch_create", json!({"sandbox": "repo", "name": "x"})),
+        ("git_branch_delete", json!({"sandbox": "repo", "name": "x"})),
+        ("git_resolve", json!({"sandbox": "repo", "path": "a.txt"})),
+    ] {
+        let resp = post_coder(&h, route, body).await;
+        assert_eq!(resp.json(), json!({"data": "coder is in read-only mode", "success": false}), "{route}");
+    }
+}
