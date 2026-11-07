@@ -112,20 +112,49 @@ pub fn py_int(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f.trunc() as i64)),
         Value::Bool(b) => Some(*b as i64),
-        Value::String(s) => {
-            let t = s.trim().replace('_', "");
-            if t.is_empty() {
-                return None;
-            }
-            t.parse::<i64>().ok()
-        }
+        Value::String(s) => py_int_str(s),
         _ => None,
     }
 }
 
-/// python `int(s)` for str
+static DECIMAL_DIGIT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
+
+/// value of a unicode decimal digit (category Nd); unicode keeps each Nd run in blocks of ten
+/// digits that start at zero, so the offset from the start of the run is the digit value
+fn decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - '0' as u32);
+    }
+    let is_nd = |c: char| DECIMAL_DIGIT.is_match(c.encode_utf8(&mut [0; 4]));
+    if !is_nd(c) {
+        return None;
+    }
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).map(is_nd).unwrap_or(false) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// python `int(s)` for str: surrounding whitespace, an optional sign, unicode decimal digits and
+/// single underscores between digits. Values beyond the i64 range saturate, which keeps every
+/// range check the callers make (hour, minute, weekday) failing exactly as python's bigints do.
 pub fn py_int_str(s: &str) -> Option<i64> {
-    py_int(&Value::String(s.to_string()))
+    const BIG: i128 = 1 << 70;
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for c in body.chars().filter(|c| *c != '_') {
+        value = (value * 10 + decimal_value(c)? as i128).min(BIG);
+    }
+    let value = if negative { -value } else { value };
+    Some(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 /// `int(query.get(key, default) or default)` with ValueError -> default
@@ -231,6 +260,22 @@ mod tests {
         assert_eq!(py_datetime(2024, 2, 30, 0, 0).unwrap_err(), "day is out of range for month");
         assert_eq!(py_datetime(2024, 2, 29, 24, 0).unwrap_err(), "hour must be in 0..23");
         assert!(py_datetime(2024, 2, 29, 23, 59).is_ok());
+    }
+
+    #[test]
+    fn py_int_str_follows_python_int_syntax() {
+        // underscores only between digits, single
+        assert_eq!(py_int_str("1_0"), Some(10));
+        assert_eq!(py_int_str("_5"), None);
+        assert_eq!(py_int_str("5_"), None);
+        assert_eq!(py_int_str("1__0"), None);
+        // unicode decimal digits (arabic-indic 12) are accepted, superscript two is not
+        assert_eq!(py_int_str("\u{0661}\u{0662}"), Some(12));
+        assert_eq!(py_int_str("\u{00b2}"), None);
+        // arbitrary size digit strings do not fail to parse; they saturate so range checks still fail
+        assert_eq!(py_int_str("99999999999999999999"), Some(i64::MAX));
+        assert_eq!(py_int_str("-99999999999999999999"), Some(i64::MIN));
+        assert_eq!(py_int_str("+7"), Some(7));
     }
 
     #[test]

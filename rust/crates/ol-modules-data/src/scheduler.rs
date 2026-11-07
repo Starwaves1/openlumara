@@ -28,10 +28,22 @@ use std::sync::Arc;
 /// but without going through config::get_module_structure() (which evaluates this
 /// module's own settings -> infinite recursion).
 pub fn available_channels() -> Vec<String> {
-    let names = ol_core::config::available_names("channels")
+    // python's metadata_registry takes each name's type from the last section that holds it
+    // (channels, user_channels, modules, user_modules), so a name also in a module section is not a channel
+    let shadowed: std::collections::HashSet<String> = ol_core::config::available_names("modules")
         .into_iter()
-        .chain(ol_core::config::available_names("user_channels"));
-    dedup_keep_first(names)
+        .chain(ol_core::config::available_names("user_modules"))
+        .collect();
+    listed_channels(
+        ol_core::config::available_names("channels"),
+        ol_core::config::available_names("user_channels"),
+        &shadowed,
+    )
+}
+
+/// channel names as python's get_available_channels() lists them
+fn listed_channels(channels: Vec<String>, user_channels: Vec<String>, shadowed: &std::collections::HashSet<String>) -> Vec<String> {
+    dedup_keep_first(channels.into_iter().chain(user_channels).filter(|n| !shadowed.contains(n)))
 }
 
 /// python keys metadata_registry by name, so a name listed in both sections appears once, at its first position
@@ -1152,6 +1164,35 @@ impl Module for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_listing_drops_names_shadowed_by_a_module_section() {
+        let shadowed: std::collections::HashSet<String> = ["both_mod".to_string()].into_iter().collect();
+        let names = listed_channels(
+            vec!["alpha".into(), "both_mod".into(), "beta".into()],
+            vec!["beta".into(), "both_mod".into(), "gamma".into()],
+            &shadowed,
+        );
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn clock_recur_parses_like_python_int() {
+        // an oversized hour reaches the range check, as python's bigint does
+        let err = ui_build_recur("clock", "", "99999999999999999999:00", None).unwrap().unwrap_err();
+        assert_eq!(err, "time out of range");
+        // python int() rejects a misplaced underscore, so the format error wins
+        let err = ui_build_recur("clock", "", "_5:00", None).unwrap().unwrap_err();
+        assert_eq!(err, "invalid time format, use HH:MM");
+        // a single underscore between digits is fine
+        let recur = ui_build_recur("clock", "", "1_0:30", None).unwrap().unwrap();
+        assert_eq!(recur["target_hour"], json!(10));
+        assert_eq!(recur["target_minute"], json!(30));
+        // oversized weekday is out of range, not an invalid weekday
+        let big = json!("99999999999999999999");
+        let err = ui_build_recur("clock", "", "10:00", Some(&big)).unwrap().unwrap_err();
+        assert_eq!(err, "weekday must be between 0 (Monday) and 6 (Sunday)");
+    }
 
     #[test]
     fn list_sorts_on_stored_trigger_time_with_falsy_last() {
