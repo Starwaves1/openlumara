@@ -4,7 +4,7 @@ use crate::util;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use std::sync::Arc;
-use ol_core::pyjson::py_str;
+use ol_core::pyjson::{py_str, truthy};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -28,25 +28,41 @@ impl Docs {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
 
-    fn folders(&self) -> Vec<String> {
-        match self.base.config.get1("folders") {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) if !s.is_empty() => s.chars().map(|c| c.to_string()).collect(),
-            _ => Vec::new(),
+    /// python `for f in folders` after `if not folders`: a list yields its items, a string its characters
+    /// and a dict its keys. Any other truthy value fails the iteration like python does.
+    fn folder_items(&self) -> anyhow::Result<Vec<Value>> {
+        let folders = self.base.config.get1("folders");
+        if !folders.as_ref().is_some_and(truthy) {
+            return Ok(Vec::new());
+        }
+        match folders {
+            Some(Value::Array(a)) => Ok(a),
+            Some(Value::String(s)) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+            Some(Value::Object(o)) => Ok(o.keys().map(|k| Value::String(k.clone())).collect()),
+            Some(other) => anyhow::bail!("'{}' object is not iterable", util::py_type_name(&other)),
+            None => Ok(Vec::new()),
         }
     }
 
     /// translates the folder path list into basenames for the AI
-    pub fn get_folder_names(&self) -> Vec<String> {
-        self.folders().iter().map(|f| util::basename(&util::rstrip_sep(f))).collect()
+    pub fn get_folder_names(&self) -> anyhow::Result<Vec<String>> {
+        self.folder_items()?
+            .iter()
+            .map(|item| {
+                // python calls f.rstrip() on each entry, which fails for a non-str entry
+                let f = item.as_str().ok_or_else(|| anyhow::anyhow!("'{}' object has no attribute 'rstrip'", util::py_type_name(item)))?;
+                Ok(util::basename(&util::rstrip_sep(f)))
+            })
+            .collect()
     }
 
     /// resolves a folder basename to its full path
     pub fn get_folder_path(&self, folder: &str) -> anyhow::Result<Option<String>> {
         let wanted = util::rstrip_sep(folder);
-        for f in self.folders() {
-            if util::basename(&util::rstrip_sep(&f)) == wanted {
-                return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&f))?)));
+        for item in self.folder_items()? {
+            let f = item.as_str().ok_or_else(|| anyhow::anyhow!("'{}' object has no attribute 'rstrip'", util::py_type_name(&item)))?;
+            if util::basename(&util::rstrip_sep(f)) == wanted {
+                return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(f))?)));
             }
         }
         Ok(None)
@@ -105,8 +121,16 @@ impl Module for Docs {
     }
 
     async fn on_ready(&self) -> anyhow::Result<()> {
-        for folder in self.folders() {
-            let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&folder))?);
+        for item in self.folder_items()? {
+            // python os.path.expanduser() fails for a non-str entry before anything is created
+            let Some(folder) = item.as_str() else {
+                anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(&item));
+            };
+            let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(folder))?);
+            // python os.makedirs() raises ValueError for a NUL in the path; std reports a different text
+            if p.contains('\0') {
+                anyhow::bail!("embedded null byte");
+            }
             std::fs::create_dir_all(&p).map_err(|e| anyhow::anyhow!(util::os_error(&e, &p)))?;
         }
         if self.base.config.get_bool("insert_system_prompt") {
@@ -116,7 +140,7 @@ impl Module for Docs {
     }
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
-        let folders = self.get_folder_names();
+        let folders = self.get_folder_names()?;
         if folders.is_empty() {
             return Ok(None);
         }
@@ -125,7 +149,7 @@ impl Module for Docs {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()), true)),
+            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()?), true)),
             "list" => {
                 let folder = args.str("folder").unwrap_or_default();
                 let subfolder = args.str("subfolder");
@@ -167,7 +191,7 @@ impl Module for Docs {
     async fn ui_route(&self, path: &str, _method: &str, _body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         match path {
             // doc folder basenames for the sidebar dropdown
-            "folders" => Ok(json!(self.get_folder_names())),
+            "folders" => Ok(json!(self.get_folder_names()?)),
             // one directory level: {subfolders: [...], files: [...]} relative paths
             "list" => {
                 let folder = query_str(&query, "folder");
@@ -244,8 +268,13 @@ mod tests {
         std::fs::create_dir_all(guide.join("sub")).unwrap();
         std::fs::write(guide.join("a.md"), "hello docs\r\nsecond line").unwrap();
         std::fs::write(guide.join("sub").join("b.md"), "nested").unwrap();
+        (install_config(json!([guide.to_string_lossy()]), insert_system_prompt), dir)
+    }
+
+    /// installs a docs config with the given raw `folders` value and returns the module
+    fn install_config(folders: Value, insert_system_prompt: bool) -> Docs {
         let settings: Map<String, Value> = Map::from_iter([
-            ("folders".to_string(), json!([guide.to_string_lossy()])),
+            ("folders".to_string(), folders),
             ("insert_system_prompt".to_string(), json!(insert_system_prompt)),
         ]);
         let data = json!({"modules": {"settings": {"docs": settings}}});
@@ -254,7 +283,7 @@ mod tests {
         // so the same data is written to it (JSON is valid YAML)
         let path = ol_core::config::config_path().expect("test config path");
         std::fs::write(&path, data.to_string()).expect("write test config");
-        (Docs::new(ModuleBase::detached("docs")), dir)
+        Docs::new(ModuleBase::detached("docs"))
     }
 
     #[test]
@@ -349,5 +378,46 @@ mod tests {
         assert_eq!(read, json!({"path": "a.md", "content": "hello docs\nsecond line"}));
         let bad = block_on(m.ui_route("read", "GET", None, query(json!({"folder": "guide"})))).unwrap();
         assert_eq!(bad, json!({"status": "error", "content": "folder and path are both required"}));
+    }
+
+    #[test]
+    fn null_folder_entry_fails_like_python() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let guide = dir.path().join("guide");
+        let m = install_config(json!([guide.to_string_lossy(), null]), true);
+        // python on_ready: os.path.expanduser(None) raises before the get_topics tool is disabled
+        let err = block_on(m.on_ready()).unwrap_err();
+        assert_eq!(err.to_string(), "expected str, bytes or os.PathLike object, not NoneType");
+        assert!(m.disabled_tools().is_empty());
+        // get_topics: python's f.rstrip() on None raises, and the tool does not catch it
+        let err = block_on(m.call_tool("get_topics", ToolArgs::default())).unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'rstrip'");
+        // list catches the error and returns it as an error result (no match, so the scan reaches the null)
+        let out = block_on(m.call_tool("list", args(json!({"folder": "nope"})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "'NoneType' object has no attribute 'rstrip'"}));
+    }
+
+    #[test]
+    fn folders_value_that_is_not_iterable_fails_like_python() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = install_config(json!(5), true);
+        let err = block_on(m.on_system_prompt()).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object is not iterable");
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide"})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "'int' object is not iterable"}));
+        // a falsy folders value is the same as no folders (python's `if not folders`)
+        let m = install_config(json!(0), true);
+        assert_eq!(block_on(m.on_system_prompt()).unwrap(), None);
+    }
+
+    #[test]
+    fn nul_in_configured_folder_fails_like_python_makedirs() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = install_config(json!(["/tmp/docs\u{0}x"]), true);
+        // python os.makedirs() raises ValueError('embedded null byte'); nothing is disabled
+        let err = block_on(m.on_ready()).unwrap_err();
+        assert_eq!(err.to_string(), "embedded null byte");
+        assert!(m.disabled_tools().is_empty());
     }
 }

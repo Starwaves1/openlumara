@@ -354,8 +354,9 @@ fn find_chars(hay: &[char], needle: &[char], start: usize) -> Option<usize> {
 /// os.listdir: names only, as raw OS names so callers can test each entry on disk. a read error part
 /// way through fails the whole listing, like python.
 pub fn listdir(path: &str) -> Result<Vec<OsString>, String> {
+    // python: os.listdir() rejects a NUL in the path with the same ValueError as open()
     if path.contains('\0') {
-        return Err("listdir: embedded null character in path".to_string());
+        return Err("embedded null byte".to_string());
     }
     let rd = std::fs::read_dir(path).map_err(|e| os_error(&e, path))?;
     let mut names = Vec::new();
@@ -519,7 +520,7 @@ mod tests {
     fn nul_in_path_raises_like_python() {
         // python: open('a\0b') -> ValueError 'embedded null byte'; os.listdir('a\0b') -> ValueError
         assert_eq!(read_text("a\0b").unwrap_err(), "embedded null byte");
-        assert_eq!(listdir("a\0b").unwrap_err(), "listdir: embedded null character in path");
+        assert_eq!(listdir("a\0b").unwrap_err(), "embedded null byte");
     }
 
     #[test]
