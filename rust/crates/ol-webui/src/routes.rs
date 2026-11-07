@@ -10,7 +10,10 @@ use crate::listing::{
 };
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
-use crate::util::{export_chat_text, get_strip, or_strip, py_int, py_int_str, py_slice, py_strip, py_type_name};
+use crate::util::{
+    export_chat_text, get_strip, or_strip, py_contains, py_int, py_int_str, py_iter, py_slice, py_sorted_unique, py_strip,
+    py_type_name,
+};
 use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -25,7 +28,6 @@ use ol_core::pyjson::{py_str, truthy};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// registers the `/api` chat, stream, input history, settings, library and system routes
@@ -38,9 +40,9 @@ pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
         .route("/api/chats", get_only(get_chats))
         .route("/api/chats/days", get_only(get_chat_days))
         .route("/api/chats/day", get_only(get_chats_for_day))
-        .route("/api/chats/categories", get(get_chat_categories))
-        .route("/api/chats/categories/count", get(get_chat_category_counts))
-        .route("/api/chats/tags", get(get_chat_tags))
+        .route("/api/chats/categories", get_only(get_chat_categories))
+        .route("/api/chats/categories/count", get_only(get_chat_category_counts))
+        .route("/api/chats/tags", get_only(get_chat_tags))
         .route("/api/chats/categories/create", post(create_chat_category))
         .route("/api/chats/categories/delete", post(delete_chat_category))
         .route("/api/chats/search", post(search_chats))
@@ -170,51 +172,58 @@ async fn chat_with_details(ch: &Channel) -> Option<Value> {
     Some(chat)
 }
 
-/// python `chat_store.get_categories()` mapped through `c or "general"`, sorted, "general" first
-pub fn category_names(categories: &[Value]) -> Vec<String> {
-    let set: BTreeSet<String> = categories
-        .iter()
-        .map(|c| if truthy(c) { py_str(c) } else { "general".to_string() })
-        .collect();
-    let mut out: Vec<String> = set.into_iter().collect();
-    if let Some(pos) = out.iter().position(|c| c == "general") {
-        out.remove(pos);
-        out.insert(0, "general".to_string());
+/// python `sorted(set(c or "general" for c in chat_store.get_categories()))` with "general" moved first
+pub fn category_names(categories: &[Value]) -> Result<Vec<Value>, String> {
+    let mapped: Vec<Value> = categories.iter().map(|c| if truthy(c) { c.clone() } else { json!("general") }).collect();
+    let mut out = py_sorted_unique(mapped)?;
+    let general = json!("general");
+    if let Some(pos) = out.iter().position(|c| *c == general) {
+        let g = out.remove(pos);
+        out.insert(0, g);
     }
-    out
+    Ok(out)
 }
 
-/// python `{chat.get("category") or "general": count}` over the chat index
-pub fn category_counts(chats: &[Value]) -> Map<String, Value> {
+/// python `{chat.get("category") or "general": count}` over the chat index, first-seen key order
+pub fn category_counts(chats: &[Value]) -> Result<Map<String, Value>, String> {
     let mut counts = Map::new();
     for chat in chats {
         let cat = match chat.get("category") {
-            Some(c) if truthy(c) => py_str(c),
-            _ => "general".to_string(),
+            Some(c) if truthy(c) => c.clone(),
+            _ => json!("general"),
         };
-        let n = counts.get(&cat).and_then(Value::as_i64).unwrap_or(0) + 1;
-        counts.insert(cat, json!(n));
+        if matches!(cat, Value::Array(_) | Value::Object(_)) {
+            return Err(format!("unhashable type: '{}'", py_type_name(&cat)));
+        }
+        let key = py_str(&cat);
+        let n = counts.get(&key).and_then(Value::as_i64).unwrap_or(0) + 1;
+        counts.insert(key, json!(n));
     }
-    counts
+    Ok(counts)
 }
 
-/// python sorted set of every truthy string tag in the chats
-pub fn tag_names(chats: &[Value]) -> Vec<String> {
-    let mut tags = BTreeSet::new();
+/// python `sorted(set(t for chat in chats for t in (chat.get("tags") or []) if t))`
+pub fn tag_names(chats: &[Value]) -> Result<Vec<Value>, String> {
+    let mut items = Vec::new();
     for chat in chats {
-        if let Some(list) = chat.get("tags").and_then(Value::as_array) {
-            for tag in list.iter().filter(|t| truthy(t)) {
-                tags.insert(py_str(tag));
-            }
+        let Some(tags) = chat.get("tags").filter(|t| truthy(t)) else { continue };
+        items.extend(py_iter(tags)?.into_iter().filter(truthy));
+    }
+    py_sorted_unique(items)
+}
+
+/// python `all(t in (r.get("tags") or []) for t in tags)`, short-circuiting like `all`
+fn has_all_tags(chat: &Value, tags: &[Value]) -> Result<bool, String> {
+    let have = match chat.get("tags") {
+        Some(v) if truthy(v) => v,
+        _ => return Ok(tags.is_empty()),
+    };
+    for t in tags {
+        if !py_contains(have, t)? {
+            return Ok(false);
         }
     }
-    tags.into_iter().collect()
-}
-
-/// python `all(t in (r.get("tags") or []) for t in tags)`
-fn has_all_tags(chat: &Value, tags: &[Value]) -> bool {
-    let have = chat.get("tags").and_then(Value::as_array);
-    tags.iter().all(|t| have.is_some_and(|h| h.iter().any(|x| x == t)))
+    Ok(true)
 }
 
 /// python `re.sub(r'[\\/:*?"<>|]', "_", title).strip() or "chat-export"` + ".txt"
@@ -366,19 +375,22 @@ async fn get_chats_for_day(State(app): State<Arc<Shared>>, RawQuery(raw): RawQue
 
 async fn get_chat_categories(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    reply(json!(category_names(&ch.chat.get_categories())), true)
+    let Ok(names) = category_names(&ch.chat.get_categories()) else { return internal_error() };
+    reply(json!(names), true)
 }
 
 async fn get_chat_category_counts(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    reply(Value::Object(category_counts(&ch.chat.data())), true)
+    let Ok(counts) = category_counts(&ch.chat.data()) else { return internal_error() };
+    reply(Value::Object(counts), true)
 }
 
 async fn get_chat_tags(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let q = QueryParams::parse(raw.as_deref());
     let Ok(chats) = chats_in(&ch, category_filter(q.get("category")), &[]) else { return internal_error() };
-    reply(json!(tag_names(&chats)), true)
+    let Ok(tags) = tag_names(&chats) else { return internal_error() };
+    reply(json!(tags), true)
 }
 
 // ------------------
@@ -395,7 +407,16 @@ async fn create_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
         },
         _ => String::new(),
     };
-    let category = match validate_category_name(&name, &ch.chat.data()) {
+    // python checks the format first; then `(chat.get("category") or "general").lower()` over every chat
+    // raises AttributeError for a truthy non-string category, which reaches starlette as the plain 500
+    if let Err(error) = validate_category_format(&name) {
+        return reply(json!(error), false);
+    }
+    let chats = ch.chat.data();
+    if chats.iter().any(|c| matches!(c.get("category"), Some(v) if truthy(v) && !v.is_string())) {
+        return internal_error();
+    }
+    let category = match validate_category_name(&name, &chats) {
         Ok(c) => c,
         Err(error) => return reply(json!(error), false),
     };
@@ -434,21 +455,31 @@ async fn delete_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
 
 /// python `search_chats` projection of one hit: group fields and highlighted title/snippets
 fn search_entry(chat: &Value, query: &str, tz: i64) -> Result<Value, String> {
-    let group = group_key(&updated_of(chat), tz)?;
+    let group = group_key(&updated_strict(chat)?, tz)?;
     let mut entry = project_chat(chat, &["title_match"]);
     entry["group_key"] = json!(if group.is_empty() { "undated".to_string() } else { group.clone() });
     entry["group_label"] = json!(day_label_from_key(&group, tz)?);
-    entry["title_highlighted"] = json!(highlight_query(Some(chat.get("title").and_then(Value::as_str).unwrap_or("")), query).unwrap_or_default());
-    let snippets: Vec<Value> = chat
-        .get("message_snippets")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|s| json!(highlight_query(Some(s.as_str().unwrap_or("")), query).unwrap_or_default()))
-                .collect()
+    // python `highlight_query(chat.get("title") or "", query)`: a truthy non-string title is str()-ed
+    let title = match chat.get("title") {
+        Some(v) if truthy(v) => py_str(v),
+        _ => String::new(),
+    };
+    entry["title_highlighted"] = json!(highlight_query(Some(title.as_str()), query));
+    // python `[highlight_query(s, query) for s in (chat.get("message_snippets") or [])]`: a null snippet stays null
+    let snippets = match chat.get("message_snippets") {
+        Some(v) if truthy(v) => py_iter(v)?,
+        _ => Vec::new(),
+    };
+    let snippets: Vec<Value> = snippets
+        .iter()
+        .map(|s| match s {
+            Value::Null => Value::Null,
+            other => {
+                    let text = py_str(other);
+                    json!(highlight_query(Some(text.as_str()), query))
+                }
         })
-        .unwrap_or_default();
+        .collect();
     entry["snippets_highlighted"] = json!(snippets);
     Ok(entry)
 }
@@ -475,12 +506,21 @@ async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
         });
     }
 
-    let tags: Vec<Value> = match obj.get("tags") {
-        Some(Value::Array(items)) => items.clone(),
-        _ => Vec::new(),
-    };
-    if !tags.is_empty() {
-        results.retain(|r| has_all_tags(r, &tags));
+    // python `data.get("tags") or []` is iterated per result, so a non-iterable tags value only fails
+    // when there is at least one result to test
+    if let Some(tags_value) = obj.get("tags").filter(|t| truthy(t)) {
+        if !results.is_empty() {
+            let Ok(tags) = py_iter(tags_value) else { return internal_error() };
+            let mut kept = Vec::new();
+            for r in results {
+                match has_all_tags(&r, &tags) {
+                    Ok(true) => kept.push(r),
+                    Ok(false) => {}
+                    Err(_) => return internal_error(),
+                }
+            }
+            results = kept;
+        }
     }
 
     // python: updated-descending unless sort=relevance (the BM25 order is kept then)
@@ -791,15 +831,18 @@ mod tests {
     #[test]
     fn categories_put_general_first_and_map_falsy_to_general() {
         let cats = vec![json!("work"), Value::Null, json!("general"), json!("alpha"), json!("")];
-        assert_eq!(category_names(&cats), vec!["general", "alpha", "work"]);
+        assert_eq!(category_names(&cats).unwrap(), vec![json!("general"), json!("alpha"), json!("work")]);
+        // python sorts a mix of strings and numbers in a set: TypeError
+        assert!(category_names(&[json!("work"), json!(3)]).is_err());
     }
 
     #[test]
     fn category_counts_group_missing_and_empty_under_general() {
         let chats = vec![json!({"category": "work"}), json!({}), json!({"category": ""}), json!({"category": "work"})];
-        let counts = category_counts(&chats);
+        let counts = category_counts(&chats).unwrap();
         assert_eq!(counts.get("work"), Some(&json!(2)));
         assert_eq!(counts.get("general"), Some(&json!(2)));
+        assert!(category_counts(&[json!({"category": ["x"]})]).is_err());
     }
 
     #[test]

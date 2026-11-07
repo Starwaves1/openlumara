@@ -250,6 +250,61 @@ pub fn py_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// python `for x in value`: lists yield their items, strings their characters, dicts their keys;
+/// Err where python raises TypeError (numbers, bools, null)
+pub fn py_iter(v: &Value) -> Result<Vec<Value>, String> {
+    match v {
+        Value::Array(items) => Ok(items.clone()),
+        Value::String(s) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+        Value::Object(m) => Ok(m.keys().map(|k| Value::String(k.clone())).collect()),
+        other => Err(format!("'{}' object is not iterable", py_type_name(other))),
+    }
+}
+
+/// python `item in container`; Err where python raises TypeError
+pub fn py_contains(container: &Value, item: &Value) -> Result<bool, String> {
+    match container {
+        Value::Array(items) => Ok(items.iter().any(|x| py_eq(x, item))),
+        Value::String(s) => match item {
+            Value::String(needle) => Ok(s.contains(needle.as_str())),
+            other => Err(format!("'in <string>' requires string as left operand, not {}", py_type_name(other))),
+        },
+        Value::Object(m) => match item {
+            Value::Array(_) | Value::Object(_) => Err(format!("unhashable type: '{}'", py_type_name(item))),
+            Value::String(key) => Ok(m.contains_key(key)),
+            _ => Ok(false),
+        },
+        other => Err(format!("argument of type '{}' is not iterable", py_type_name(other))),
+    }
+}
+
+/// python `sorted(set(items))`: duplicates removed by python equality (first kept), then ordered.
+/// strings order among themselves, numbers and bools among themselves; a mix, or an unhashable
+/// list/dict item, raises in python and gives Err here
+pub fn py_sorted_unique(items: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut unique: Vec<Value> = Vec::new();
+    for item in items {
+        if matches!(item, Value::Array(_) | Value::Object(_)) {
+            return Err(format!("unhashable type: '{}'", py_type_name(&item)));
+        }
+        if !unique.iter().any(|u| py_eq(u, &item)) {
+            unique.push(item);
+        }
+    }
+    if unique.iter().all(Value::is_string) {
+        unique.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    } else if unique.iter().all(|v| matches!(v, Value::Number(_) | Value::Bool(_))) {
+        let num = |v: &Value| match v {
+            Value::Bool(b) => *b as i64 as f64,
+            other => other.as_f64().unwrap_or(0.0),
+        };
+        unique.sort_by(|a, b| num(a).partial_cmp(&num(b)).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        return Err("'<' not supported between instances of the mixed types in the set".into());
+    }
+    Ok(unique)
+}
+
 /// python `bool(value)`; missing values are falsy
 pub fn truthy_opt(v: Option<&Value>) -> bool {
     v.map(truthy).unwrap_or(false)
@@ -402,6 +457,26 @@ pub fn export_turns_text(turns: &[Value]) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn py_iteration_and_membership_follow_python() {
+        assert_eq!(py_iter(&json!("ab")).unwrap(), vec![json!("a"), json!("b")]);
+        assert_eq!(py_iter(&json!({"k": 1})).unwrap(), vec![json!("k")]);
+        assert!(py_iter(&json!(5)).is_err());
+        assert!(py_contains(&json!("money"), &json!("one")).unwrap());
+        assert!(py_contains(&json!("money"), &json!(1)).is_err());
+        assert!(py_contains(&json!(["a", 1]), &json!(1.0)).unwrap());
+        assert!(!py_contains(&json!({"k": 1}), &json!(1)).unwrap());
+        assert!(py_contains(&json!({"k": 1}), &json!([])).is_err());
+    }
+
+    #[test]
+    fn sorted_unique_orders_one_kind_and_rejects_mixes() {
+        assert_eq!(py_sorted_unique(vec![json!("b"), json!("a"), json!("b")]).unwrap(), vec![json!("a"), json!("b")]);
+        assert_eq!(py_sorted_unique(vec![json!(2), json!(1.0), json!(1)]).unwrap(), vec![json!(1.0), json!(2)]);
+        assert!(py_sorted_unique(vec![json!("a"), json!(1)]).is_err());
+        assert!(py_sorted_unique(vec![json!(["x"])]).is_err());
+    }
 
     #[test]
     fn display_call_matches_python_format() {

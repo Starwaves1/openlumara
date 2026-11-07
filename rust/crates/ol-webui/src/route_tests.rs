@@ -686,3 +686,194 @@ async fn chat_current_and_load_fail_with_500_when_a_stored_token_count_is_not_a_
     assert_eq!(ok.status, StatusCode::OK);
     assert_eq!(ok.json()["success"], json!(true));
 }
+
+// ------------------
+// chat categories / tags / search (channels/webui/channel.py api-3)
+// ------------------
+
+fn post_json(uri: &str, body: &str) -> Request<Body> {
+    request(Method::POST, uri, None, Some("application/json"), body)
+}
+
+#[tokio::test]
+async fn get_chat_categories_lists_sorted_names_with_general_first() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "w", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "alpha", "a", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "general", "g", "2026-11-01T10:00:00", &[]).await;
+    let resp = h.get("/api/chats/categories").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.json(), json!({"data": ["general", "alpha", "work"], "success": true}));
+}
+
+#[tokio::test]
+async fn get_chat_category_counts_counts_each_category_and_missing_as_general() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "w1", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "work", "w2", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "general", "g", "2026-11-01T10:00:00", &[]).await;
+    let resp = h.get("/api/chats/categories/count").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.json(), json!({"data": {"work": 2, "general": 1}, "success": true}));
+}
+
+#[tokio::test]
+async fn get_chat_tags_lists_sorted_unique_tags_scoped_by_category() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "w1", "2026-11-01T10:00:00", &["urgent", "bug"]).await;
+    chat_at(&h, "work", "w2", "2026-11-01T10:00:00", &["bug", ""]).await;
+    chat_at(&h, "home", "h1", "2026-11-01T10:00:00", &["recipe"]).await;
+    let all = h.get("/api/chats/tags").await;
+    assert_eq!(all.json(), json!({"data": ["bug", "recipe", "urgent"], "success": true}));
+    let work = h.get("/api/chats/tags?category=work").await;
+    assert_eq!(work.json(), json!({"data": ["bug", "urgent"], "success": true}));
+}
+
+#[tokio::test]
+async fn category_get_routes_answer_head_and_post_with_405_allow_get() {
+    let h = harness(false).await;
+    for uri in ["/api/chats/categories", "/api/chats/categories/count", "/api/chats/tags"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "HEAD {uri}");
+        assert!(resp.body.is_empty(), "HEAD {uri} body: {}", resp.body);
+        let resp = h.send(request(Method::POST, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "POST {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "POST {uri}");
+    }
+}
+
+#[tokio::test]
+async fn create_chat_category_validates_then_opens_a_chat_in_the_new_category() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "w", "2026-11-01T10:00:00", &[]).await;
+
+    let created = h.send(post_json("/api/chats/categories/create", r#"{"name": "  Travel  "}"#)).await;
+    assert_eq!(created.status, StatusCode::OK);
+    let id = created.json()["data"]["id"].as_str().expect("new chat id").to_string();
+    assert_eq!(created.json()["success"], json!(true));
+    let chats = h.ch.chat.data();
+    let new_chat = chats.iter().find(|c| c["id"] == json!(id)).expect("new chat in index");
+    assert_eq!(new_chat["category"], json!("travel"));
+
+    let dup = h.send(post_json("/api/chats/categories/create", r#"{"name": "WORK"}"#)).await;
+    assert_eq!(dup.json(), json!({"data": "'work' already exists", "success": false}));
+    let colon = h.send(post_json("/api/chats/categories/create", r#"{"name": "a:b"}"#)).await;
+    assert_eq!(colon.json(), json!({"data": "':' is reserved for subcategories", "success": false}));
+    let blank = h.send(post_json("/api/chats/categories/create", r#"{"name": "  "}"#)).await;
+    assert_eq!(blank.json(), json!({"data": "category name cannot be empty", "success": false}));
+    let missing = h.send(post_json("/api/chats/categories/create", "{}")).await;
+    assert_eq!(missing.json(), json!({"data": "category name cannot be empty", "success": false}));
+    // a non-string name raises in python's .strip(): the plain 500
+    let number = h.send(post_json("/api/chats/categories/create", r#"{"name": 5}"#)).await;
+    assert_eq!(number.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn delete_chat_category_moves_its_chats_to_general() {
+    let h = harness(false).await;
+    let w1 = chat_at(&h, "work", "w1", "2026-11-01T10:00:00", &[]).await;
+    let w2 = chat_at(&h, "work", "w2", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "home", "h", "2026-11-01T10:00:00", &[]).await;
+
+    let refused = h.send(post_json("/api/chats/categories/delete", r#"{"name": " general "}"#)).await;
+    assert_eq!(refused.json(), json!({"data": "'general' cannot be deleted", "success": false}));
+    let blank = h.send(post_json("/api/chats/categories/delete", r#"{"name": null}"#)).await;
+    assert_eq!(blank.json(), json!({"data": "'general' cannot be deleted", "success": false}));
+
+    let nothing = h.send(post_json("/api/chats/categories/delete", r#"{"name": "missing"}"#)).await;
+    assert_eq!(nothing.json(), json!({"data": {"moved": 0}, "success": true}));
+
+    let deleted = h.send(post_json("/api/chats/categories/delete", r#"{"name": " work "}"#)).await;
+    assert_eq!(deleted.json(), json!({"data": {"moved": 2}, "success": true}));
+    let chats = h.ch.chat.data();
+    for id in [&w1, &w2] {
+        let chat = chats.iter().find(|c| c["id"] == json!(id)).expect("chat kept");
+        assert_eq!(chat["category"], json!("general"));
+    }
+    let categories = h.get("/api/chats/categories").await;
+    assert_eq!(categories.json()["data"], json!(["general", "home"]));
+}
+
+#[tokio::test]
+async fn search_chats_matches_titles_highlights_them_and_sorts_newest_first() {
+    let h = harness(false).await;
+    let older = chat_at(&h, "work", "Budget review", "2026-11-01T09:00:00", &["money"]).await;
+    let newer = chat_at(&h, "work", "Budget plan", "2026-11-02T09:00:00", &["money", "urgent"]).await;
+    chat_at(&h, "home", "Recipes", "2026-11-03T09:00:00", &[]).await;
+
+    let resp = h.send(post_json("/api/chats/search", r#"{"query": " budget "}"#)).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true));
+    let hits = body["data"].as_array().expect("hit list");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["id"], json!(newer));
+    assert_eq!(hits[1]["id"], json!(older));
+    assert_eq!(hits[0]["title_highlighted"], json!(r#"<strong class="search-highlight">Budget</strong> plan"#));
+    assert_eq!(hits[0]["title_match"], json!(true));
+    assert_eq!(hits[0]["snippets_highlighted"], json!([]));
+    assert!(hits[0]["group_key"].is_string() && hits[0]["group_label"].is_string());
+    assert_ne!(hits[0]["group_key"], json!("undated"));
+
+    // a category filter, a tag filter (AND) and the empty query
+    let in_home = h.send(post_json("/api/chats/search", r#"{"query": "budget", "category": "general"}"#)).await;
+    assert_eq!(in_home.json()["data"], json!([]));
+    let urgent = h.send(post_json("/api/chats/search", r#"{"query": "budget", "tags": ["money", "urgent"]}"#)).await;
+    assert_eq!(urgent.json()["data"].as_array().unwrap().len(), 1);
+    assert_eq!(urgent.json()["data"][0]["id"], json!(newer));
+    let empty = h.send(post_json("/api/chats/search", r#"{"query": "   "}"#)).await;
+    assert_eq!(empty.json(), json!({"data": [], "success": true}));
+}
+
+#[tokio::test]
+async fn search_chats_escapes_html_and_rejects_a_non_string_query_like_python() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "<b>Plan</b> & more", "2026-11-01T09:00:00", &[]).await;
+    let resp = h.send(post_json("/api/chats/search", r#"{"query": "plan"}"#)).await;
+    let hit = &resp.json()["data"][0];
+    assert_eq!(hit["title_highlighted"], json!(r#"&lt;b&gt;<strong class="search-highlight">Plan</strong>&lt;/b&gt; &amp; more"#));
+    // `query.strip()` on an int raises: plain 500
+    let bad = h.send(post_json("/api/chats/search", r#"{"query": 7}"#)).await;
+    assert_eq!(bad.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn category_and_search_routes_reject_a_non_json_body_with_the_plain_500() {
+    let h = harness(false).await;
+    for uri in ["/api/chats/categories/create", "/api/chats/categories/delete", "/api/chats/search"] {
+        let resp = h.send(post_json(uri, "not json")).await;
+        assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn category_routes_follow_python_type_errors_on_odd_stored_values() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "w", "2026-11-01T10:00:00", &[]).await;
+    chat_at(&h, "home", "h", "2026-11-01T10:00:00", &[]).await;
+    // a numeric category next to strings makes python's sorted(set(...)) raise
+    h.ch.chat.with_data_mut(|data| data[0]["category"] = json!(5));
+    assert_eq!(h.get("/api/chats/categories").await.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // create checks the format first, then `.lower()` on the stored non-string category raises
+    let format = h.send(post_json("/api/chats/categories/create", r#"{"name": "a:b"}"#)).await;
+    assert_eq!(format.json(), json!({"data": "':' is reserved for subcategories", "success": false}));
+    let dup = h.send(post_json("/api/chats/categories/create", r#"{"name": "fresh"}"#)).await;
+    assert_eq!(dup.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn search_tags_filter_only_fails_for_non_iterable_tags_when_there_are_results() {
+    let h = harness(false).await;
+    chat_at(&h, "work", "Budget", "2026-11-01T10:00:00", &["m", "y"]).await;
+    // `for t in 5` raises, but only once the comprehension has a result to test
+    let with_hits = h.send(post_json("/api/chats/search", r#"{"query": "budget", "tags": 5}"#)).await;
+    assert_eq!(with_hits.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let no_hits = h.send(post_json("/api/chats/search", r#"{"query": "nothing-matches", "tags": 5}"#)).await;
+    assert_eq!(no_hits.json(), json!({"data": [], "success": true}));
+    // a string is iterated by character: each character must be one of the chat's tags
+    let chars = h.send(post_json("/api/chats/search", r#"{"query": "budget", "tags": "my"}"#)).await;
+    assert_eq!(chars.json()["data"].as_array().unwrap().len(), 1);
+    let not_all = h.send(post_json("/api/chats/search", r#"{"query": "budget", "tags": "money"}"#)).await;
+    assert_eq!(not_all.json()["data"], json!([]));
+}
