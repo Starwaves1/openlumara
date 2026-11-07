@@ -53,6 +53,11 @@ fn sget(m: &Map<String, Value>, key: &str) -> String {
     }
 }
 
+/// python's `(body or {}).get("subpath", "")` passed on without stringifying
+fn subpath_of(m: &Map<String, Value>) -> Value {
+    m.get("subpath").cloned().unwrap_or(Value::Null)
+}
+
 /// python's `(body or {}).get(key, "")` for a field a write route requires: a falsy value
 /// (absent, null, "", 0, false, [], {}) is missing; a truthy value is kept as the raw JSON
 /// value, because python hands it on unchanged to `startswith`
@@ -132,8 +137,11 @@ fn raw_sandbox_root(coder: &Coder, sandbox: &Value) -> R<Option<String>> {
 }
 
 /// python `int(s)` for a str: surrounding whitespace, an optional sign and single underscores
-/// between digits are accepted (`int(" 1_000 ") == 1000`)
+/// between digits are accepted (`int(" 1_000 ") == 1000`). Python ints are unbounded; values
+/// beyond the i64 range saturate, which is exact for every caller (they only clamp with min/max
+/// or compare against a count).
 fn parse_py_int(s: &str) -> Option<i64> {
+    const BIG: i128 = 1 << 70;
     let t = s.trim();
     let (neg, body) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
@@ -146,8 +154,12 @@ fn parse_py_int(s: &str) -> Option<i64> {
     if !body.chars().all(|c| c.is_ascii_digit() || c == '_') {
         return None;
     }
-    let n: i64 = body.replace('_', "").parse().ok()?;
-    Some(if neg { -n } else { n })
+    let mut n: i128 = 0;
+    for d in body.chars().filter(|c| *c != '_') {
+        n = (n * 10 + d.to_digit(10)? as i128).min(BIG);
+    }
+    let n = if neg { -n } else { n };
+    Some(n.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 /// python's `(body or {}).get("content", "")` passed on unchanged: only a str can be written or
@@ -180,19 +192,81 @@ fn syntax_errors(code: &str, file_path: &str) -> Vec<String> {
     }
 }
 
+/// python's `$` (no MULTILINE) matches at the end of the string or just before a final newline.
+/// fancy_regex's `$` only matches at the very end, so each unescaped `$` outside a character
+/// class becomes the equivalent `(?=\n?\z)`.
+fn py_dollar(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '[' if !in_class => {
+                in_class = true;
+                out.push(c);
+                // a `]` right after `[` or `[^` is a literal member of the class
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next().unwrap_or('^'));
+                }
+                if chars.peek() == Some(&']') {
+                    out.push(chars.next().unwrap_or(']'));
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(c);
+            }
+            '$' if !in_class => out.push_str(r"(?=\n?\z)"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// compile a user regex like python's `regex.compile(pattern, flags)`
 fn compile_regex(pattern: &str, ignore_case: bool) -> R<fancy_regex::Regex> {
-    let mut b = fancy_regex::RegexBuilder::new(pattern);
+    let mut b = fancy_regex::RegexBuilder::new(&py_dollar(pattern));
     b.case_insensitive(ignore_case);
     b.backtrack_limit(REGEX_BACKTRACK_LIMIT);
     b.build().map_err(|e| e.to_string())
 }
 
-/// `pattern.search(line)`; lines keep their trailing newline in python, where `$` also
-/// matches just before it - search without it so anchors behave the same.
+/// `pattern.search(line)` on the line as python yields it, trailing newline included: `\s`, `\n`
+/// and `\Z` see the newline exactly as python does (`$` is handled by `compile_regex`).
 fn re_search(re: &fancy_regex::Regex, line: &str) -> R<bool> {
-    let l = line.strip_suffix('\n').unwrap_or(line);
-    re.is_match(l).map_err(|e| e.to_string())
+    re.is_match(line).map_err(|e| e.to_string())
+}
+
+/// the `folder_blacklist` config value as python's `d not in blacklist` reads it: a list or dict
+/// matches whole names (only str list items can match a str name), a str matches a name that is
+/// a substring of it
+enum Blacklist {
+    Names(Vec<String>),
+    Substring(String),
+}
+
+impl Blacklist {
+    fn from_config(v: Option<Value>) -> Self {
+        match v {
+            Some(Value::String(s)) => Blacklist::Substring(s),
+            Some(Value::Array(a)) => Blacklist::Names(a.into_iter().filter_map(|x| if let Value::String(s) = x { Some(s) } else { None }).collect()),
+            Some(Value::Object(m)) => Blacklist::Names(m.keys().cloned().collect()),
+            _ => Blacklist::Names(Vec::new()),
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            Blacklist::Names(names) => names.iter().any(|n| n == name),
+            Blacklist::Substring(s) => s.contains(name),
+        }
+    }
 }
 
 /// python `_route_search`'s os.walk: flat (file, line, text) hits under `root`, skipping hidden
@@ -201,7 +275,7 @@ fn search_tree(
     root: &str,
     pattern: Option<&fancy_regex::Regex>,
     needle: &Value,
-    blacklist: &[String],
+    blacklist: &Blacklist,
     max_matches: i64,
 ) -> anyhow::Result<(Vec<Value>, bool)> {
     // non-regex: python evaluates `needle.lower()` per line, so a non-str needle only fails
@@ -299,8 +373,17 @@ fn context_lists(all_lines: &[&str], line_num: usize, context: i64) -> (Vec<Valu
 
 /// run git; returns (returncode, raw stdout)
 async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
+    run_git_bytes_in(Some(root), args, timeout).await
+}
+
+/// `run_git_bytes` where `cwd` None runs git in the server's own working directory (python's
+/// `subprocess.run(cwd=None)`)
+async fn run_git_bytes_in(cwd: Option<&str>, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+    cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     match tokio::time::timeout(Duration::from_secs(timeout), cmd.output()).await {
         Err(_) => (124, b"git command timed out".to_vec()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (127, b"git executable not found".to_vec()),
@@ -311,8 +394,16 @@ async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u
 
 /// run git; returns (ok, output)
 async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
+    run_git_in(Some(root), args, accept).await
+}
+
+/// `run_git` where `cwd` None runs git in the server's own working directory
+async fn run_git_in(cwd: Option<&str>, args: &[&str], accept: &[i32]) -> (bool, String) {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+    cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Err(_) => return (false, "git command timed out".into()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return (false, "git executable not found".into()),
@@ -344,6 +435,11 @@ async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
 
 async fn git(root: &str, args: &[&str]) -> (bool, String) {
     run_git(root, args, &[0]).await
+}
+
+/// `git` where `cwd` None runs in the server's own working directory
+async fn git_in(cwd: Option<&str>, args: &[&str]) -> (bool, String) {
+    run_git_in(cwd, args, &[0]).await
 }
 
 fn s(v: &[&str]) -> Vec<String> {
@@ -529,8 +625,8 @@ impl Coder {
         }
     }
 
-    fn blacklist(&self) -> Vec<String> {
-        self.cfg_list("folder_blacklist")
+    fn blacklist(&self) -> Blacklist {
+        Blacklist::from_config(self.cfg("folder_blacklist"))
     }
 
     fn read_only(&self) -> bool {
@@ -639,7 +735,7 @@ impl Coder {
         let mut total: i64 = 0;
         for m in matches {
             let rel = pyos::relpath(&m, &target_path);
-            if rel.split('/').any(|p| blacklist.iter().any(|b| b == p)) {
+            if rel.split('/').any(|p| blacklist.contains(p)) {
                 continue;
             }
             total += 1;
@@ -1253,18 +1349,34 @@ impl Coder {
 
     // ---------------- git
 
-    fn git_root(&self, sandbox: &str, subpath: &str) -> R<String> {
-        self.value_git_root(&Value::String(sandbox.to_string()), subpath)
-    }
-
-    /// python `_git_root(sandbox, subpath)` on a raw request value. A None sandbox root is refused
-    /// here (python would run git in the server's own working directory).
-    fn value_git_root(&self, sandbox: &Value, subpath: &str) -> R<String> {
-        let full = raw_sandbox_root(self, sandbox)?.ok_or_else(|| FSPATH_NONE.to_string())?;
-        if subpath.is_empty() {
+    /// python `_git_root(sandbox, subpath)` on raw request values. Returns None where python passes
+    /// `cwd=None` to git (no sandbox_paths and no subpath): git then runs in the server's own
+    /// working directory.
+    fn python_git_root(&self, sandbox: &Value, subpath: &Value) -> R<Option<String>> {
+        let full = raw_sandbox_root(self, sandbox)?;
+        if !truthy(subpath) {
             return Ok(full);
         }
-        ol_core::paths::sandbox_path(&full, Some(subpath)).map_err(|e| e.to_string())
+        // core.sandbox_path calls `base_path.replace` before `requested_path.replace`
+        let base = full.ok_or_else(|| "'NoneType' object has no attribute 'replace'".to_string())?;
+        let Value::String(sub) = subpath else {
+            return Err(format!("'{}' object has no attribute 'replace'", py_type_name(subpath)));
+        };
+        ol_core::paths::sandbox_path(&base, Some(sub)).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// `_git_root` for a query value (always a str). A None root is refused: the routes that use it
+    /// mutate or are not yet ported to the cwd fallback.
+    fn git_root(&self, sandbox: &str, subpath: &str) -> R<String> {
+        self.python_git_root(&Value::String(sandbox.to_string()), &Value::String(subpath.to_string()))?
+            .ok_or_else(|| FSPATH_NONE.to_string())
+    }
+
+    /// `_git_root` for a POST body: `subpath` is handed on raw, so a falsy non-str value is "no
+    /// subpath" and a truthy non-str one fails as python's `.replace` does
+    fn body_git_root(&self, sandbox: &str, b: &Map<String, Value>) -> R<String> {
+        self.python_git_root(&Value::String(sandbox.to_string()), &subpath_of(b))?
+            .ok_or_else(|| FSPATH_NONE.to_string())
     }
 
     /// python `for p in paths` over a raw request value: a list yields its items, a str its
@@ -1343,18 +1455,20 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")) {
+        // python runs git with cwd=None when there is no sandbox_paths and no subpath
+        let root = match self.python_git_root(&Value::String(sandbox.clone()), &Value::String(sget(q, "subpath"))) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let cwd = root.as_deref();
+        let (ok, _) = git_in(cwd, &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return json!({"is_repo": false, "read_only": self.read_only()});
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (ok_b, b_out) = git(&root, &["branch", "--format=%(refname:short)"]).await;
+        let (_, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok_b, b_out) = git_in(cwd, &["branch", "--format=%(refname:short)"]).await;
         let branches: Vec<String> = if ok_b { b_out.split('\n').map(|b| b.trim()).filter(|b| !b.is_empty()).map(String::from).collect() } else { Vec::new() };
-        let (rc, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1", "-z"]), 15).await;
+        let (rc, raw) = run_git_bytes_in(cwd, &s(&["status", "--porcelain=v1", "-z"]), 15).await;
         let changes = if rc == 0 { parse_porcelain_z(&raw) } else { Vec::new() };
         json!({"is_repo": true, "branch": branch, "branches": branches, "changes": changes, "read_only": self.read_only()})
     }
@@ -1365,16 +1479,18 @@ impl Coder {
         if sandbox.is_empty() {
             return Ok(self.result("no sandbox given", false));
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")) {
+        // python runs git with cwd=None when there is no sandbox_paths and no subpath
+        let root = match self.python_git_root(&Value::String(sandbox.clone()), &Value::String(sget(q, "subpath"))) {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let cwd = root.as_deref();
+        let (ok, _) = git_in(cwd, &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return Ok(json!({"is_repo": false}));
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (_, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (rc, raw) = run_git_bytes_in(cwd, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             return Ok(json!({"is_repo": true, "branch": branch, "log": []}));
         }
@@ -1386,7 +1502,8 @@ impl Coder {
         let (Some(sandbox), Some(paths)) = (required_field(b, "sandbox"), required_field(b, "paths")) else {
             return self.result("sandbox and paths are both required", false);
         };
-        let root = match self.value_git_root(sandbox, &sget(b, "subpath")) {
+        // python: a None root reaches `os.path.dirname(None)` in _check_git_paths
+        let root = match self.python_git_root(sandbox, &subpath_of(b)).and_then(|r| r.ok_or_else(|| FSPATH_NONE.to_string())) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1412,7 +1529,7 @@ impl Coder {
         if sandbox.is_empty() || message.is_empty() {
             return self.result("sandbox and message are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1429,7 +1546,7 @@ impl Coder {
         if sandbox.is_empty() || name.is_empty() {
             return self.result("sandbox and name are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1511,7 +1628,7 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1613,7 +1730,7 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1648,7 +1765,7 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1684,7 +1801,7 @@ impl Coder {
         if !valid.is_match(&name) {
             return self.result("invalid branch name: use letters, digits, dots, slashes, hyphens, underscores", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1705,7 +1822,7 @@ impl Coder {
         if sandbox.is_empty() || name.is_empty() {
             return self.result("sandbox and name are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
+        let root = match self.body_git_root(&sandbox, b) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1751,7 +1868,7 @@ impl Coder {
         if !matches!(strategy.as_str(), "ours" | "theirs" | "both") {
             return self.result("strategy must be 'ours', 'theirs', or 'both'", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
+        let root = match self.body_git_root(&sandbox, b).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1789,7 +1906,7 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
+        let root = match self.body_git_root(&sandbox, b).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -2115,7 +2232,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.txt"), "hit\n").unwrap();
         std::fs::write(root.join("b.txt"), "hit\n").unwrap();
-        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &[], 1).unwrap();
+        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &Blacklist::Names(Vec::new()), 1).unwrap();
         assert!(truncated);
         assert_eq!(results.len(), 2);
     }
@@ -2131,7 +2248,7 @@ mod tests {
         bytes.extend(std::iter::repeat(b'z').take(9000));
         bytes.extend(b"\n\xff\nhit late\n");
         std::fs::write(root.join("bad.txt"), &bytes).unwrap();
-        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &[], 200).unwrap();
+        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &Blacklist::Names(Vec::new()), 200).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["line"], 1);
         assert!(!truncated);
@@ -2200,5 +2317,59 @@ mod tests {
         let errs = syntax_errors("def f(:\n", "a.py");
         assert!(!errs.is_empty());
         assert!(errs.iter().all(|e| e.starts_with("Line 1, Col ")), "{:?}", errs);
+    }
+
+    #[test]
+    fn python_int_saturates_instead_of_failing_on_big_values() {
+        // python's int() is unbounded and the routes clamp with min(), so big values clamp too
+        assert_eq!(parse_py_int("99999999999999999999").unwrap().min(20), 20);
+        assert_eq!(parse_py_int("-99999999999999999999"), Some(i64::MIN));
+        assert_eq!(parse_py_int("1_000_000_000_000_000_000_000").unwrap().min(500), 500);
+    }
+
+    #[test]
+    fn dollar_matches_before_a_trailing_newline_like_python() {
+        // lines keep their newline, as python's file iteration yields them
+        let re = compile_regex("foo$", true).unwrap();
+        assert!(re_search(&re, "foo\n").unwrap());
+        assert!(re_search(&re, "foo").unwrap());
+        assert!(!re_search(&re, "foobar\n").unwrap());
+        // `$` inside a class is literal, and `\$` is an escaped dollar
+        assert!(re_search(&compile_regex("[$]", false).unwrap(), "a$\n").unwrap());
+        assert!(re_search(&compile_regex(r"a\$", false).unwrap(), "a$\n").unwrap());
+        // python's `^$` only matches an empty line, not the start of a line with text
+        assert!(!re_search(&compile_regex("^$", false).unwrap(), "abc\n").unwrap());
+        assert!(re_search(&compile_regex("^$", false).unwrap(), "\n").unwrap());
+        // `\s` and `\n` see the newline that ends the line
+        assert!(re_search(&compile_regex(r"o\s", false).unwrap(), "foo\n").unwrap());
+        assert!(re_search(&compile_regex(r"o\n", false).unwrap(), "foo\n").unwrap());
+    }
+
+    #[test]
+    fn folder_blacklist_follows_python_membership() {
+        // a str is a substring test, a list matches whole str names only
+        assert!(Blacklist::from_config(Some(json!("modules"))).contains("modules"));
+        assert!(!Blacklist::from_config(Some(json!("node_modules"))).contains("src"));
+        assert!(Blacklist::from_config(Some(json!(["target", 5]))).contains("target"));
+        assert!(!Blacklist::from_config(Some(json!(["target", 5]))).contains("5"));
+        assert!(!Blacklist::from_config(Some(json!(""))).contains("target"));
+    }
+
+    #[test]
+    fn git_root_passes_subpath_through_like_python_git_root() {
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        // no sandbox_paths: a falsy subpath is no subpath, so the root is None (git's cwd=None)
+        assert_eq!(coder.python_git_root(&json!("ws"), &json!(false)).unwrap(), None);
+        assert_eq!(coder.python_git_root(&json!("ws"), &json!(0)).unwrap(), None);
+        // a truthy subpath with no root fails on core.sandbox_path's `base_path.replace`, which runs
+        // before the subpath is looked at, so a non-str subpath gives the same message here
+        assert_eq!(
+            coder.python_git_root(&json!("ws"), &json!("repo")).unwrap_err(),
+            "'NoneType' object has no attribute 'replace'"
+        );
+        assert_eq!(
+            coder.python_git_root(&json!("ws"), &json!(5)).unwrap_err(),
+            "'NoneType' object has no attribute 'replace'"
+        );
     }
 }
