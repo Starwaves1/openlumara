@@ -15,7 +15,7 @@ pub fn build_payload(query: &str) -> Payload {
 
 /// `extract_results`: a single result built from the first item
 pub fn extract(text: &str) -> Result<Vec<Record>, DdgsError> {
-    let json: Value = serde_json::from_str(text).map_err(|e| DdgsError::Failed(format!("{e}")))?;
+    let json: Value = crate::util::py_json_loads(text).map_err(DdgsError::Failed)?;
     let obj = json.as_object().ok_or_else(|| no_attr(&json, "get"))?;
     // `items = json_data.get("results", [])`; `if not items: return []`
     let items = obj.get("results").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
@@ -33,14 +33,22 @@ pub fn extract(text: &str) -> Result<Vec<Record>, DdgsError> {
         Some(other) => return Err(DdgsError::Failed(format!("'{}' object has no attribute 'strip'", py_type(other)))),
     };
     // body = items[0].get("snippet", ""); body.split("\n\n", 1)[1] if "\n\n" in body else body
-    let snippet = match first.get("snippet") {
-        None => String::new(),
-        Some(Value::String(s)) => s.clone(),
+    let body = match first.get("snippet") {
+        None => Value::String(String::new()),
+        Some(Value::String(snippet)) => match snippet.split_once("\n\n") {
+            Some((_, rest)) => Value::String(rest.to_string()),
+            None => Value::String(snippet.clone()),
+        },
+        // `in` on a list is an element comparison: only a "\n\n" element makes it true, then split fails
+        Some(Value::Array(items)) => {
+            if items.iter().any(|v| v.as_str() == Some("\n\n")) {
+                return Err(DdgsError::Failed("'list' object has no attribute 'split'".into()));
+            }
+            Value::Array(items.clone())
+        }
+        // a dict's `in` tests its keys, which are all str, so "\n\n" is never one of them
+        Some(obj @ Value::Object(_)) => obj.clone(),
         Some(other) => return Err(DdgsError::Failed(format!("argument of type '{}' is not iterable", py_type(other)))),
-    };
-    let body = match snippet.split_once("\n\n") {
-        Some((_, rest)) => rest.to_string(),
-        None => snippet,
     };
     // items[0]['slug']
     let slug = first.get("slug").ok_or_else(|| DdgsError::Failed("'slug'".into()))?;
@@ -48,7 +56,7 @@ pub fn extract(text: &str) -> Result<Vec<Record>, DdgsError> {
 
     Ok(vec![build(
         Category::Text,
-        vec![("title", title.into()), ("href", href.into()), ("body", body.into())],
+        vec![("title", title.into()), ("href", href.into()), ("body", body)],
     )?])
 }
 
@@ -84,6 +92,18 @@ mod tests {
         assert_eq!(out[0]["href"], serde_json::json!("https://grokipedia.com/page/Lunar_orbit"));
         assert!(extract(r#"{"results":[]}"#).unwrap().is_empty());
         assert!(extract(r#"{"results":[{"title":"x","snippet":"y"}]}"#).is_err());
+    }
+
+    #[test]
+    fn snippet_shapes_fail_like_python_base_result_and_membership() {
+        let snippet = |v: &str| format!(r#"{{"results":[{{"title":"t","snippet":{v},"slug":"s"}}]}}"#);
+        // a list is `in`-tested by element: no "\n\n" element leaves it alone, the setattr normaliser rejects it
+        assert_eq!(extract(&snippet(r#"["a"]"#)).unwrap_err().message(), "expected string or bytes-like object, got 'list'");
+        assert_eq!(extract(&snippet(r#"{"a":1}"#)).unwrap_err().message(), "expected string or bytes-like object, got 'dict'");
+        assert_eq!(extract(&snippet(r#"["\n\n"]"#)).unwrap_err().message(), "'list' object has no attribute 'split'");
+        assert_eq!(extract(&snippet("5")).unwrap_err().message(), "argument of type 'int' is not iterable");
+        assert_eq!(extract(&snippet("null")).unwrap_err().message(), "argument of type 'NoneType' is not iterable");
+        assert_eq!(extract("{").unwrap_err().message(), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
     }
 
     #[test]

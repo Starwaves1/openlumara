@@ -105,6 +105,188 @@ pub fn urljoin(base: &str, url: &str) -> Result<String, String> {
     Ok(urlunsplit(&u.scheme, &netloc, path, &u.query, &u.fragment))
 }
 
+/// The text python's `json.loads(text)` raises with, for the ddgs engines that parse json.
+/// serde_json decides whether the text parses; when it does not, this reproduces CPython's
+/// `JSONDecodeError` message (`"Expecting value: line 1 column 1 (char 0)"`). A text CPython
+/// accepts but serde rejects (NaN, Infinity, lone surrogates) keeps serde's own text.
+pub fn py_json_loads(text: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(text).map_err(|e| py_json_error(text).unwrap_or_else(|| e.to_string()))
+}
+
+/// CPython's `JSONDecodeError` text for `text`, or None when CPython's decoder accepts it.
+fn py_json_error(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let scan = JsonScan { c: &chars };
+    let start = scan.ws(0);
+    let (msg, pos) = match scan.value(start) {
+        Err(e) => e,
+        Ok(end) => {
+            let end = scan.ws(end);
+            if end == chars.len() {
+                return None;
+            }
+            ("Extra data", end)
+        }
+    };
+    // lineno/colno as JSONDecodeError computes them; pos counts code points, as python's str does
+    let before = &chars[..pos];
+    let lineno = before.iter().filter(|c| **c == '\n').count() + 1;
+    let colno = match before.iter().rposition(|c| *c == '\n') {
+        Some(nl) => pos - nl,
+        None => pos + 1,
+    };
+    Some(format!("{msg}: line {lineno} column {colno} (char {pos})"))
+}
+
+/// a failure position as `(message, index into the code points)`
+type JsonErr = (&'static str, usize);
+
+/// CPython's `json` scanner (C flavour) walking code points; only the error positions matter here
+struct JsonScan<'a> {
+    c: &'a [char],
+}
+
+impl JsonScan<'_> {
+    fn at(&self, i: usize) -> Option<char> {
+        self.c.get(i).copied()
+    }
+
+    fn ws(&self, mut i: usize) -> usize {
+        while matches!(self.at(i), Some(' ' | '\t' | '\n' | '\r')) {
+            i += 1;
+        }
+        i
+    }
+
+    fn starts_with(&self, i: usize, word: &str) -> bool {
+        word.chars().enumerate().all(|(k, ch)| self.at(i + k) == Some(ch))
+    }
+
+    /// the value starting at `i`; returns the index just past it
+    fn value(&self, i: usize) -> Result<usize, JsonErr> {
+        match self.at(i) {
+            Some('"') => self.string(i),
+            Some('{') => self.object(i),
+            Some('[') => self.array(i),
+            Some('n') => self.literal(i, "null"),
+            Some('t') => self.literal(i, "true"),
+            Some('f') => self.literal(i, "false"),
+            Some('N') => self.literal(i, "NaN"),
+            Some('I') => self.literal(i, "Infinity"),
+            Some('-') if self.starts_with(i, "-Infinity") => Ok(i + "-Infinity".len()),
+            _ => self.number(i),
+        }
+    }
+
+    fn literal(&self, i: usize, word: &str) -> Result<usize, JsonErr> {
+        if self.starts_with(i, word) {
+            Ok(i + word.len())
+        } else {
+            Err(("Expecting value", i))
+        }
+    }
+
+    /// `(-?(?:0|[1-9]\d*))(\.\d+)?([eE][-+]?\d+)?`
+    fn number(&self, i: usize) -> Result<usize, JsonErr> {
+        let digit = |j: usize| matches!(self.at(j), Some('0'..='9'));
+        let mut j = i;
+        if self.at(j) == Some('-') {
+            j += 1;
+        }
+        match self.at(j) {
+            Some('0') => j += 1,
+            Some('1'..='9') => {
+                while digit(j) {
+                    j += 1;
+                }
+            }
+            _ => return Err(("Expecting value", i)),
+        }
+        if self.at(j) == Some('.') && digit(j + 1) {
+            j += 1;
+            while digit(j) {
+                j += 1;
+            }
+        }
+        if matches!(self.at(j), Some('e' | 'E')) {
+            let mut k = j + 1;
+            if matches!(self.at(k), Some('+' | '-')) {
+                k += 1;
+            }
+            if digit(k) {
+                while digit(k) {
+                    k += 1;
+                }
+                j = k;
+            }
+        }
+        Ok(j)
+    }
+
+    /// `begin` is the opening quote; strict mode rejects raw control characters
+    fn string(&self, begin: usize) -> Result<usize, JsonErr> {
+        let unterminated = ("Unterminated string starting at", begin);
+        let mut j = begin + 1;
+        loop {
+            match self.at(j) {
+                None => return Err(unterminated),
+                Some('"') => return Ok(j + 1),
+                Some('\\') => match self.at(j + 1) {
+                    None => return Err(unterminated),
+                    Some('u') => {
+                        if !(0..4).all(|k| matches!(self.at(j + 2 + k), Some(h) if h.is_ascii_hexdigit())) {
+                            return Err(("Invalid \\uXXXX escape", j + 1));
+                        }
+                        j += 6;
+                    }
+                    Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => j += 2,
+                    Some(_) => return Err(("Invalid \\escape", j)),
+                },
+                Some(ch) if (ch as u32) < 0x20 => return Err(("Invalid control character at", j)),
+                Some(_) => j += 1,
+            }
+        }
+    }
+
+    fn object(&self, i: usize) -> Result<usize, JsonErr> {
+        let mut j = self.ws(i + 1);
+        if self.at(j) == Some('}') {
+            return Ok(j + 1);
+        }
+        loop {
+            if self.at(j) != Some('"') {
+                return Err(("Expecting property name enclosed in double quotes", j));
+            }
+            j = self.ws(self.string(j)?);
+            if self.at(j) != Some(':') {
+                return Err(("Expecting ':' delimiter", j));
+            }
+            j = self.value(self.ws(j + 1))?;
+            j = self.ws(j);
+            match self.at(j) {
+                Some('}') => return Ok(j + 1),
+                Some(',') => j = self.ws(j + 1),
+                _ => return Err(("Expecting ',' delimiter", j)),
+            }
+        }
+    }
+
+    fn array(&self, i: usize) -> Result<usize, JsonErr> {
+        let mut j = self.ws(i + 1);
+        if self.at(j) == Some(']') {
+            return Ok(j + 1);
+        }
+        loop {
+            j = self.ws(self.value(j)?);
+            match self.at(j) {
+                Some(']') => return Ok(j + 1),
+                Some(',') => j = self.ws(j + 1),
+                _ => return Err(("Expecting ',' delimiter", j)),
+            }
+        }
+    }
+}
+
 /// A value as python's `json.loads` returns it. Integers keep every digit, floats are python floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PyJson {
@@ -450,6 +632,20 @@ mod tests {
             assert!(json_loads(bad).is_none(), "{:?} should not parse", bad);
         }
         assert_eq!(roundtrip("\"\\ud83d\\ude00\\n\\u00e9\""), Some("\"\u{1f600}\\n\u{e9}\"".to_string()));
+    }
+
+    #[test]
+    fn py_json_loads_reports_cpython_decode_error_text() {
+        let msg = |t: &str| py_json_loads(t).unwrap_err();
+        assert_eq!(msg(""), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\"a\" 1}"), "Expecting ':' delimiter: line 1 column 6 (char 5)");
+        assert_eq!(msg("[1 2]"), "Expecting ',' delimiter: line 1 column 4 (char 3)");
+        assert_eq!(msg("[1,]"), "Expecting value: line 1 column 4 (char 3)");
+        assert_eq!(msg("{\"a\":1} x"), "Extra data: line 1 column 9 (char 8)");
+        assert_eq!(msg("\"abc"), "Unterminated string starting at: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
+        assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
+        assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
     }
 
     #[test]

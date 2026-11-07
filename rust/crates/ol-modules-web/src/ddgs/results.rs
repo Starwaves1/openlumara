@@ -350,7 +350,7 @@ pub fn finish(agg: &Aggregator, query: &str, max_results: Option<usize>, err: Op
 
 /// `json.loads(text).get("results", [])` as the JSON engines iterate it
 pub fn json_results(text: &str) -> Result<Vec<Value>, DdgsError> {
-    let root: Value = serde_json::from_str(text).map_err(|e| DdgsError::Failed(format!("{e}")))?;
+    let root: Value = crate::util::py_json_loads(text).map_err(DdgsError::Failed)?;
     let obj = root
         .as_object()
         .ok_or_else(|| DdgsError::Failed(format!("'{}' object has no attribute 'get'", py_type_name(&root))))?;

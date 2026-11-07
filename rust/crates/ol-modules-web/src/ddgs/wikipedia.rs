@@ -21,13 +21,9 @@ fn extract_url(lang: &str, title: &str) -> String {
     )
 }
 
-fn json_error(e: serde_json::Error) -> DdgsError {
-    DdgsError::Failed(format!("{e}"))
-}
-
 /// `extract_results(html_text)`; `lang` is the language the search ran in (`self.lang`)
 pub async fn extract(session: &mut Session, lang: &str, text: &str) -> Result<Vec<Record>, DdgsError> {
-    let json: Value = serde_json::from_str(text).map_err(json_error)?;
+    let json: Value = crate::util::py_json_loads(text).map_err(DdgsError::Failed)?;
     // `if not json_data[1]: return []`
     let second = py_getitem(&json, 1)?;
     if !truthy(&second) {
@@ -45,7 +41,7 @@ pub async fn extract(session: &mut Session, lang: &str, text: &str) -> Result<Ve
     let title_text = rec.get("title").and_then(Value::as_str).ok_or_else(|| DdgsError::Failed("title is not a str".into()))?.to_string();
     // python `if resp_data:` skips an empty body (falsy), keeping body=''
     if let Some(resp) = session.request_text(Method::Get, &extract_url(lang, &title_text), &[]).await?.filter(|r| !r.is_empty()) {
-        let data: Value = serde_json::from_str(&resp).map_err(json_error)?;
+        let data: Value = crate::util::py_json_loads(&resp).map_err(DdgsError::Failed)?;
         // `json_data["query"]["pages"].values()`
         let pages = py_key(py_key(&data, "query")?, "pages")?;
         let pages = pages.as_object().ok_or_else(|| no_attr(pages, "values"))?;

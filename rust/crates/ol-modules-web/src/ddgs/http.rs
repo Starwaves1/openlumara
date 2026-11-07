@@ -35,6 +35,11 @@ impl Reply {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+
+    /// `BaseSearchEngine.request` + `if not html_text`: the text of a 200 reply with a body, else None
+    pub fn ok_text(&self) -> Option<String> {
+        (self.status == 200).then(|| self.text()).filter(|text| !text.is_empty())
+    }
 }
 
 struct Cookie {
@@ -168,10 +173,10 @@ impl Session {
         Ok(Reply { status, body })
     }
 
-    /// `BaseSearchEngine.request`: the text of a 200 response, None otherwise
+    /// `BaseSearchEngine.request` + `if not html_text: return None`: the text of a 200 response,
+    /// None otherwise and for an empty body
     pub async fn request_text(&mut self, method: Method, url: &str, payload: &[(String, String)]) -> Result<Option<String>, DdgsError> {
-        let reply = self.request(method, url, payload).await?;
-        Ok((reply.status == 200).then(|| reply.text()))
+        Ok(self.request(method, url, payload).await?.ok_text())
     }
 }
 
@@ -208,6 +213,14 @@ pub async fn get_vqd(session: &mut Session, query: &str) -> Result<String, DdgsE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_200_body_is_no_response_like_base_engine_search() {
+        let reply = |status, body: &str| Reply { status, body: body.as_bytes().to_vec() };
+        assert_eq!(reply(200, "").ok_text(), None);
+        assert_eq!(reply(404, "<p>gone</p>").ok_text(), None);
+        assert_eq!(reply(200, "[]").ok_text().as_deref(), Some("[]"));
+    }
 
     #[test]
     fn vqd_with_invalid_utf8_falls_through_to_the_next_pattern() {

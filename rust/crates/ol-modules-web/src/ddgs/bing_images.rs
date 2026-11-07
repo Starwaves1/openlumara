@@ -2,7 +2,7 @@
 
 use super::html::{self, all_elements, child_named, class_has, class_is, desc_where, first_text, has_attr, named};
 use super::http::{Method, Net, Session};
-use super::results::build;
+use super::results::{build, no_attr};
 use super::{kv, lookup, Category, DdgsError, Payload, SearchArgs};
 use crate::ddgs::results::Record;
 use crate::pytext::{py_split, py_strip};
@@ -56,10 +56,9 @@ pub fn extract(html_text: &str) -> Result<Vec<Record>, DdgsError> {
             .and_then(|a| a.value().attr("m").map(str::to_string));
         let Some(metadata) = metadata else { continue };
 
-        let m: Value = serde_json::from_str(&metadata).map_err(|e| DdgsError::Failed(format!("{e}")))?;
-        let m = m
-            .as_object()
-            .ok_or_else(|| DdgsError::Failed("'list' object has no attribute 'get'".into()))?;
+        let m: Value = crate::util::py_json_loads(&metadata).map_err(DdgsError::Failed)?;
+        // `m.get("t")` on a non-dict: python names the type of the decoded value
+        let m = m.as_object().ok_or_else(|| no_attr(&m, "get"))?;
         let field = |key: &str| m.get(key).cloned().unwrap_or(Value::Null);
         let mut rec = build(
             Category::Images,

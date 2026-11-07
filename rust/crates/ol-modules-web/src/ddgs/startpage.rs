@@ -16,7 +16,15 @@ const SAFESEARCH: &[(&str, &str)] = &[("on", "heavy"), ("moderate", "moderate"),
 /// `get_sc()`: the `sc` hidden input of the search form on the start page (empty when absent)
 pub async fn get_sc(session: &mut Session) -> Result<String, DdgsError> {
     let reply = session.request(Method::Get, HOME, &[]).await?;
-    let doc = html::parse(&reply.text());
+    sc_from_page(&reply.text())
+}
+
+/// the `sc` value of a start page body; a body with no element at all is lxml's `Document is empty`
+pub fn sc_from_page(page: &str) -> Result<String, DdgsError> {
+    if page.trim_ascii().is_empty() {
+        return Err(DdgsError::Failed("Document is empty".into()));
+    }
+    let doc = html::parse(page);
     // //form[@id="search"]//input[@name="sc"]/@value  (first value)
     for form in all_elements(&doc).into_iter().filter(|e| named(*e, "form") && e.value().attr("id") == Some("search")) {
         let inputs = desc_where(form, |e| named(e, "input") && e.value().attr("name") == Some("sc"));
@@ -106,6 +114,18 @@ mod tests {
         assert_eq!(results[0]["body"], serde_json::json!("Body one"));
         let kept = post(results);
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn empty_start_page_body_raises_lxml_document_is_empty() {
+        assert_eq!(sc_from_page("").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page(" \n\t").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("<html></html>").unwrap(), "");
+    }
+
+    #[test]
+    fn sc_token_is_read_from_the_search_form() {
+        assert_eq!(sc_from_page(r#"<form id="search"><input name="sc" value="tok9"></form>"#).unwrap(), "tok9");
     }
 
     #[test]
