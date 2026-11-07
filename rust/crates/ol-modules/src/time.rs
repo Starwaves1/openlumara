@@ -11,7 +11,9 @@ use chrono_tz::{OffsetComponents, OffsetName};
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
 use serde_json::{json, Map, Value};
 use std::ffi::{CStr, CString};
+use std::io::Read;
 use std::os::raw::c_char;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const METHOD_END_PROMPT: &str = "end prompt";
@@ -100,9 +102,10 @@ fn local_stamp() -> Stamp {
 /// python `zoneinfo.ZoneInfo(key)` + `datetime.now(tz=...)`
 fn zone_stamp(key: &str) -> anyhow::Result<Stamp> {
     validate_zone_key(key)?;
-    let tz: chrono_tz::Tz = key
-        .parse()
-        .map_err(|_| anyhow!("'No time zone found with key {}'", key))?;
+    let tz: chrono_tz::Tz = match key.parse() {
+        Ok(tz) => tz,
+        Err(_) => return Err(tzfile_error(key)),
+    };
     let now = Utc::now().with_timezone(&tz);
     let tzname = now.offset().abbreviation().unwrap_or("").to_string();
     // python's timetuple() flag: 1 when dst() is non-zero, else 0
@@ -114,6 +117,42 @@ fn zone_stamp(key: &str) -> anyhow::Result<Stamp> {
         tzname,
         isdst,
     })
+}
+
+/// python `zoneinfo.TZPATH`: PYTHONTZPATH when it is set (only absolute entries count, an empty value
+/// means no entries), else the search path the reference CPython was built with
+fn tzpath() -> Vec<PathBuf> {
+    match std::env::var_os("PYTHONTZPATH") {
+        Some(env) => env
+            .to_string_lossy()
+            .split(':')
+            .filter(|p| p.starts_with('/'))
+            .map(PathBuf::from)
+            .collect(),
+        None => ["/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo", "/etc/zoneinfo"]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
+    }
+}
+
+/// the error python's ZoneInfo gives for a key chrono-tz does not know. python loads the first file
+/// for the key on TZPATH, so an existing file that is not TZif raises ValueError. A valid TZif file
+/// that chrono-tz lacks is still reported as not found: chrono-tz is the only zone source here.
+fn tzfile_error(key: &str) -> anyhow::Error {
+    for dir in tzpath() {
+        let path = dir.join(key);
+        if path.is_file() {
+            if let Ok(file) = std::fs::File::open(&path) {
+                let mut magic = Vec::new();
+                if file.take(4).read_to_end(&mut magic).is_ok() && magic != b"TZif" {
+                    return anyhow!("Invalid TZif file: magic not found");
+                }
+            }
+            break;
+        }
+    }
+    anyhow!("'No time zone found with key {}'", key)
 }
 
 /// the base python's `zoneinfo._tzpath._validate_tzfile_path` checks keys against (`_TEST_PATH`)
@@ -162,28 +201,50 @@ fn posix_normpath(path: &str) -> String {
     }
 }
 
-/// python `_get_current_time()`: `timezone` == "local" is the device zone, anything else is an IANA key
-fn current_stamp(timezone: Option<&str>) -> anyhow::Result<Stamp> {
-    match timezone {
-        Some("local") => Ok(local_stamp()),
-        Some(key) => zone_stamp(key),
-        None => Err(anyhow!("expected str, bytes or os.PathLike object, not NoneType")),
+/// the python type name of a config value, as it appears in TypeError messages
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
     }
 }
 
-/// `%z` as python formats it: sign, HHMM, plus SS when the offset has seconds
-fn format_utcoffset(offset_secs: i32) -> String {
+/// python `_get_current_time()`: `timezone` == "local" is the device zone, anything else is an IANA key
+fn current_stamp(timezone: &Value) -> anyhow::Result<Stamp> {
+    match timezone {
+        Value::String(key) if key == "local" => Ok(local_stamp()),
+        Value::String(key) => zone_stamp(key),
+        // python looks the key up in ZoneInfo's cache (a dict) before it checks the type
+        Value::Array(_) => Err(anyhow!("cannot use 'list' as a dict key (unhashable type: 'list')")),
+        Value::Object(_) => Err(anyhow!("cannot use 'dict' as a dict key (unhashable type: 'dict')")),
+        other => Err(anyhow!("expected str, bytes or os.PathLike object, not {}", py_type_name(other))),
+    }
+}
+
+/// python `strftime()` format argument: only a str is accepted
+fn format_arg(v: &Value) -> anyhow::Result<&str> {
+    v.as_str()
+        .ok_or_else(|| anyhow!("strftime() argument 1 must be str, not {}", py_type_name(v)))
+}
+
+/// `%z` / `%:z` as python formats it: sign, HHMM (HH:MM with `sep` ":"), plus SS when the offset has seconds
+fn format_utcoffset(offset_secs: i32, sep: &str) -> String {
     let sign = if offset_secs < 0 { '-' } else { '+' };
     let a = offset_secs.abs();
     let (hh, mm, ss) = (a / 3600, (a % 3600) / 60, a % 60);
     if ss != 0 {
-        format!("{sign}{hh:02}{mm:02}{ss:02}")
+        format!("{sign}{hh:02}{sep}{mm:02}{sep}{ss:02}")
     } else {
-        format!("{sign}{hh:02}{mm:02}")
+        format!("{sign}{hh:02}{sep}{mm:02}")
     }
 }
 
-/// python `datetime.strftime` pre-pass (`_wrap_strftime`): %z, %Z and %f are expanded here, every
+/// python `datetime.strftime` pre-pass (`_wrap_strftime`): %z, %:z, %Z and %f are expanded here, every
 /// other directive (and "%%") is passed through to the C library
 fn wrap_strftime(fmt: &str, stamp: &Stamp) -> String {
     let mut out = String::with_capacity(fmt.len());
@@ -195,7 +256,12 @@ fn wrap_strftime(fmt: &str, stamp: &Stamp) -> String {
         }
         match chars.next() {
             None => out.push('%'),
-            Some('z') => out.push_str(&format_utcoffset(stamp.offset_secs)),
+            Some('z') => out.push_str(&format_utcoffset(stamp.offset_secs, "")),
+            // %:z is only a directive when a 'z' follows the colon; otherwise both characters pass through
+            Some(':') if chars.as_str().starts_with('z') => {
+                chars.next();
+                out.push_str(&format_utcoffset(stamp.offset_secs, ":"));
+            }
             Some('Z') => out.push_str(&stamp.tzname),
             Some('f') => out.push_str(&format!("{:06}", stamp.micros)),
             Some(other) => {
@@ -205,6 +271,16 @@ fn wrap_strftime(fmt: &str, stamp: &Stamp) -> String {
         }
     }
     out
+}
+
+/// python `datetime.strftime(fmt)`: the `_wrap_strftime` pre-pass and then the C library for each
+/// NUL-separated piece of the format, with the NULs kept in the output (CPython 3.14 does this)
+fn py_strftime(fmt: &str, stamp: &Stamp) -> anyhow::Result<String> {
+    let pieces = fmt
+        .split('\0')
+        .map(|piece| c_strftime(&wrap_strftime(piece, stamp), stamp))
+        .collect::<anyhow::Result<Vec<String>>>()?;
+    Ok(pieces.join("\0"))
 }
 
 /// python `time.strftime(fmt, timetuple)`: the C library strftime on the datetime's fields, with
@@ -239,7 +315,7 @@ fn c_strftime(fmt: &str, stamp: &Stamp) -> anyhow::Result<String> {
 /// python `now.strftime(date_format)`, then the zone name appended when `add_timezone` is set,
 /// joined with a space
 fn time_info(stamp: &Stamp, date_format: &str, add_timezone: bool) -> anyhow::Result<String> {
-    let mut parts = vec![c_strftime(&wrap_strftime(date_format, stamp), stamp)?];
+    let mut parts = vec![py_strftime(date_format, stamp)?];
     if add_timezone {
         parts.push(stamp.tzname.clone());
     }
@@ -261,14 +337,10 @@ impl Time {
 
     /// the formatted "<date> [<tzname>]" text, read from the current config
     fn time_text(&self) -> anyhow::Result<String> {
-        let timezone = self.base.config.get_str("timezone");
-        let stamp = current_stamp(timezone.as_deref())?;
-        let date_format = self
-            .base
-            .config
-            .get_str("date_format")
-            .ok_or_else(|| anyhow!("strftime() argument 1 must be str, not None"))?;
-        time_info(&stamp, &date_format, self.base.config.get_bool("add_timezone"))
+        let timezone = self.base.config.get1("timezone").unwrap_or(Value::Null);
+        let stamp = current_stamp(&timezone)?;
+        let date_format = self.base.config.get1("date_format").unwrap_or(Value::Null);
+        time_info(&stamp, format_arg(&date_format)?, self.base.config.get_bool("add_timezone"))
     }
 }
 
@@ -341,9 +413,70 @@ mod tests {
 
     #[test]
     fn unknown_zone_key_is_an_error() {
-        let err = current_stamp(Some("Nope/Nowhere")).unwrap_err();
+        let err = current_stamp(&json!("Nope/Nowhere")).unwrap_err();
         assert_eq!(err.to_string(), "'No time zone found with key Nope/Nowhere'");
-        assert!(current_stamp(None).is_err());
+        assert_eq!(
+            current_stamp(&Value::Null).unwrap_err().to_string(),
+            "expected str, bytes or os.PathLike object, not NoneType"
+        );
+    }
+
+    #[test]
+    fn non_string_config_values_name_their_python_type() {
+        // python: ZoneInfo(value) and strftime(value) name the real type in their TypeError
+        let zone_cases = [
+            (json!(5), "expected str, bytes or os.PathLike object, not int"),
+            (json!(1.5), "expected str, bytes or os.PathLike object, not float"),
+            (json!(true), "expected str, bytes or os.PathLike object, not bool"),
+            (json!(["a"]), "cannot use 'list' as a dict key (unhashable type: 'list')"),
+            (json!({}), "cannot use 'dict' as a dict key (unhashable type: 'dict')"),
+        ];
+        for (value, msg) in zone_cases {
+            assert_eq!(current_stamp(&value).unwrap_err().to_string(), msg, "value {value}");
+        }
+        let fmt_cases = [
+            (json!(5), "strftime() argument 1 must be str, not int"),
+            (json!(false), "strftime() argument 1 must be str, not bool"),
+            (Value::Null, "strftime() argument 1 must be str, not NoneType"),
+        ];
+        for (value, msg) in fmt_cases {
+            assert_eq!(format_arg(&value).unwrap_err().to_string(), msg, "value {value}");
+        }
+    }
+
+    #[test]
+    fn colon_z_and_nul_pieces_follow_python_strftime() {
+        let s = fixed_stamp();
+        // python 3.14: %:z is +HH:MM, with :SS when the offset has seconds
+        assert_eq!(time_info(&s, "%:z", false).unwrap(), "+01:00");
+        assert_eq!(time_info(&s, "%:%z", false).unwrap(), "%:+0100");
+        let mut odd = fixed_stamp();
+        odd.offset_secs = -(5 * 3600 + 29 * 60 + 53);
+        assert_eq!(time_info(&odd, "%:z|%z", false).unwrap(), "-05:29:53|-052953");
+        // python 3.14 keeps a NUL in the output and formats each side on its own
+        assert_eq!(time_info(&s, "%Y\0%m", false).unwrap(), "2026\011");
+        assert_eq!(time_info(&s, "a\0%Y\0", false).unwrap(), "a\x002026\x00");
+        assert_eq!(time_info(&s, "x%%\0%%Y", false).unwrap(), "x%\0%Y");
+    }
+
+    #[test]
+    fn zone_lookup_reports_a_non_tzif_file_as_a_value_error() {
+        let _g = crate::util::CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // python reads the first file for the key on TZPATH: a file that is not TZif is a ValueError
+        let dir = std::env::temp_dir().join(format!("time-tzpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zone.tab"), "# tzdata text, not TZif\n").unwrap();
+        let saved = std::env::var_os("PYTHONTZPATH");
+        std::env::set_var("PYTHONTZPATH", &dir);
+        let not_tzif = zone_stamp("zone.tab").unwrap_err().to_string();
+        let missing = zone_stamp("Not/AZone").unwrap_err().to_string();
+        match saved {
+            Some(v) => std::env::set_var("PYTHONTZPATH", v),
+            None => std::env::remove_var("PYTHONTZPATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(not_tzif, "Invalid TZif file: magic not found");
+        assert_eq!(missing, "'No time zone found with key Not/AZone'");
     }
 
     #[test]
@@ -357,11 +490,11 @@ mod tests {
             ("America/", "ZoneInfo keys must be normalized relative paths, got: America/"),
         ];
         for (key, msg) in cases {
-            assert_eq!(current_stamp(Some(key)).unwrap_err().to_string(), msg, "key {key:?}");
+            assert_eq!(current_stamp(&json!(key)).unwrap_err().to_string(), msg, "key {key:?}");
         }
         // "../_/x" normalizes back under the validation base, so it is a well-formed but unknown key
         assert_eq!(
-            current_stamp(Some("../_/x")).unwrap_err().to_string(),
+            current_stamp(&json!("../_/x")).unwrap_err().to_string(),
             "'No time zone found with key ../_/x'"
         );
     }
