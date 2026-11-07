@@ -222,8 +222,8 @@ mod tests {
     use ol_core::manager::{Args, Manager};
     use serde_json::Map;
 
-    /// the config is process-wide, so the tests that install one run one at a time
-    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// the config is process-wide, so every test that installs one (in any module) runs under the same lock
+    use crate::util::CONFIG_TEST_LOCK as CONFIG_LOCK;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)

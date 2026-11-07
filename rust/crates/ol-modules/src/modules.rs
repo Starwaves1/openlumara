@@ -52,6 +52,9 @@ impl Module for Modules {
     }
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
+        // python's core.config.get() reloads config.yaml from disk on every call, so edits made
+        // outside the process are seen here
+        ol_core::config::reload();
         if ol_core::config::get_bool(&["model", "dynamic_tool_loading"], false) {
             // if dynamic tool loading is on, the list of enabled modules gets sent in the tool prompt
             // so don't send a duplicate in the system prompt
@@ -180,6 +183,25 @@ mod tests {
         let m = setup(false, false);
         let prompt = block_on(m.on_system_prompt()).unwrap();
         assert_eq!(prompt.as_deref(), Some("{'enabled': 'identity, notes', 'disabled': 'tutorial'}"));
+    }
+
+    #[test]
+    fn system_prompt_reflects_config_edited_on_disk_while_running() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(false, false);
+        // an edit made outside the process, like a user editing config.yaml by hand
+        let path = ol_core::config::config_path().expect("test config path");
+        let edited = json!({
+            "modules": {
+                "enabled": ["identity"],
+                "disabled": ["tutorial", "notes"],
+                "settings": {"modules": {"allow_ai_to_toggle": false}}
+            },
+            "model": {"dynamic_tool_loading": false}
+        });
+        std::fs::write(&path, edited.to_string()).expect("write edited config");
+        let prompt = block_on(m.on_system_prompt()).unwrap();
+        assert_eq!(prompt.as_deref(), Some("{'enabled': 'identity', 'disabled': 'tutorial, notes'}"));
     }
 
     #[test]
