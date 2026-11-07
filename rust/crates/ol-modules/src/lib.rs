@@ -3,6 +3,7 @@
 pub mod chats;
 pub mod identity;
 pub mod lists;
+pub mod models;
 pub mod notes;
 pub mod replacer;
 pub mod token_threshold;
@@ -85,5 +86,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: chats::meta::UNSAFE,
         category: chats::meta::CATEGORY,
         factory: chats::Chats::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "models",
+        class_name: models::meta::CLASS_NAME,
+        doc: models::meta::DOC,
+        settings: models::meta::settings,
+        unsafe_: models::meta::UNSAFE,
+        category: models::meta::CATEGORY,
+        factory: models::Models::factory,
     });
 }
