@@ -1,5 +1,7 @@
-//! Port of modules/{http,web_reader,web_search,file_manager,unsafe_shell}.
+//! Port of modules/{http,web_reader,web_search,file_manager,unsafe_shell}; `ddgs` is the
+//! search library web_search uses.
 
+pub mod ddgs;
 mod entities;
 pub mod file_manager;
 pub mod http;
