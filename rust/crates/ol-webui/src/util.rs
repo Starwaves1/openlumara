@@ -24,7 +24,7 @@ const MAX_JSON_DEPTH: usize = 128;
 /// python `json.loads` on a request body (starlette's `request.json()`): the same accepted documents,
 /// the same error positions (in characters) and the same messages as python's C scanner
 pub fn py_json_loads(body: &[u8]) -> Result<Value, BodyJsonError> {
-    parse_document(body, false)
+    parse_document(body, None)
 }
 
 /// `py_json_loads` for a handler that only reads keys whose non-string values it treats as falsy or
@@ -32,14 +32,22 @@ pub fn py_json_loads(body: &[u8]) -> Result<Value, BodyJsonError> {
 /// is accepted as python accepts it. (python's `nan` is truthy, so a handler that fails on a
 /// non-string value gives the same result for `nan` and for null.)
 pub fn py_json_loads_lenient(body: &[u8]) -> Result<Value, BodyJsonError> {
-    parse_document(body, true)
+    parse_document(body, Some(Value::Null))
 }
 
-fn parse_document(body: &[u8], lenient: bool) -> Result<Value, BodyJsonError> {
+/// `py_json_loads` for a handler that reads a key with `value.strip()` after `data.get(key) or ""`.
+/// python's NaN, Infinity and out-of-range numbers are truthy and not strings, so `.strip()` fails on
+/// them. they are read as `true` here: a truthy non-string that `or_strip` rejects, as python rejects it.
+pub fn py_json_loads_python_only_true(body: &[u8]) -> Result<Value, BodyJsonError> {
+    parse_document(body, Some(Value::Bool(true)))
+}
+
+/// `python_only_as` is the value a python-only number reads as; None when `Value` cannot hold it
+fn parse_document(body: &[u8], python_only_as: Option<Value>) -> Result<Value, BodyJsonError> {
     // json.loads on bytes decodes with utf-8-sig, which drops a leading byte order mark
     let Ok(text) = std::str::from_utf8(body) else { return Err(BodyJsonError::Unrepresentable) };
     let doc: Vec<char> = text.strip_prefix('\u{feff}').unwrap_or(text).chars().collect();
-    let scanner = JsonScanner { doc: &doc, lenient };
+    let scanner = JsonScanner { doc: &doc, python_only_as };
     let start = scanner.ws(0);
     let (value, end) = scanner.value(start, 0)?;
     let end = scanner.ws(end);
@@ -76,8 +84,8 @@ fn decode_error(doc: &[char], msg: &str, pos: usize) -> BodyJsonError {
 /// first character it may consume and returns the index just past what it consumed
 struct JsonScanner<'a> {
     doc: &'a [char],
-    /// read python-only values (NaN, Infinity, out-of-range numbers) as null instead of failing
-    lenient: bool,
+    /// what python-only values (NaN, Infinity, out-of-range numbers) read as; None fails the body
+    python_only_as: Option<Value>,
 }
 
 impl JsonScanner<'_> {
@@ -92,12 +100,11 @@ impl JsonScanner<'_> {
         word.chars().enumerate().all(|(k, c)| self.doc.get(i + k) == Some(&c))
     }
 
-    /// a value python parses but `Value` cannot hold: a failure, or null when lenient, ending at `end`
+    /// a value python parses but `Value` cannot hold: a failure, or its stand-in, ending at `end`
     fn python_only(&self, end: usize) -> Result<(Value, usize), BodyJsonError> {
-        if self.lenient {
-            Ok((Value::Null, end))
-        } else {
-            Err(BodyJsonError::Unrepresentable)
+        match &self.python_only_as {
+            Some(stand_in) => Ok((stand_in.clone(), end)),
+            None => Err(BodyJsonError::Unrepresentable),
         }
     }
 
@@ -961,5 +968,16 @@ mod tests {
             BodyJsonError::Decode("Expecting property name enclosed in double quotes: line 1 column 11 (char 10)".into())
         );
         assert_eq!(py_json_loads(b"[NaN]").unwrap_err(), BodyJsonError::Unrepresentable);
+    }
+
+    #[test]
+    fn python_only_true_reader_makes_python_only_numbers_truthy_non_strings() {
+        // a NaN message is truthy in python and has no .strip(); here it reads as true, which or_strip rejects
+        assert_eq!(
+            py_json_loads_python_only_true(b"{\"message\": NaN, \"x\": [Infinity], \"n\": 0}").unwrap(),
+            json!({"message": true, "x": [true], "n": 0})
+        );
+        assert_eq!(py_json_loads_python_only_true(b"NaN").unwrap(), json!(true));
+        assert!(py_json_loads_python_only_true(b"{\"a\": NaN,}").is_err());
     }
 }

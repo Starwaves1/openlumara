@@ -1143,6 +1143,21 @@ async fn input_history_get_returns_the_saved_entries_oldest_first() {
 }
 
 #[tokio::test]
+async fn input_history_add_reads_python_json_loads_bodies() {
+    let h = harness(false).await;
+    // python's json.loads takes NaN in another key, so the message is still appended
+    let kept = h.send(post_json("/api/input_history", r#"{"message": "ls", "x": NaN, "y": -Infinity}"#)).await;
+    assert_eq!(kept.json(), json!({"data": ["ls"], "success": true}));
+
+    // a NaN message is truthy and has no .strip(), so python raises and the response is a plain 500
+    for body in [r#"{"message": NaN}"#, r#"{"message": Infinity}"#, "NaN", "[NaN]"] {
+        let resp = h.send(post_json("/api/input_history", body)).await;
+        assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR, "body {body}");
+    }
+    assert_eq!(h.get("/api/input_history").await.json(), json!({"data": ["ls"], "success": true}));
+}
+
+#[tokio::test]
 async fn chat_prompt_and_input_history_answer_head_and_other_methods_with_405_allow_get() {
     let h = harness(false).await;
     for uri in ["/api/chat/prompt", "/api/input_history"] {

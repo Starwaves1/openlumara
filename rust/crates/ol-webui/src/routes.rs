@@ -12,7 +12,7 @@ use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
     export_chat_text, get_strip, or_strip, parse_body, py_contains, py_int, py_int_str, py_iter, py_json_loads_lenient,
-    py_slice, py_sorted_unique, py_strip, py_type_name,
+    py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip, py_type_name,
 };
 use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
@@ -681,7 +681,11 @@ async fn input_history_get(State(app): State<Arc<Shared>>) -> Response {
 }
 
 async fn input_history_add(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
-    let Some(obj) = json_object(&body) else { return internal_error() };
+    // python: request.json() is json.loads, which takes NaN and Infinity. a NaN message is truthy and
+    // fails at .strip() (a plain 500), which the python-only reader's stand-in does too
+    let Some(obj) = py_json_loads_python_only_true(&body).ok().and_then(|v| v.as_object().cloned()) else {
+        return internal_error();
+    };
     let Ok(message) = or_strip(obj.get("message"), "") else { return internal_error() };
     if message.is_empty() {
         return reply(Value::Null, true);
