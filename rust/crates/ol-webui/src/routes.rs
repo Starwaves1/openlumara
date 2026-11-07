@@ -12,7 +12,8 @@ use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
     export_chat_text, get_strip, or_strip, parse_body, py_contains, py_eq, py_int, py_int_str, py_iter,
-    py_json_loads_lenient, py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip, py_type_name,
+    py_json_loads, py_json_loads_lenient, py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip,
+    py_type_name, BodyJsonError,
 };
 use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
@@ -266,14 +267,25 @@ pub fn export_filename(title: &str) -> String {
     format!("{}.txt", base)
 }
 
-/// python `input_history` append: dedupes against the last entry, keeps the newest 100
-pub fn push_input_history(history: &mut Vec<Value>, message: &str) {
+/// python `input_history` append: dedupes against the last entry, keeps the newest 100. false when the
+/// message is the last entry, which python answers without saving the file
+pub fn push_input_history(history: &mut Vec<Value>, message: &str) -> bool {
     if history.last().and_then(Value::as_str) == Some(message) {
-        return;
+        return false;
     }
     history.push(json!(message));
     while history.len() > 100 {
         history.remove(0);
+    }
+    true
+}
+
+/// python `StorageList.load()` (json) raises when `json.loads` rejects the file text: a plain 500 that
+/// leaves the file as it is. an empty file and an unreadable file do not raise (they load as no entries)
+fn input_history_file_parses(path: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text.is_empty() || !matches!(py_json_loads(text.as_bytes()), Err(BodyJsonError::Decode(_))),
+        Err(_) => true,
     }
 }
 
@@ -700,9 +712,14 @@ async fn input_history_add(State(app): State<Arc<Shared>>, body: Bytes) -> Respo
         return reply(Value::Null, true);
     }
     let mut history = app.input_history.lock();
+    if !input_history_file_parses(&history.path) {
+        return internal_error();
+    }
     history.load();
-    push_input_history(&mut history.data, &message);
-    let _ = history.save();
+    // python returns the list without saving when the message repeats the last entry
+    if push_input_history(&mut history.data, &message) {
+        let _ = history.save();
+    }
     reply(Value::Array(history.data.clone()), true)
 }
 
@@ -977,6 +994,35 @@ mod tests {
         assert_eq!(history.len(), 100);
         assert_eq!(history.first(), Some(&json!("cmd 5")));
         assert_eq!(history.last(), Some(&json!("cmd 104")));
+    }
+
+    #[test]
+    fn input_history_push_reports_a_save_only_when_it_appends() {
+        let mut history: Vec<Value> = vec![json!("ls")];
+        // a repeat of the last entry is answered without a save, like python's early return
+        assert!(!push_input_history(&mut history, "ls"));
+        assert_eq!(history, vec![json!("ls")]);
+        assert!(push_input_history(&mut history, "cd /tmp"));
+        assert_eq!(history, vec![json!("ls"), json!("cd /tmp")]);
+    }
+
+    #[test]
+    fn input_history_file_that_json_loads_rejects_is_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p.to_string_lossy().to_string()
+        };
+        // python json.loads raises on these: the handler answers 500 and leaves the file alone
+        assert!(!input_history_file_parses(&file("truncated.json", "[\"ls\", \"cd")));
+        assert!(!input_history_file_parses(&file("garbage.json", "not json")));
+        // an empty file loads as no entries, and valid json (or python's NaN) does not raise
+        assert!(input_history_file_parses(&file("empty.json", "")));
+        assert!(input_history_file_parses(&file("list.json", "[\"ls\"]")));
+        assert!(input_history_file_parses(&file("nan.json", "[NaN]")));
+        // a file that cannot be read is logged by python's _read and does not raise
+        assert!(input_history_file_parses(&dir.path().join("missing.json").to_string_lossy()));
     }
 
     #[test]
