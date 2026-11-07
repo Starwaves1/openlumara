@@ -291,8 +291,27 @@ fn py_int(v: Option<&Value>, default: i64) -> anyhow::Result<i64> {
         None => Ok(default),
         Some(Value::Number(n)) => Ok(n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)),
         Some(Value::Bool(b)) => Ok(*b as i64),
-        Some(Value::String(s)) => s.trim().parse::<i64>().map_err(|_| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
+        Some(Value::String(s)) => py_int_str(s).ok_or_else(|| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
         Some(other) => Err(anyhow!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(other))),
+    }
+}
+
+/// python `int(str)`: surrounding whitespace, an optional sign, and digits with single underscores between them
+fn py_int_str(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (negative, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let parts: Vec<&str> = body.split('_').collect();
+    if parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let n: i64 = parts.concat().parse().ok()?;
+    if negative {
+        n.checked_neg()
+    } else {
+        Some(n)
     }
 }
 
@@ -766,7 +785,8 @@ impl Coder {
 
     fn route_sandboxes(&self) -> anyhow::Result<Value> {
         let mode = self.cfg("editor_mode").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "standard".into());
-        let autosave = self.cfg("autosave_interval").filter(truthy).and_then(|v| ol_core::pyjson::as_f64(&v)).map(|f| f as i64).unwrap_or(0);
+        // python: int(self.config.get("autosave_interval") or 0), so bad text raises ValueError out of the route
+        let autosave = py_int(self.cfg("autosave_interval").filter(truthy).as_ref(), 0)?;
         Ok(json!({
             "sandboxes": self.get_sandbox_paths().map_err(err)?,
             "read_only": self.read_only(),
@@ -780,6 +800,12 @@ impl Coder {
         let rel_path = sget(q, "path");
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
+        }
+        // python: with no sandbox_paths the base is None, and an empty path hands that None to os.path.isdir,
+        // which raises a TypeError outside any try block (a non-empty path fails earlier, inside sandbox_path)
+        let requested = rel_path.strip_prefix(sandbox.as_str()).unwrap_or(&rel_path);
+        if requested.is_empty() && matches!(self.get_full_sandbox_path(&sandbox), Ok(None)) {
+            return self.result("stat: path should be string, bytes, os.PathLike or integer, not NoneType", false);
         }
         let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
             Ok(t) => t,
@@ -1869,5 +1895,60 @@ mod tests {
         // python quirk: context_lines[:1] includes the line *after* the match
         assert_eq!(b, vec![json!("b")]);
         assert_eq!(a, vec![json!("b")]);
+    }
+
+    /// the module config is process-global, so the tests that install one hold this lock
+    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// a coder whose settings are `settings`, laid out the way the channel config holds them (modules.settings.coder)
+    fn coder_with(settings: Value) -> Coder {
+        let config = json!({"modules": {"settings": {"coder": settings}}});
+        let dir = std::env::temp_dir().join(format!("ol-test-config-coder-{}", std::process::id()));
+        ol_core::config::set_for_tests(config.clone());
+        let _ = std::fs::remove_file(dir.join("config.yml"));
+        std::fs::write(dir.join("config.yml"), config.to_string()).expect("write test config");
+        Coder::new(ModuleBase::detached("coder"))
+    }
+
+    #[test]
+    fn sandboxes_autosave_interval_is_python_int_of_the_setting() {
+        let _lock = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let autosave = |v: Value| coder_with(json!({"autosave_interval": v})).route_sandboxes();
+        assert_eq!(autosave(json!("5")).unwrap()["autosave_interval"], json!(5));
+        assert_eq!(autosave(json!(" 1_000 ")).unwrap()["autosave_interval"], json!(1000));
+        assert_eq!(autosave(json!(2.9)).unwrap()["autosave_interval"], json!(2));
+        // python: `value or 0`, so falsy text is 0 rather than a parse error
+        assert_eq!(autosave(json!("")).unwrap()["autosave_interval"], json!(0));
+        // python int() raises ValueError, which the route does not catch
+        let bad = autosave(json!("2.5")).unwrap_err().to_string();
+        assert_eq!(bad, "invalid literal for int() with base 10: '2.5'");
+        assert_eq!(autosave(json!("abc")).unwrap_err().to_string(), "invalid literal for int() with base 10: 'abc'");
+    }
+
+    #[test]
+    fn tree_without_sandboxes_fails_with_the_python_error_for_each_path_shape() {
+        let _lock = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let coder = coder_with(json!({}));
+        let query = |path: &str| {
+            let mut q = Map::new();
+            q.insert("sandbox".into(), json!("proj"));
+            q.insert("path".into(), json!(path));
+            q
+        };
+        // empty path: python hands None to os.path.isdir, which raises TypeError out of the route
+        assert_eq!(
+            coder.route_tree(&query("")),
+            json!({"status": "error", "content": "stat: path should be string, bytes, os.PathLike or integer, not NoneType"})
+        );
+        // the sandbox name alone counts as an empty path once python strips it
+        assert_eq!(
+            coder.route_tree(&query("proj")),
+            json!({"status": "error", "content": "stat: path should be string, bytes, os.PathLike or integer, not NoneType"})
+        );
+        // a non-empty path fails inside sandbox_path(None, ...) and python reports that as the result
+        assert_eq!(
+            coder.route_tree(&query("src")),
+            json!({"status": "error", "content": "'NoneType' object has no attribute 'replace'"})
+        );
     }
 }
