@@ -1,5 +1,6 @@
 //! (being ported - see rust/PORTING.md)
 
+pub mod calculator;
 pub mod channel;
 pub mod chats;
 pub mod docs;
@@ -135,5 +136,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: writing_style::meta::UNSAFE,
         category: writing_style::meta::CATEGORY,
         factory: writing_style::WritingStyle::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "calculator",
+        class_name: calculator::meta::CLASS_NAME,
+        doc: calculator::meta::DOC,
+        settings: calculator::meta::settings,
+        unsafe_: calculator::meta::UNSAFE,
+        category: calculator::meta::CATEGORY,
+        factory: calculator::Calculator::factory,
     });
 }

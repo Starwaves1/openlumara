@@ -1,0 +1,2062 @@
+//! Safe evaluator for the expression language of python's `simpleeval.simple_eval` (simpleeval 1.0.x
+//! defaults, which is what `pip install simpleeval` gives today).
+//!
+//! Supported: int (arbitrary precision), float, bool, str and None literals, the names True/False/None,
+//! `+ - * / // % **`, `<< >> & | ^ ~`, `not and or`, chained comparisons (`== != < <= > >= in not in
+//! is is not`), `a if c else b`, parentheses, str indexing and slicing, and the functions simpleeval
+//! allows by default: rand, randint, int, float, str. As in simpleeval, `import`, lambdas,
+//! comprehensions and list/dict/set/tuple literals are rejected with simpleeval's own messages.
+//!
+//! Not supported (reported as an error, never guessed): f-strings, bytes, complex numbers, attribute
+//! access such as `"abc".upper()`, printf-style `%` formatting of strings, and results that python
+//! would return as complex numbers.
+
+use crate::util::py_strip;
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use ol_core::pyjson::{float_repr, py_repr};
+use serde_json::Value as Json;
+use std::cmp::Ordering;
+
+const MAX_STRING_LENGTH: usize = 100_000;
+const MAX_POWER: i64 = 4_000_000;
+const MAX_SHIFT: i64 = 10_000;
+const DISALLOW_PREFIXES: &[&str] = &["_", "func_"];
+const DISALLOW_METHODS: &[&str] = &["format", "format_map", "mro", "tb_frame", "gi_frame", "ag_frame", "cr_frame", "exec"];
+const KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except",
+    "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+    "while", "with", "yield",
+];
+const STRING_PREFIXES: &[&str] = &["r", "u", "b", "br", "rb", "f", "fr", "rf"];
+const OPS3: &[&str] = &["**=", "//=", ">>=", "<<=", "..."];
+const OPS2: &[&str] = &["**", "//", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", ":=", "->"];
+const OPS1: &[&str] = &["+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "=", ".", ",", ":", "@", "(", ")", "[", "]", "{", "}", ";"];
+const AUG_OPS: &[&str] = &["+=", "-=", "*=", "/=", "//=", "%=", "**=", "<<=", ">>=", "&=", "|=", "^=", "@="];
+
+/// an exception raised while evaluating; the message is python's `str(e)`
+#[derive(Debug, Clone, PartialEq)]
+pub struct PyErr(pub String);
+
+impl std::fmt::Display for PyErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+type Res<T> = Result<T, PyErr>;
+
+fn fail<T>(msg: impl Into<String>) -> Res<T> {
+    Err(PyErr(msg.into()))
+}
+
+fn syntax_error(msg: &str, line: usize) -> PyErr {
+    PyErr(format!("{msg} (<unknown>, line {line})"))
+}
+
+fn not_available(node: &str) -> String {
+    format!("Sorry, {node} is not available in this evaluator")
+}
+
+/// the default simpleeval functions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Func {
+    Rand,
+    RandInt,
+    Int,
+    Float,
+    Str,
+}
+
+/// a python value produced by the evaluator
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    Int(BigInt),
+    Bool(bool),
+    Float(f64),
+    Str(String),
+    None,
+    Func(Func),
+}
+
+fn function_named(name: &str) -> Option<Func> {
+    match name {
+        "rand" => Some(Func::Rand),
+        "randint" => Some(Func::RandInt),
+        "int" => Some(Func::Int),
+        "float" => Some(Func::Float),
+        "str" => Some(Func::Str),
+        _ => None,
+    }
+}
+
+fn type_name(v: &Val) -> &'static str {
+    match v {
+        Val::Int(_) => "int",
+        Val::Bool(_) => "bool",
+        Val::Float(_) => "float",
+        Val::Str(_) => "str",
+        Val::None => "NoneType",
+        Val::Func(Func::Int | Func::Float | Func::Str) => "type",
+        Val::Func(Func::Rand) => "builtin_function_or_method",
+        Val::Func(Func::RandInt) => "function",
+    }
+}
+
+fn repr_str(s: &str) -> String {
+    py_repr(&Json::String(s.to_string()))
+}
+
+/// python `str(float)`
+fn float_str(f: f64) -> String {
+    if f.is_nan() {
+        "nan".into()
+    } else if f.is_infinite() {
+        if f > 0.0 { "inf".into() } else { "-inf".into() }
+    } else {
+        float_repr(f)
+    }
+}
+
+/// python `str(value)` without the int digit limit (used inside error messages)
+fn display(v: &Val) -> String {
+    match v {
+        Val::Int(i) => i.to_string(),
+        Val::Bool(true) => "True".into(),
+        Val::Bool(false) => "False".into(),
+        Val::Float(f) => float_str(*f),
+        Val::Str(s) => s.clone(),
+        Val::None => "None".into(),
+        Val::Func(Func::Rand) => "<built-in method random of Random object>".into(),
+        Val::Func(Func::RandInt) => "<function random_int>".into(),
+        Val::Func(Func::Int) => "<class 'int'>".into(),
+        Val::Func(Func::Float) => "<class 'float'>".into(),
+        Val::Func(Func::Str) => "<class 'str'>".into(),
+    }
+}
+
+/// python `str(value)`: what the module returns as the tool result. Like cpython, converting an int
+/// with more than 4300 digits to a string fails.
+pub fn format_result(v: &Val) -> Res<String> {
+    if let Val::Int(i) = v {
+        // 4300 digits is about 14284 bits: anything smaller is safely under the limit
+        if i.bits() > 14_000 && i.magnitude().to_string().len() > 4300 {
+            return fail("Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit");
+        }
+    }
+    Ok(display(v))
+}
+
+fn truthy(v: &Val) -> bool {
+    match v {
+        Val::Int(i) => !i.is_zero(),
+        Val::Bool(b) => *b,
+        Val::Float(f) => *f != 0.0,
+        Val::Str(s) => !s.is_empty(),
+        Val::None => false,
+        Val::Func(_) => true,
+    }
+}
+
+/// a numeric operand: bools take part as ints, like python
+enum Num {
+    I(BigInt),
+    F(f64),
+}
+
+fn num_of(v: &Val) -> Option<Num> {
+    match v {
+        Val::Int(i) => Some(Num::I(i.clone())),
+        Val::Bool(b) => Some(Num::I(BigInt::from(u8::from(*b)))),
+        Val::Float(f) => Some(Num::F(*f)),
+        _ => None,
+    }
+}
+
+fn is_int_like(v: &Val) -> bool {
+    matches!(v, Val::Int(_) | Val::Bool(_))
+}
+
+/// python `int(float)` for the value of a float
+fn float_to_int(f: f64) -> Res<BigInt> {
+    if f.is_nan() {
+        return fail("cannot convert float NaN to integer");
+    }
+    if f.is_infinite() {
+        return fail("cannot convert float infinity to integer");
+    }
+    BigInt::from_f64(f.trunc()).map_or_else(|| fail("cannot convert float to integer"), Ok)
+}
+
+/// python `float(int)`, which raises for ints too large for a float
+fn int_to_f64(i: &BigInt) -> Res<f64> {
+    match i.to_f64() {
+        Some(f) if f.is_finite() => Ok(f),
+        _ => fail("int too large to convert to float"),
+    }
+}
+
+/// an int argument as a machine integer (saturating, like python slice indices)
+fn saturating_i64(i: &BigInt) -> i64 {
+    i.to_i64().unwrap_or(if i.is_negative() { i64::MIN } else { i64::MAX })
+}
+
+fn index_arg(v: &Val) -> Res<i64> {
+    match num_of(v) {
+        Some(Num::I(i)) => Ok(saturating_i64(&i)),
+        _ => fail(format!("'{}' object cannot be interpreted as an integer", type_name(v))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    FloorDiv,
+    Mod,
+    Pow,
+    LShift,
+    RShift,
+    BitOr,
+    BitXor,
+    BitAnd,
+}
+
+impl BinOp {
+    fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::FloorDiv => "//",
+            BinOp::Mod => "%",
+            BinOp::Pow => "**",
+            BinOp::LShift => "<<",
+            BinOp::RShift => ">>",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::BitAnd => "&",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UnOp {
+    Neg,
+    Pos,
+    Invert,
+    Not,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CmpOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtE,
+    Gt,
+    GtE,
+    In,
+    NotIn,
+    Is,
+    IsNot,
+}
+
+impl CmpOp {
+    fn symbol(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "==",
+            CmpOp::NotEq => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::LtE => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::GtE => ">=",
+            CmpOp::In => "in",
+            CmpOp::NotIn => "not in",
+            CmpOp::Is => "is",
+            CmpOp::IsNot => "is not",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SubKey {
+    Index(Box<Expr>),
+    Slice(Option<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>),
+}
+
+#[derive(Debug, Clone)]
+enum Expr {
+    Const(Val),
+    Name(String),
+    /// a node that simpleeval parses but refuses to evaluate; the message is raised when reached
+    Fail(String),
+    Unary(UnOp, Box<Expr>),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+    Compare(Box<Expr>, Vec<(CmpOp, Expr)>),
+    /// test, body, orelse
+    IfExp(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// func, positional args, keyword args
+    Call(Box<Expr>, Vec<Expr>, Vec<(String, Expr)>),
+    Attr(Box<Expr>, String),
+    Subscript(Box<Expr>, SubKey),
+}
+
+#[derive(Debug, Clone)]
+enum Stmt {
+    Expr(Expr),
+    /// `target = value`: only the value is evaluated, like simpleeval
+    Assign(Expr),
+    /// `target op= value`: only the value is evaluated, like simpleeval
+    AugAssign(Expr),
+    Fail(String),
+}
+
+// ---------------------------------------------------------------- lexer
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Num(Val),
+    Str(String),
+    /// a literal this evaluator does not support; raised when the expression reaches it
+    Fail(String),
+    Name(String),
+    Op(&'static str),
+    Newline,
+    Eof,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Token {
+    tok: Tok,
+    line: usize,
+}
+
+struct Lexer {
+    src: Vec<char>,
+    i: usize,
+    line: usize,
+    open: Vec<(char, usize)>,
+    out: Vec<Token>,
+    line_start: bool,
+    /// the previous logical line ended with ':' so indented lines are a block body
+    block_open: bool,
+}
+
+fn lex(text: &str) -> Res<Vec<Token>> {
+    let mut lx = Lexer { src: text.chars().collect(), i: 0, line: 1, open: Vec::new(), out: Vec::new(), line_start: true, block_open: false };
+    lx.run()?;
+    Ok(lx.out)
+}
+
+fn bracket_op(c: char) -> &'static str {
+    match c {
+        '(' => "(",
+        ')' => ")",
+        '[' => "[",
+        ']' => "]",
+        '{' => "{",
+        _ => "}",
+    }
+}
+
+impl Lexer {
+    fn at(&self, k: usize) -> Option<char> {
+        self.src.get(self.i + k).copied()
+    }
+
+    fn push(&mut self, tok: Tok) {
+        let line = self.line;
+        self.out.push(Token { tok, line });
+    }
+
+    fn match_op(&self) -> Option<&'static str> {
+        OPS3.iter().chain(OPS2.iter()).chain(OPS1.iter()).copied().find(|op| op.chars().enumerate().all(|(k, ch)| self.at(k) == Some(ch)))
+    }
+
+    fn run(&mut self) -> Res<()> {
+        while let Some(c) = self.at(0) {
+            if self.line_start && self.open.is_empty() {
+                self.line_start = false;
+                let mut j = 0;
+                while matches!(self.at(j), Some(' ' | '\t' | '\x0c')) {
+                    j += 1;
+                }
+                let blank = matches!(self.at(j), None | Some('\n' | '\r' | '#'));
+                if j == 0 && !blank {
+                    self.block_open = false;
+                }
+                if j > 0 && !blank && !self.block_open {
+                    return Err(syntax_error("unexpected indent", self.line));
+                }
+                self.i += j;
+                continue;
+            }
+            match c {
+                ' ' | '\t' | '\x0c' | '\r' => self.i += 1,
+                '#' => {
+                    while matches!(self.at(0), Some(ch) if ch != '\n') {
+                        self.i += 1;
+                    }
+                }
+                '\n' => {
+                    if self.open.is_empty() {
+                        if matches!(self.out.last(), Some(Token { tok: Tok::Op(":"), .. })) {
+                            self.block_open = true;
+                        }
+                        if !matches!(self.out.last(), None | Some(Token { tok: Tok::Newline, .. })) {
+                            self.push(Tok::Newline);
+                        }
+                        self.line_start = true;
+                    }
+                    self.line += 1;
+                    self.i += 1;
+                }
+                '\\' => match (self.at(1), self.at(2)) {
+                    (Some('\n'), _) => {
+                        self.i += 2;
+                        self.line += 1;
+                    }
+                    (Some('\r'), Some('\n')) => {
+                        self.i += 3;
+                        self.line += 1;
+                    }
+                    _ => return Err(syntax_error("unexpected character after line continuation character", self.line)),
+                },
+                '0'..='9' => {
+                    let t = self.number()?;
+                    self.push(t);
+                }
+                '.' if matches!(self.at(1), Some('0'..='9')) => {
+                    let t = self.number()?;
+                    self.push(t);
+                }
+                '"' | '\'' => {
+                    let t = self.string(String::new())?;
+                    self.push(t);
+                }
+                _ if c.is_alphabetic() || c == '_' => {
+                    let start = self.i;
+                    while matches!(self.at(0), Some(ch) if ch.is_alphanumeric() || ch == '_') {
+                        self.i += 1;
+                    }
+                    let word: String = self.src[start..self.i].iter().collect();
+                    let lower = word.to_ascii_lowercase();
+                    if matches!(self.at(0), Some('"' | '\'')) && STRING_PREFIXES.contains(&lower.as_str()) {
+                        let t = self.string(lower)?;
+                        self.push(t);
+                    } else {
+                        self.push(Tok::Name(word));
+                    }
+                }
+                '(' | '[' | '{' => {
+                    self.open.push((c, self.line));
+                    self.i += 1;
+                    self.push(Tok::Op(bracket_op(c)));
+                }
+                ')' | ']' | '}' => {
+                    let want = match c {
+                        ')' => '(',
+                        ']' => '[',
+                        _ => '{',
+                    };
+                    match self.open.pop() {
+                        None => return Err(syntax_error(&format!("unmatched '{c}'"), self.line)),
+                        Some((o, ol)) if o != want => {
+                            let on = if ol != self.line { format!(" on line {ol}") } else { String::new() };
+                            return Err(syntax_error(&format!("closing parenthesis '{c}' does not match opening parenthesis '{o}'{on}"), self.line));
+                        }
+                        Some(_) => {}
+                    }
+                    self.i += 1;
+                    self.push(Tok::Op(bracket_op(c)));
+                }
+                _ => {
+                    if let Some(op) = self.match_op() {
+                        self.i += op.chars().count();
+                        self.push(Tok::Op(op));
+                    } else if c.is_ascii() {
+                        return Err(syntax_error("invalid syntax", self.line));
+                    } else {
+                        return Err(syntax_error(&format!("invalid character '{c}' (U+{:04X})", c as u32), self.line));
+                    }
+                }
+            }
+        }
+        if let Some((open, line)) = self.open.last() {
+            return Err(syntax_error(&format!("'{open}' was never closed"), *line));
+        }
+        if !matches!(self.out.last(), Some(Token { tok: Tok::Newline, .. })) {
+            self.push(Tok::Newline);
+        }
+        self.push(Tok::Eof);
+        Ok(())
+    }
+
+    fn eat_digits(&mut self) {
+        while matches!(self.at(0), Some(ch) if ch.is_ascii_digit() || ch == '_') {
+            self.i += 1;
+        }
+    }
+
+    fn number(&mut self) -> Res<Tok> {
+        let line = self.line;
+        if self.at(0) == Some('0') {
+            let radix = match self.at(1).map(|c| c.to_ascii_lowercase()) {
+                Some('x') => 16,
+                Some('o') => 8,
+                Some('b') => 2,
+                _ => 0,
+            };
+            if radix != 0 {
+                self.i += 2;
+                let start = self.i;
+                while matches!(self.at(0), Some(ch) if ch.is_ascii_alphanumeric() || ch == '_') {
+                    self.i += 1;
+                }
+                let body: String = self.src[start..self.i].iter().filter(|c| **c != '_').collect();
+                return BigInt::parse_bytes(body.as_bytes(), radix)
+                    .map(|v| Tok::Num(Val::Int(v)))
+                    .ok_or_else(|| syntax_error("invalid syntax", line));
+            }
+        }
+        let start = self.i;
+        let mut is_float = false;
+        self.eat_digits();
+        if self.at(0) == Some('.') {
+            is_float = true;
+            self.i += 1;
+            self.eat_digits();
+        }
+        if matches!(self.at(0), Some('e' | 'E')) {
+            let k = if matches!(self.at(1), Some('+' | '-')) { 2 } else { 1 };
+            if matches!(self.at(k), Some('0'..='9')) {
+                is_float = true;
+                self.i += k;
+                self.eat_digits();
+            }
+        }
+        let text: String = self.src[start..self.i].iter().filter(|c| **c != '_').collect();
+        if matches!(self.at(0), Some('j' | 'J')) {
+            self.i += 1;
+            return Ok(Tok::Fail("complex numbers are not supported by this calculator".into()));
+        }
+        if is_float {
+            let mut t = if text.starts_with('.') { format!("0{text}") } else { text };
+            if t.contains(".e") || t.contains(".E") {
+                t = t.replacen(".e", ".0e", 1).replacen(".E", ".0E", 1);
+            }
+            if t.ends_with('.') {
+                t.push('0');
+            }
+            return t.parse::<f64>().map(|f| Tok::Num(Val::Float(f))).map_err(|_| syntax_error("invalid syntax", line));
+        }
+        if text.len() > 1 && text.starts_with('0') && text.chars().any(|c| c != '0') {
+            return Err(syntax_error("leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers", line));
+        }
+        BigInt::parse_bytes(text.as_bytes(), 10).map(|v| Tok::Num(Val::Int(v))).ok_or_else(|| syntax_error("invalid syntax", line))
+    }
+
+    fn unterminated(&self, triple: bool, line0: usize) -> PyErr {
+        let kind = if triple { "unterminated triple-quoted string literal" } else { "unterminated string literal" };
+        syntax_error(&format!("{kind} (detected at line {})", self.line), line0)
+    }
+
+    fn hex_escape(&mut self, digits: usize, out: &mut String) -> Res<()> {
+        let mut v: u64 = 0;
+        for _ in 0..digits {
+            match self.at(0).and_then(|c| c.to_digit(16)) {
+                Some(x) => {
+                    v = v * 16 + u64::from(x);
+                    self.i += 1;
+                }
+                None => return Err(syntax_error("(unicode error) malformed escape sequence", self.line)),
+            }
+        }
+        let ch = u32::try_from(v).ok().and_then(char::from_u32);
+        out.push(ch.ok_or_else(|| syntax_error("(unicode error) invalid unicode character", self.line))?);
+        Ok(())
+    }
+
+    fn string(&mut self, prefix: String) -> Res<Tok> {
+        let line0 = self.line;
+        let raw = prefix.contains('r');
+        let quote = self.src[self.i];
+        let triple = self.at(1) == Some(quote) && self.at(2) == Some(quote);
+        self.i += if triple { 3 } else { 1 };
+        let mut out = String::new();
+        let mut named_escape = false;
+        loop {
+            let Some(c) = self.at(0) else { return Err(self.unterminated(triple, line0)) };
+            if c == quote && (!triple || (self.at(1) == Some(quote) && self.at(2) == Some(quote))) {
+                self.i += if triple { 3 } else { 1 };
+                break;
+            }
+            if c == '\n' && !triple {
+                return Err(self.unterminated(false, line0));
+            }
+            if c != '\\' {
+                if c == '\n' {
+                    self.line += 1;
+                }
+                out.push(c);
+                self.i += 1;
+                continue;
+            }
+            let Some(d) = self.at(1) else { return Err(self.unterminated(triple, line0)) };
+            self.i += 2;
+            if raw {
+                out.push('\\');
+                out.push(d);
+                if d == '\n' {
+                    self.line += 1;
+                }
+                continue;
+            }
+            match d {
+                '\n' => self.line += 1,
+                '\\' => out.push('\\'),
+                '\'' => out.push('\''),
+                '"' => out.push('"'),
+                'a' => out.push('\u{7}'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'v' => out.push('\u{b}'),
+                '0'..='7' => {
+                    let mut v = d.to_digit(8).unwrap_or(0);
+                    let mut n = 1;
+                    while n < 3 {
+                        match self.at(0).and_then(|c| c.to_digit(8)) {
+                            Some(x) => {
+                                v = v * 8 + x;
+                                self.i += 1;
+                                n += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                }
+                'x' => self.hex_escape(2, &mut out)?,
+                'u' => self.hex_escape(4, &mut out)?,
+                'U' => self.hex_escape(8, &mut out)?,
+                'N' => {
+                    named_escape = true;
+                    if self.at(0) == Some('{') {
+                        while !matches!(self.at(0), None | Some('}')) {
+                            self.i += 1;
+                        }
+                        self.i += 1;
+                    }
+                }
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
+            }
+        }
+        if prefix.contains('b') {
+            return Ok(Tok::Fail("bytes literals are not supported by this calculator".into()));
+        }
+        if prefix.contains('f') {
+            return Ok(Tok::Fail("f-strings are not supported by this calculator".into()));
+        }
+        if named_escape {
+            return Ok(Tok::Fail("named unicode escapes are not supported by this calculator".into()));
+        }
+        Ok(Tok::Str(out))
+    }
+}
+
+// ---------------------------------------------------------------- parser
+
+struct Parser {
+    toks: Vec<Token>,
+    pos: usize,
+    /// the expression as the caller gave it (simpleeval reports this text in its messages)
+    source: String,
+}
+
+fn is_keyword(s: &str) -> bool {
+    KEYWORDS.contains(&s)
+}
+
+fn is_target(e: &Expr) -> bool {
+    matches!(e, Expr::Name(_) | Expr::Attr(..) | Expr::Subscript(..))
+}
+
+/// the name cpython gives an expression node in assignment errors, and whether that message ends with
+/// cpython's "here. Maybe you meant '==' instead of '='?" hint
+fn assign_kind(e: &Expr) -> (&'static str, bool) {
+    match e {
+        Expr::Const(Val::None) => ("None", false),
+        Expr::Const(Val::Bool(true)) => ("True", false),
+        Expr::Const(Val::Bool(false)) => ("False", false),
+        Expr::Const(_) => ("literal", true),
+        Expr::Call(..) => ("function call", true),
+        Expr::Compare(..) => ("comparison", false),
+        Expr::IfExp(..) => ("conditional expression", false),
+        _ => ("expression", true),
+    }
+}
+
+/// cpython's message for an assignment to something that is not a name, attribute or subscript
+fn assign_error(e: &Expr, line: usize) -> PyErr {
+    let (kind, hint) = assign_kind(e);
+    if hint {
+        syntax_error(&format!("cannot assign to {kind} here. Maybe you meant '==' instead of '='?"), line)
+    } else {
+        syntax_error(&format!("cannot assign to {kind}"), line)
+    }
+}
+
+/// cpython's message for an augmented assignment to something that is not a name, attribute or subscript
+fn aug_error(e: &Expr, line: usize) -> PyErr {
+    let (kind, _) = assign_kind(e);
+    syntax_error(&format!("'{kind}' is an illegal expression for augmented assignment"), line)
+}
+
+impl Parser {
+    fn tok(&self) -> &Tok {
+        &self.toks[self.pos].tok
+    }
+
+    fn peek_tok(&self, k: usize) -> Option<&Tok> {
+        self.toks.get(self.pos + k).map(|t| &t.tok)
+    }
+
+    fn line(&self) -> usize {
+        self.toks[self.pos].line
+    }
+
+    /// consumes the current token; the final Eof token is never consumed
+    fn bump(&mut self) -> Tok {
+        let t = self.toks[self.pos].tok.clone();
+        if self.pos + 1 < self.toks.len() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn is_op(&self, op: &str) -> bool {
+        matches!(self.tok(), Tok::Op(o) if *o == op)
+    }
+
+    fn is_kw(&self, kw: &str) -> bool {
+        matches!(self.tok(), Tok::Name(n) if n == kw)
+    }
+
+    fn is_name_at(&self, k: usize, kw: &str) -> bool {
+        matches!(self.peek_tok(k), Some(Tok::Name(n)) if n == kw)
+    }
+
+    fn eat_op(&mut self, op: &str) -> bool {
+        if self.is_op(op) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn invalid<T>(&self) -> Res<T> {
+        Err(syntax_error("invalid syntax", self.line()))
+    }
+
+    fn expect_op(&mut self, op: &str) -> Res<()> {
+        if self.eat_op(op) {
+            Ok(())
+        } else {
+            self.invalid()
+        }
+    }
+
+    /// skips the rest of a bracketed comprehension and returns the node simpleeval refuses
+    fn comprehension(&mut self, node: &str, close: &str) -> Res<Expr> {
+        let mut depth = 0usize;
+        loop {
+            match self.tok() {
+                Tok::Eof | Tok::Newline => return self.invalid(),
+                Tok::Op(o) if depth == 0 && *o == close => {
+                    self.bump();
+                    return Ok(Expr::Fail(not_available(node)));
+                }
+                Tok::Op(o) if matches!(*o, "(" | "[" | "{") => depth += 1,
+                Tok::Op(o) if matches!(*o, ")" | "]" | "}") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    fn skip_to_eof(&mut self) {
+        while !matches!(self.tok(), Tok::Eof) {
+            self.bump();
+        }
+    }
+
+    fn parse_module(&mut self) -> Res<Vec<Stmt>> {
+        let mut stmts = Vec::new();
+        loop {
+            while matches!(self.tok(), Tok::Newline) {
+                self.bump();
+            }
+            if matches!(self.tok(), Tok::Eof) {
+                break;
+            }
+            stmts.push(self.statement()?);
+            match self.tok() {
+                Tok::Newline | Tok::Eof => {}
+                Tok::Op(";") => {
+                    self.bump();
+                }
+                _ => return self.invalid(),
+            }
+        }
+        Ok(stmts)
+    }
+
+    fn skip_statement(&mut self) {
+        while !matches!(self.tok(), Tok::Newline | Tok::Eof | Tok::Op(";")) {
+            self.bump();
+        }
+    }
+
+    fn statement(&mut self) -> Res<Stmt> {
+        if let Tok::Name(kw) = self.tok().clone() {
+            let node = match kw.as_str() {
+                "import" => {
+                    self.skip_statement();
+                    return Ok(Stmt::Fail("Sorry, 'import' is not allowed.".into()));
+                }
+                "from" => Some("ImportFrom"),
+                "global" => Some("Global"),
+                "nonlocal" => Some("Nonlocal"),
+                "del" => Some("Delete"),
+                "pass" => Some("Pass"),
+                "break" => Some("Break"),
+                "continue" => Some("Continue"),
+                "return" => Some("Return"),
+                "raise" => Some("Raise"),
+                "assert" => Some("Assert"),
+                "elif" | "else" | "except" | "finally" => return self.invalid(),
+                "if" => Some("If"),
+                "while" => Some("While"),
+                "for" => Some("For"),
+                "try" => Some("Try"),
+                "with" => Some("With"),
+                "def" => Some("FunctionDef"),
+                "class" => Some("ClassDef"),
+                "async" => match self.peek_tok(1) {
+                    Some(Tok::Name(n)) if n == "def" => Some("AsyncFunctionDef"),
+                    Some(Tok::Name(n)) if n == "for" => Some("AsyncFor"),
+                    Some(Tok::Name(n)) if n == "with" => Some("AsyncWith"),
+                    _ => return self.invalid(),
+                },
+                _ => None,
+            };
+            if let Some(node) = node {
+                // a compound statement's block is never parsed: simpleeval only refuses the node
+                self.skip_to_eof();
+                return Ok(Stmt::Fail(not_available(node)));
+            }
+        }
+        let first = self.test_list()?;
+        if self.is_op(":") {
+            if !is_target(&first) {
+                return Err(syntax_error("illegal target for annotation", self.line()));
+            }
+            self.skip_statement();
+            return Ok(Stmt::Fail(not_available("AnnAssign")));
+        }
+        if self.is_op("=") {
+            let mut exprs = vec![first];
+            while self.eat_op("=") {
+                exprs.push(self.test_list()?);
+            }
+            let value = exprs.pop().unwrap_or(Expr::Const(Val::None));
+            if let Some(bad) = exprs.iter().find(|t| !is_target(t)) {
+                return Err(assign_error(bad, self.line()));
+            }
+            return Ok(Stmt::Assign(value));
+        }
+        if matches!(self.tok(), Tok::Op(op) if AUG_OPS.contains(op)) {
+            if !is_target(&first) {
+                return Err(aug_error(&first, self.line()));
+            }
+            self.bump();
+            let value = self.test_list()?;
+            return Ok(Stmt::AugAssign(value));
+        }
+        Ok(Stmt::Expr(first))
+    }
+
+    /// `a, b` at statement level is a tuple, which simpleeval refuses to evaluate
+    fn test_list(&mut self) -> Res<Expr> {
+        let first = self.test()?;
+        if !self.is_op(",") {
+            return Ok(first);
+        }
+        while self.eat_op(",") {
+            if matches!(self.tok(), Tok::Newline | Tok::Eof | Tok::Op("=" | ";")) || matches!(self.tok(), Tok::Op(op) if AUG_OPS.contains(op)) {
+                break;
+            }
+            self.test()?;
+        }
+        Ok(Expr::Fail(not_available("Tuple")))
+    }
+
+    fn test(&mut self) -> Res<Expr> {
+        if self.is_kw("lambda") {
+            self.bump();
+            while !self.is_op(":") {
+                if matches!(self.tok(), Tok::Newline | Tok::Eof) {
+                    return self.invalid();
+                }
+                self.bump();
+            }
+            self.bump();
+            self.test()?;
+            return Ok(Expr::Fail(not_available("Lambda")));
+        }
+        let body = self.or_test()?;
+        if self.is_kw("if") {
+            self.bump();
+            let cond = self.or_test()?;
+            if !self.is_kw("else") {
+                return Err(syntax_error("expected 'else' after 'if' expression", self.line()));
+            }
+            self.bump();
+            if matches!(self.tok(), Tok::Newline | Tok::Eof) {
+                return Err(syntax_error("expected expression after 'else', but statement is given", self.line()));
+            }
+            let orelse = self.test()?;
+            return Ok(Expr::IfExp(Box::new(cond), Box::new(body), Box::new(orelse)));
+        }
+        Ok(body)
+    }
+
+    fn or_test(&mut self) -> Res<Expr> {
+        let mut vals = vec![self.and_test()?];
+        while self.is_kw("or") {
+            self.bump();
+            vals.push(self.and_test()?);
+        }
+        if vals.len() == 1 {
+            return Ok(vals.remove(0));
+        }
+        Ok(Expr::Or(vals))
+    }
+
+    fn and_test(&mut self) -> Res<Expr> {
+        let mut vals = vec![self.not_test()?];
+        while self.is_kw("and") {
+            self.bump();
+            vals.push(self.not_test()?);
+        }
+        if vals.len() == 1 {
+            return Ok(vals.remove(0));
+        }
+        Ok(Expr::And(vals))
+    }
+
+    fn not_test(&mut self) -> Res<Expr> {
+        if self.is_kw("not") {
+            self.bump();
+            let inner = self.not_test()?;
+            return Ok(Expr::Unary(UnOp::Not, Box::new(inner)));
+        }
+        self.comparison()
+    }
+
+    fn cmp_op(&self) -> Option<(CmpOp, usize)> {
+        match self.tok() {
+            Tok::Op("<") => Some((CmpOp::Lt, 1)),
+            Tok::Op(">") => Some((CmpOp::Gt, 1)),
+            Tok::Op("==") => Some((CmpOp::Eq, 1)),
+            Tok::Op(">=") => Some((CmpOp::GtE, 1)),
+            Tok::Op("<=") => Some((CmpOp::LtE, 1)),
+            Tok::Op("!=") => Some((CmpOp::NotEq, 1)),
+            Tok::Name(n) if n == "in" => Some((CmpOp::In, 1)),
+            Tok::Name(n) if n == "not" && self.is_name_at(1, "in") => Some((CmpOp::NotIn, 2)),
+            Tok::Name(n) if n == "is" && self.is_name_at(1, "not") => Some((CmpOp::IsNot, 2)),
+            Tok::Name(n) if n == "is" => Some((CmpOp::Is, 1)),
+            _ => None,
+        }
+    }
+
+    fn comparison(&mut self) -> Res<Expr> {
+        let left = self.bitor()?;
+        let mut rest = Vec::new();
+        while let Some((op, width)) = self.cmp_op() {
+            for _ in 0..width {
+                self.bump();
+            }
+            rest.push((op, self.bitor()?));
+        }
+        if rest.is_empty() {
+            return Ok(left);
+        }
+        Ok(Expr::Compare(Box::new(left), rest))
+    }
+
+    /// one left-associative binary precedence level
+    fn binary_level(&mut self, table: &[(&str, BinOp)], lower: fn(&mut Parser) -> Res<Expr>) -> Res<Expr> {
+        let mut left = lower(self)?;
+        loop {
+            let found = match self.tok() {
+                Tok::Op(o) => table.iter().find(|(s, _)| *s == *o).map(|(_, op)| *op),
+                _ => None,
+            };
+            let Some(op) = found else { break };
+            self.bump();
+            let right = lower(self)?;
+            left = Expr::Binary(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn bitor(&mut self) -> Res<Expr> {
+        self.binary_level(&[("|", BinOp::BitOr)], Self::bitxor)
+    }
+
+    fn bitxor(&mut self) -> Res<Expr> {
+        self.binary_level(&[("^", BinOp::BitXor)], Self::bitand)
+    }
+
+    fn bitand(&mut self) -> Res<Expr> {
+        self.binary_level(&[("&", BinOp::BitAnd)], Self::shift)
+    }
+
+    fn shift(&mut self) -> Res<Expr> {
+        self.binary_level(&[("<<", BinOp::LShift), (">>", BinOp::RShift)], Self::arith)
+    }
+
+    fn arith(&mut self) -> Res<Expr> {
+        self.binary_level(&[("+", BinOp::Add), ("-", BinOp::Sub)], Self::term)
+    }
+
+    fn term(&mut self) -> Res<Expr> {
+        let table = [("*", BinOp::Mul), ("/", BinOp::Div), ("//", BinOp::FloorDiv), ("%", BinOp::Mod)];
+        let mut left = self.binary_level(&table, Self::factor)?;
+        while self.eat_op("@") {
+            // simpleeval has no MatMult operator: it fails when this node is reached, before its operands
+            self.binary_level(&table, Self::factor)?;
+            left = Expr::Fail(format!("Operator 'MatMult()' does not exist in expression '{}'", self.source));
+        }
+        Ok(left)
+    }
+
+    fn factor(&mut self) -> Res<Expr> {
+        let op = match self.tok() {
+            Tok::Op("-") => Some(UnOp::Neg),
+            Tok::Op("+") => Some(UnOp::Pos),
+            Tok::Op("~") => Some(UnOp::Invert),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.bump();
+            let inner = self.factor()?;
+            return Ok(Expr::Unary(op, Box::new(inner)));
+        }
+        self.power()
+    }
+
+    fn power(&mut self) -> Res<Expr> {
+        let base = self.atom_expr()?;
+        if self.eat_op("**") {
+            let exp = self.factor()?;
+            return Ok(Expr::Binary(BinOp::Pow, Box::new(base), Box::new(exp)));
+        }
+        Ok(base)
+    }
+
+    fn atom_expr(&mut self) -> Res<Expr> {
+        let mut e = self.atom()?;
+        loop {
+            if self.eat_op("(") {
+                let (args, kwargs) = self.call_args()?;
+                e = Expr::Call(Box::new(e), args, kwargs);
+            } else if self.eat_op("[") {
+                let key = self.subscript()?;
+                self.expect_op("]")?;
+                e = Expr::Subscript(Box::new(e), key);
+            } else if self.eat_op(".") {
+                let Tok::Name(name) = self.tok().clone() else { return self.invalid() };
+                if is_keyword(&name) {
+                    return self.invalid();
+                }
+                self.bump();
+                e = Expr::Attr(Box::new(e), name);
+            } else {
+                break;
+            }
+        }
+        Ok(e)
+    }
+
+    /// arguments after `(`, through the closing `)`
+    fn call_args(&mut self) -> Res<(Vec<Expr>, Vec<(String, Expr)>)> {
+        let mut args = Vec::new();
+        let mut kwargs: Vec<(String, Expr)> = Vec::new();
+        while !self.is_op(")") {
+            if self.is_op("*") || self.is_op("**") {
+                self.bump();
+                self.test()?;
+                args.push(Expr::Fail(not_available("Starred")));
+            } else if matches!(self.tok(), Tok::Name(n) if !is_keyword(n)) && matches!(self.peek_tok(1), Some(Tok::Op("="))) {
+                let Tok::Name(name) = self.bump() else { return self.invalid() };
+                self.bump();
+                let value = self.test()?;
+                kwargs.push((name, value));
+            } else {
+                let value = self.test()?;
+                if self.is_kw("for") {
+                    // f(x for x in y): a GeneratorExp argument, closed by the call's ')'
+                    args.push(self.comprehension("GeneratorExp", ")")?);
+                    return Ok((args, kwargs));
+                }
+                if !kwargs.is_empty() {
+                    return Err(syntax_error("positional argument follows keyword argument", self.line()));
+                }
+                args.push(value);
+            }
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok((args, kwargs))
+    }
+
+    fn subscript(&mut self) -> Res<SubKey> {
+        let lo = if self.is_op(":") { None } else { Some(self.test()?) };
+        if self.is_op(",") {
+            // a tuple index: simpleeval refuses the Tuple node
+            while self.eat_op(",") {
+                if self.is_op("]") {
+                    break;
+                }
+                self.test()?;
+            }
+            return Ok(SubKey::Index(Box::new(Expr::Fail(not_available("Tuple")))));
+        }
+        if !self.is_op(":") {
+            return match lo {
+                Some(e) => Ok(SubKey::Index(Box::new(e))),
+                None => self.invalid(),
+            };
+        }
+        self.bump();
+        let slice_end = |p: &Parser| p.is_op("]") || p.is_op(",") || p.is_op(":");
+        let hi = if slice_end(&*self) { None } else { Some(Box::new(self.test()?)) };
+        let step = if self.eat_op(":") {
+            if self.is_op("]") || self.is_op(",") {
+                None
+            } else {
+                Some(Box::new(self.test()?))
+            }
+        } else {
+            None
+        };
+        Ok(SubKey::Slice(lo.map(Box::new), hi, step))
+    }
+
+    fn atom(&mut self) -> Res<Expr> {
+        match self.tok().clone() {
+            Tok::Num(v) => {
+                self.bump();
+                Ok(Expr::Const(v))
+            }
+            Tok::Str(_) => {
+                let mut s = String::new();
+                while let Tok::Str(part) = self.tok().clone() {
+                    s.push_str(&part);
+                    self.bump();
+                }
+                Ok(Expr::Const(Val::Str(s)))
+            }
+            Tok::Fail(msg) => {
+                self.bump();
+                Ok(Expr::Fail(msg))
+            }
+            Tok::Name(n) => match n.as_str() {
+                "True" => {
+                    self.bump();
+                    Ok(Expr::Const(Val::Bool(true)))
+                }
+                "False" => {
+                    self.bump();
+                    Ok(Expr::Const(Val::Bool(false)))
+                }
+                "None" => {
+                    self.bump();
+                    Ok(Expr::Const(Val::None))
+                }
+                _ if is_keyword(&n) => self.invalid(),
+                _ => {
+                    self.bump();
+                    Ok(Expr::Name(n))
+                }
+            },
+            Tok::Op("(") => {
+                self.bump();
+                if self.eat_op(")") {
+                    return Ok(Expr::Fail(not_available("Tuple")));
+                }
+                let first = self.test()?;
+                if self.is_kw("for") {
+                    return self.comprehension("GeneratorExp", ")");
+                }
+                if self.is_op(",") {
+                    while self.eat_op(",") {
+                        if self.is_op(")") {
+                            break;
+                        }
+                        self.test()?;
+                    }
+                    self.expect_op(")")?;
+                    return Ok(Expr::Fail(not_available("Tuple")));
+                }
+                self.expect_op(")")?;
+                Ok(first)
+            }
+            Tok::Op("[") => {
+                self.bump();
+                while !self.is_op("]") {
+                    self.test()?;
+                    if self.is_kw("for") {
+                        return self.comprehension("ListComp", "]");
+                    }
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op("]")?;
+                Ok(Expr::Fail(not_available("List")))
+            }
+            Tok::Op("{") => {
+                self.bump();
+                if self.eat_op("}") {
+                    return Ok(Expr::Fail(not_available("Dict")));
+                }
+                self.test()?;
+                if self.is_kw("for") {
+                    return self.comprehension("SetComp", "}");
+                }
+                if self.eat_op(":") {
+                    self.test()?;
+                    if self.is_kw("for") {
+                        return self.comprehension("DictComp", "}");
+                    }
+                    while self.eat_op(",") {
+                        if self.is_op("}") {
+                            break;
+                        }
+                        self.test()?;
+                        self.expect_op(":")?;
+                        self.test()?;
+                    }
+                    self.expect_op("}")?;
+                    return Ok(Expr::Fail(not_available("Dict")));
+                }
+                while self.eat_op(",") {
+                    if self.is_op("}") {
+                        break;
+                    }
+                    self.test()?;
+                }
+                self.expect_op("}")?;
+                Ok(Expr::Fail(not_available("Set")))
+            }
+            _ => self.invalid(),
+        }
+    }
+}
+
+fn parse(text: &str, source: &str) -> Res<Vec<Stmt>> {
+    let toks = lex(text)?;
+    Parser { toks, pos: 0, source: source.to_string() }.parse_module()
+}
+
+// ---------------------------------------------------------------- operators
+
+fn unary(op: UnOp, v: &Val) -> Res<Val> {
+    match op {
+        UnOp::Not => Ok(Val::Bool(!truthy(v))),
+        UnOp::Neg => match num_of(v) {
+            Some(Num::I(i)) => Ok(Val::Int(-i)),
+            Some(Num::F(f)) => Ok(Val::Float(-f)),
+            None => fail(format!("bad operand type for unary -: '{}'", type_name(v))),
+        },
+        UnOp::Pos => match num_of(v) {
+            Some(Num::I(i)) => Ok(Val::Int(i)),
+            Some(Num::F(f)) => Ok(Val::Float(f)),
+            None => fail(format!("bad operand type for unary +: '{}'", type_name(v))),
+        },
+        UnOp::Invert => match num_of(v) {
+            Some(Num::I(i)) => Ok(Val::Int(!i)),
+            _ => fail(format!("bad operand type for unary ~: '{}'", type_name(v))),
+        },
+    }
+}
+
+fn binary(op: BinOp, l: &Val, r: &Val) -> Res<Val> {
+    if op == BinOp::Pow {
+        // simpleeval's safe_power calls abs() on both operands before anything else
+        for v in [l, r] {
+            if num_of(v).is_none() {
+                return fail(format!("bad operand type for abs(): '{}'", type_name(v)));
+            }
+        }
+    }
+    if let (Some(a), Some(b)) = (num_of(l), num_of(r)) {
+        return numeric_binary(op, a, b, l, r);
+    }
+    match (op, l, r) {
+        (BinOp::Add, Val::Str(a), Val::Str(b)) => {
+            if a.chars().count() + b.chars().count() > MAX_STRING_LENGTH {
+                return fail("Sorry, adding those two together would make something too long.");
+            }
+            Ok(Val::Str(format!("{a}{b}")))
+        }
+        (BinOp::Add, Val::Str(_), other) => fail(format!("can only concatenate str (not \"{}\") to str", type_name(other))),
+        (BinOp::Mul, Val::Str(s), n) | (BinOp::Mul, n, Val::Str(s)) if is_int_like(n) => repeat_str(s, n),
+        // simpleeval's safe_mult first computes `other * len(str)` for the length check
+        (BinOp::Mul, Val::Str(s), other) | (BinOp::Mul, other, Val::Str(s)) => match other {
+            Val::Str(_) => fail("'>' not supported between instances of 'str' and 'int'"),
+            Val::Float(f) if f * s.chars().count() as f64 > MAX_STRING_LENGTH as f64 => {
+                fail("Sorry, I will not evaluate something that long.")
+            }
+            Val::Float(_) => fail("can't multiply sequence by non-int of type 'float'"),
+            _ => fail(format!("unsupported operand type(s) for *: '{}' and 'int'", type_name(other))),
+        },
+        (BinOp::Mod, Val::Str(_), _) => fail("string formatting with % is not supported by this calculator"),
+        _ => fail(format!("unsupported operand type(s) for {}: '{}' and '{}'", op.symbol(), type_name(l), type_name(r))),
+    }
+}
+
+fn repeat_str(s: &str, n: &Val) -> Res<Val> {
+    let count = match num_of(n) {
+        Some(Num::I(i)) => i,
+        _ => BigInt::zero(),
+    };
+    if !count.is_positive() {
+        return Ok(Val::Str(String::new()));
+    }
+    let len = s.chars().count();
+    if BigInt::from(len) * &count > BigInt::from(MAX_STRING_LENGTH) {
+        return fail("Sorry, I will not evaluate something that long.");
+    }
+    let times = count.to_usize().unwrap_or(0);
+    Ok(Val::Str(s.repeat(times)))
+}
+
+fn numeric_binary(op: BinOp, a: Num, b: Num, l: &Val, r: &Val) -> Res<Val> {
+    if op == BinOp::Pow {
+        // simpleeval's safe_power: refuse huge bases and exponents before computing anything
+        let too_big = |n: &Num| match n {
+            Num::I(i) => i.abs() > BigInt::from(MAX_POWER),
+            Num::F(f) => f.abs() > MAX_POWER as f64,
+        };
+        let big_base = too_big(&a);
+        let big_exp = too_big(&b);
+        if big_base || big_exp {
+            return fail(format!("Sorry! I don't want to evaluate {} ** {}", display(l), display(r)));
+        }
+    }
+    match (a, b) {
+        (Num::I(x), Num::I(y)) => {
+            let both_bool = matches!((l, r), (Val::Bool(_), Val::Bool(_)));
+            int_binary(op, x, y, both_bool)
+        }
+        (a, b) => {
+            let x = match a {
+                Num::I(i) => int_to_f64(&i)?,
+                Num::F(f) => f,
+            };
+            let y = match b {
+                Num::I(i) => int_to_f64(&i)?,
+                Num::F(f) => f,
+            };
+            float_binary(op, x, y, l, r)
+        }
+    }
+}
+
+fn int_binary(op: BinOp, x: BigInt, y: BigInt, both_bool: bool) -> Res<Val> {
+    match op {
+        BinOp::Add => Ok(Val::Int(x + y)),
+        BinOp::Sub => Ok(Val::Int(x - y)),
+        BinOp::Mul => Ok(Val::Int(x * y)),
+        BinOp::Div => {
+            if y.is_zero() {
+                return fail("division by zero");
+            }
+            Ok(Val::Float(int_to_f64(&x)? / int_to_f64(&y)?))
+        }
+        BinOp::FloorDiv => {
+            if y.is_zero() {
+                return fail("division by zero");
+            }
+            Ok(Val::Int(x.div_floor(&y)))
+        }
+        BinOp::Mod => {
+            if y.is_zero() {
+                return fail("division by zero");
+            }
+            Ok(Val::Int(x.mod_floor(&y)))
+        }
+        BinOp::Pow => {
+            if !y.is_negative() {
+                let e = y.to_u32().unwrap_or(0);
+                return Ok(Val::Int(x.pow(e)));
+            }
+            // int ** negative int is computed as a float, like python
+            if x.is_zero() {
+                return fail("zero to a negative power");
+            }
+            Ok(Val::Float(int_to_f64(&x)?.powf(int_to_f64(&y)?)))
+        }
+        BinOp::LShift | BinOp::RShift => {
+            let max_base = BigInt::from_f64(f64::MAX).unwrap_or_default();
+            if y.abs() > BigInt::from(MAX_SHIFT) || x.abs() > max_base {
+                return fail(format!("Sorry! I don't want to evaluate {x} {} {y}", op.symbol()));
+            }
+            if y.is_negative() {
+                return fail("negative shift count");
+            }
+            let n = y.to_usize().unwrap_or(0);
+            Ok(Val::Int(if op == BinOp::LShift { x << n } else { x >> n }))
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            if both_bool {
+                let (a, b) = (!x.is_zero(), !y.is_zero());
+                return Ok(Val::Bool(match op {
+                    BinOp::BitAnd => a && b,
+                    BinOp::BitOr => a || b,
+                    _ => a != b,
+                }));
+            }
+            Ok(Val::Int(match op {
+                BinOp::BitAnd => x & y,
+                BinOp::BitOr => x | y,
+                _ => x ^ y,
+            }))
+        }
+    }
+}
+
+/// python float `//` (CPython float_divmod)
+fn float_floordiv(vx: f64, wx: f64) -> f64 {
+    let m = vx % wx;
+    let mut div = (vx - m) / wx;
+    if m != 0.0 && (wx < 0.0) != (m < 0.0) {
+        div -= 1.0;
+    }
+    if div != 0.0 {
+        let mut f = div.floor();
+        if div - f > 0.5 {
+            f += 1.0;
+        }
+        f
+    } else {
+        0.0_f64.copysign(vx / wx)
+    }
+}
+
+/// python float `%` (CPython float_rem)
+fn float_mod(vx: f64, wx: f64) -> f64 {
+    let mut m = vx % wx;
+    if m != 0.0 {
+        if (wx < 0.0) != (m < 0.0) {
+            m += wx;
+        }
+    } else {
+        m = 0.0_f64.copysign(wx);
+    }
+    m
+}
+
+fn float_binary(op: BinOp, x: f64, y: f64, l: &Val, r: &Val) -> Res<Val> {
+    match op {
+        BinOp::Add => Ok(Val::Float(x + y)),
+        BinOp::Sub => Ok(Val::Float(x - y)),
+        BinOp::Mul => Ok(Val::Float(x * y)),
+        BinOp::Div => {
+            if y == 0.0 {
+                return fail("division by zero");
+            }
+            Ok(Val::Float(x / y))
+        }
+        BinOp::FloorDiv => {
+            if y == 0.0 {
+                return fail("division by zero");
+            }
+            Ok(Val::Float(float_floordiv(x, y)))
+        }
+        BinOp::Mod => {
+            if y == 0.0 {
+                return fail("division by zero");
+            }
+            Ok(Val::Float(float_mod(x, y)))
+        }
+        BinOp::Pow => float_pow(x, y),
+        _ => fail(format!("unsupported operand type(s) for {}: '{}' and '{}'", op.symbol(), type_name(l), type_name(r))),
+    }
+}
+
+fn float_pow(x: f64, y: f64) -> Res<Val> {
+    if x == 0.0 && y < 0.0 {
+        return fail("zero to a negative power");
+    }
+    if x < 0.0 && y.is_finite() && y.fract() != 0.0 {
+        return fail("complex results are not supported by this calculator");
+    }
+    let res = x.powf(y);
+    if res.is_infinite() && x.is_finite() && y.is_finite() {
+        return fail("(34, 'Numerical result out of range')");
+    }
+    Ok(Val::Float(res))
+}
+
+fn equal(l: &Val, r: &Val) -> bool {
+    if let (Some(a), Some(b)) = (num_of(l), num_of(r)) {
+        return cmp_num(&a, &b) == Some(Ordering::Equal);
+    }
+    match (l, r) {
+        (Val::Str(a), Val::Str(b)) => a == b,
+        (Val::None, Val::None) => true,
+        (Val::Func(a), Val::Func(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn identical(l: &Val, r: &Val) -> bool {
+    match (l, r) {
+        (Val::None, Val::None) => true,
+        (Val::Bool(a), Val::Bool(b)) => a == b,
+        // cpython caches small ints, the empty string and the one-character latin strings
+        (Val::Int(a), Val::Int(b)) => a == b && (-5..=256).contains(&saturating_i64(a)),
+        (Val::Str(a), Val::Str(b)) => a == b && a.chars().count() <= 1,
+        (Val::Func(a), Val::Func(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// python ordering of two numbers; None when a NaN is involved
+fn cmp_num(a: &Num, b: &Num) -> Option<Ordering> {
+    match (a, b) {
+        (Num::I(x), Num::I(y)) => Some(x.cmp(y)),
+        (Num::F(x), Num::F(y)) => x.partial_cmp(y),
+        (Num::I(i), Num::F(f)) => cmp_int_float(i, *f),
+        (Num::F(f), Num::I(i)) => cmp_int_float(i, *f).map(Ordering::reverse),
+    }
+}
+
+/// exact comparison of an int with a float
+fn cmp_int_float(i: &BigInt, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f.is_infinite() {
+        return Some(if f > 0.0 { Ordering::Less } else { Ordering::Greater });
+    }
+    let fl = f.floor();
+    let bf = BigInt::from_f64(fl)?;
+    Some(match i.cmp(&bf) {
+        Ordering::Equal if f == fl => Ordering::Equal,
+        Ordering::Equal => Ordering::Less,
+        Ordering::Less => Ordering::Less,
+        Ordering::Greater => Ordering::Greater,
+    })
+}
+
+fn contains(needle: &Val, hay: &Val) -> Res<bool> {
+    match hay {
+        Val::Str(h) => match needle {
+            Val::Str(n) => Ok(h.contains(n.as_str())),
+            other => fail(format!("'in <string>' requires string as left operand, not {}", type_name(other))),
+        },
+        other => fail(format!("argument of type '{}' is not a container or iterable", type_name(other))),
+    }
+}
+
+fn compare(op: CmpOp, l: &Val, r: &Val) -> Res<bool> {
+    match op {
+        CmpOp::Eq => Ok(equal(l, r)),
+        CmpOp::NotEq => Ok(!equal(l, r)),
+        CmpOp::In => contains(l, r),
+        CmpOp::NotIn => Ok(!contains(l, r)?),
+        CmpOp::Is => Ok(identical(l, r)),
+        CmpOp::IsNot => Ok(!identical(l, r)),
+        CmpOp::Lt | CmpOp::LtE | CmpOp::Gt | CmpOp::GtE => {
+            let ord = if let (Some(a), Some(b)) = (num_of(l), num_of(r)) {
+                cmp_num(&a, &b)
+            } else if let (Val::Str(a), Val::Str(b)) = (l, r) {
+                Some(a.cmp(b))
+            } else {
+                return fail(format!("'{}' not supported between instances of '{}' and '{}'", op.symbol(), type_name(l), type_name(r)));
+            };
+            Ok(match ord {
+                None => false,
+                Some(o) => match op {
+                    CmpOp::Lt => o == Ordering::Less,
+                    CmpOp::LtE => o != Ordering::Greater,
+                    CmpOp::Gt => o == Ordering::Greater,
+                    _ => o != Ordering::Less,
+                },
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------- subscripts
+
+fn index_value(container: &Val, key: &Val) -> Res<Val> {
+    match container {
+        Val::Str(s) => {
+            let idx = match key {
+                Val::Int(i) => i.clone(),
+                Val::Bool(b) => BigInt::from(u8::from(*b)),
+                other => return fail(format!("string indices must be integers, not '{}'", type_name(other))),
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let n = BigInt::from(chars.len());
+            let idx = if idx.is_negative() { idx + &n } else { idx };
+            if idx.is_negative() || idx >= n {
+                return fail("string index out of range");
+            }
+            let i = idx.to_usize().unwrap_or(0);
+            Ok(Val::Str(chars[i].to_string()))
+        }
+        other => fail(format!("'{}' object is not subscriptable", type_name(other))),
+    }
+}
+
+/// python slice.indices() for a sequence of length `n`
+fn slice_indices(n: i64, start: Option<i64>, stop: Option<i64>, step: i64) -> Vec<usize> {
+    let (lower, upper) = if step < 0 { (-1, n - 1) } else { (0, n) };
+    let norm = |v: i64| -> i64 {
+        if v < 0 {
+            let v = v.saturating_add(n);
+            if v < lower { lower } else { v }
+        } else if v > upper {
+            upper
+        } else {
+            v
+        }
+    };
+    let mut i = match start {
+        None => {
+            if step < 0 {
+                upper
+            } else {
+                lower
+            }
+        }
+        Some(v) => norm(v),
+    };
+    let stop = match stop {
+        None => {
+            if step < 0 {
+                lower
+            } else {
+                upper
+            }
+        }
+        Some(v) => norm(v),
+    };
+    let mut out = Vec::new();
+    while (step > 0 && i < stop) || (step < 0 && i > stop) {
+        out.push(i as usize);
+        i = i.saturating_add(step);
+    }
+    out
+}
+
+fn slice_bound(v: &Option<Val>) -> Res<Option<i64>> {
+    match v {
+        None | Some(Val::None) => Ok(None),
+        Some(other) => match num_of(other) {
+            Some(Num::I(i)) => Ok(Some(saturating_i64(&i))),
+            _ => fail("slice indices must be integers or None or have an __index__ method"),
+        },
+    }
+}
+
+fn slice_value(container: &Val, lo: Option<Val>, hi: Option<Val>, step: Option<Val>) -> Res<Val> {
+    let Val::Str(s) = container else {
+        return fail(format!("'{}' object is not subscriptable", type_name(container)));
+    };
+    let lo = slice_bound(&lo)?;
+    let hi = slice_bound(&hi)?;
+    let step = slice_bound(&step)?.unwrap_or(1);
+    if step == 0 {
+        return fail("slice step cannot be zero");
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let picked: String = slice_indices(chars.len() as i64, lo, hi, step).into_iter().map(|i| chars[i]).collect();
+    Ok(Val::Str(picked))
+}
+
+// ---------------------------------------------------------------- functions
+
+/// the parts of a call that the python functions read: positional and keyword values
+fn first_arg(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Option<Val> {
+    args.into_iter().chain(kwargs.into_iter().map(|(_, v)| v)).next()
+}
+
+fn call_function(f: Func, args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    match f {
+        Func::Rand => {
+            if !args.is_empty() {
+                return fail(format!("random() takes no arguments ({} given)", args.len()));
+            }
+            if !kwargs.is_empty() {
+                return fail("random() takes no keyword arguments");
+            }
+            Ok(Val::Float(rand::random::<f64>()))
+        }
+        Func::RandInt => random_int(args, kwargs),
+        Func::Int => int_call(args, kwargs),
+        Func::Float => float_call(args, kwargs),
+        Func::Str => str_call(args, kwargs),
+    }
+}
+
+/// simpleeval's `random_int(top)`: `int(random() * top)`
+fn random_int(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "top") {
+        return fail(format!("random_int() got an unexpected keyword argument '{k}'"));
+    }
+    let total = args.len() + kwargs.len();
+    if total > 1 {
+        return fail(format!("random_int() takes 1 positional argument but {total} were given"));
+    }
+    let Some(top) = first_arg(args, kwargs) else {
+        return fail("random_int() missing 1 required positional argument: 'top'");
+    };
+    let r: f64 = rand::random();
+    let product = match num_of(&top) {
+        Some(Num::F(f)) => r * f,
+        Some(Num::I(i)) => r * int_to_f64(&i)?,
+        None => match &top {
+            Val::Str(_) => return fail("can't multiply sequence by non-int of type 'float'"),
+            other => return fail(format!("unsupported operand type(s) for *: 'float' and '{}'", type_name(other))),
+        },
+    };
+    Ok(Val::Int(float_to_int(product)?))
+}
+
+fn int_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    // int's `x` is positional-only; `base` is the only keyword
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "base") {
+        return fail(format!("int() got an unexpected keyword argument '{k}'"));
+    }
+    if args.len() > 2 {
+        return fail(format!("int expected at most 2 arguments, got {}", args.len()));
+    }
+    let mut it = args.into_iter();
+    let x = it.next();
+    let mut base = it.next();
+    for (_, v) in kwargs {
+        if base.is_some() {
+            return fail("argument for int() given by name ('base') and position (2)");
+        }
+        base = Some(v);
+    }
+    let Some(x) = x else {
+        if base.is_some() {
+            return fail("int() missing string argument");
+        }
+        return Ok(Val::Int(BigInt::zero()));
+    };
+    if let Some(b) = base {
+        let Val::Str(s) = &x else {
+            return fail("int() can't convert non-string with explicit base");
+        };
+        let b = index_arg(&b)?;
+        if b != 0 && !(2..=36).contains(&b) {
+            return fail("int() base must be >= 2 and <= 36, or 0");
+        }
+        return parse_int_str(s, b);
+    }
+    match &x {
+        Val::Int(i) => Ok(Val::Int(i.clone())),
+        Val::Bool(b) => Ok(Val::Int(BigInt::from(u8::from(*b)))),
+        Val::Float(f) => Ok(Val::Int(float_to_int(*f)?)),
+        Val::Str(s) => parse_int_str(s, 10),
+        other => fail(format!("int() argument must be a string, a bytes-like object or a real number, not '{}'", type_name(other))),
+    }
+}
+
+/// python `int(s, base)` for base 0 (auto) or 2..=36
+fn parse_int_str(s: &str, base: i64) -> Res<Val> {
+    let invalid = || fail(format!("invalid literal for int() with base {base}: {}", repr_str(s)));
+    let body = py_strip(s);
+    let (neg, rest) = if let Some(r) = body.strip_prefix('-') {
+        (true, r)
+    } else if let Some(r) = body.strip_prefix('+') {
+        (false, r)
+    } else {
+        (false, body)
+    };
+    let prefix_radix: u32 = match rest.get(0..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => 0,
+    };
+    let (radix, digits) = if prefix_radix != 0 && (base == 0 || base == i64::from(prefix_radix)) {
+        (prefix_radix, &rest[2..])
+    } else if base == 0 {
+        if rest.len() > 1 && rest.starts_with('0') && rest.chars().any(|c| c.is_ascii_digit() && c != '0') {
+            return invalid();
+        }
+        (10u32, rest)
+    } else {
+        (base as u32, rest)
+    };
+    let chars: Vec<char> = digits.chars().collect();
+    let mut clean = String::new();
+    for (k, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            let prev_ok = k > 0 && chars[k - 1].to_digit(radix).is_some();
+            let next_ok = chars.get(k + 1).is_some_and(|n| n.to_digit(radix).is_some());
+            if !(prev_ok && next_ok) {
+                return invalid();
+            }
+        } else if c.to_digit(radix).is_some() {
+            clean.push(c);
+        } else {
+            return invalid();
+        }
+    }
+    let Some(v) = BigInt::parse_bytes(clean.as_bytes(), radix) else { return invalid() };
+    Ok(Val::Int(if neg { -v } else { v }))
+}
+
+/// `float` with underscores removed when python allows them (only between digits)
+fn parse_float_str(s: &str) -> Res<f64> {
+    let body = py_strip(s);
+    let chars: Vec<char> = body.chars().collect();
+    let mut clean = String::new();
+    let mut ok = true;
+    for (k, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            let prev_ok = k > 0 && chars[k - 1].is_ascii_digit();
+            let next_ok = chars.get(k + 1).is_some_and(|n| n.is_ascii_digit());
+            if !(prev_ok && next_ok) {
+                ok = false;
+                break;
+            }
+        } else {
+            clean.push(c);
+        }
+    }
+    match (ok, clean.parse::<f64>()) {
+        (true, Ok(f)) => Ok(f),
+        _ => fail(format!("could not convert string to float: {}", repr_str(s))),
+    }
+}
+
+fn float_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    if !kwargs.is_empty() {
+        return fail("float() takes no keyword arguments");
+    }
+    let total = args.len() + kwargs.len();
+    if total > 1 {
+        return fail(format!("float expected at most 1 argument, got {total}"));
+    }
+    match first_arg(args, kwargs) {
+        None => Ok(Val::Float(0.0)),
+        Some(Val::Float(f)) => Ok(Val::Float(f)),
+        Some(Val::Int(i)) => Ok(Val::Float(int_to_f64(&i)?)),
+        Some(Val::Bool(b)) => Ok(Val::Float(if b { 1.0 } else { 0.0 })),
+        Some(Val::Str(s)) => parse_float_str(&s).map(Val::Float),
+        Some(other) => fail(format!("float() argument must be a string or a real number, not '{}'", type_name(&other))),
+    }
+}
+
+fn str_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "object") {
+        return fail(format!("str() got an unexpected keyword argument '{k}'"));
+    }
+    if args.len() + kwargs.len() > 1 {
+        return match args.first() {
+            Some(Val::Str(_)) => fail("decoding str is not supported"),
+            Some(other) => fail(format!("decoding to str: need a bytes-like object, {} found", type_name(other))),
+            None => fail("decoding str is not supported"),
+        };
+    }
+    match first_arg(args, kwargs) {
+        Some(v) => Ok(Val::Str(format_result(&v)?)),
+        None => Ok(Val::Str(String::new())),
+    }
+}
+
+// ---------------------------------------------------------------- evaluator
+
+struct Evaluator<'a> {
+    /// the expression as the caller gave it (simpleeval reports this text in its messages)
+    expression: &'a str,
+}
+
+impl Evaluator<'_> {
+    fn exec(&self, stmt: &Stmt) -> Res<Val> {
+        match stmt {
+            Stmt::Expr(e) | Stmt::Assign(e) | Stmt::AugAssign(e) => self.eval(e),
+            Stmt::Fail(msg) => fail(msg.clone()),
+        }
+    }
+
+    fn eval(&self, e: &Expr) -> Res<Val> {
+        match e {
+            Expr::Const(v) => {
+                if let Val::Str(s) = v {
+                    let n = s.chars().count();
+                    if n > MAX_STRING_LENGTH {
+                        return fail(format!("Literal in statement is too long! ({n}, when {MAX_STRING_LENGTH} is max)"));
+                    }
+                }
+                Ok(v.clone())
+            }
+            Expr::Name(n) => match function_named(n) {
+                Some(f) => Ok(Val::Func(f)),
+                None => fail(format!("'{n}' is not defined for expression '{}'", self.expression)),
+            },
+            Expr::Fail(msg) => fail(msg.clone()),
+            Expr::Unary(op, x) => {
+                let v = self.eval(x)?;
+                unary(*op, &v)
+            }
+            Expr::Binary(op, a, b) => {
+                let l = self.eval(a)?;
+                let r = self.eval(b)?;
+                binary(*op, &l, &r)
+            }
+            Expr::And(vals) => {
+                let mut last = Val::Bool(false);
+                for v in vals {
+                    last = self.eval(v)?;
+                    if !truthy(&last) {
+                        break;
+                    }
+                }
+                Ok(last)
+            }
+            Expr::Or(vals) => {
+                let mut last = Val::Bool(false);
+                for v in vals {
+                    last = self.eval(v)?;
+                    if truthy(&last) {
+                        break;
+                    }
+                }
+                Ok(last)
+            }
+            Expr::Compare(first, rest) => {
+                let mut left = self.eval(first)?;
+                let mut result = Val::Bool(true);
+                for (op, c) in rest {
+                    if !truthy(&result) {
+                        break;
+                    }
+                    let right = self.eval(c)?;
+                    result = Val::Bool(compare(*op, &left, &right)?);
+                    left = right;
+                }
+                Ok(result)
+            }
+            Expr::IfExp(test, body, orelse) => {
+                if truthy(&self.eval(test)?) {
+                    self.eval(body)
+                } else {
+                    self.eval(orelse)
+                }
+            }
+            Expr::Call(func, args, kwargs) => self.call(func, args, kwargs),
+            Expr::Attr(base, name) => self.attribute(base, name),
+            Expr::Subscript(base, key) => {
+                let container = self.eval(base)?;
+                self.subscript(&container, key)
+            }
+        }
+    }
+
+    fn call(&self, func: &Expr, args: &[Expr], kwargs: &[(String, Expr)]) -> Res<Val> {
+        let callee = match func {
+            Expr::Name(n) => match function_named(n) {
+                Some(f) => f,
+                None => return fail(format!("Function '{n}' not defined, for expression '{}'.", self.expression)),
+            },
+            Expr::Attr(..) => match self.eval(func)? {
+                Val::Func(f) => f,
+                other => return fail(format!("'{}' object is not callable", type_name(&other))),
+            },
+            _ => return fail("Lambda Functions not implemented"),
+        };
+        let mut pos = Vec::with_capacity(args.len());
+        for a in args {
+            pos.push(self.eval(a)?);
+        }
+        let mut kw = Vec::with_capacity(kwargs.len());
+        for (k, v) in kwargs {
+            kw.push((k.clone(), self.eval(v)?));
+        }
+        call_function(callee, pos, kw)
+    }
+
+    fn attribute(&self, base: &Expr, name: &str) -> Res<Val> {
+        if DISALLOW_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            return fail(format!("Sorry, access to __attributes or func_ attributes is not available. ({name})"));
+        }
+        if DISALLOW_METHODS.contains(&name) {
+            return fail(format!("Sorry, this method is not available. ({name})"));
+        }
+        self.eval(base)?;
+        fail(format!("Attribute '{name}' does not exist in expression '{}'", self.expression))
+    }
+
+    fn subscript(&self, container: &Val, key: &SubKey) -> Res<Val> {
+        match key {
+            SubKey::Index(k) => {
+                let kv = self.eval(k)?;
+                index_value(container, &kv)
+            }
+            SubKey::Slice(lo, hi, step) => {
+                let lo = self.opt(lo)?;
+                let hi = self.opt(hi)?;
+                let step = self.opt(step)?;
+                slice_value(container, lo, hi, step)
+            }
+        }
+    }
+
+    fn opt(&self, e: &Option<Box<Expr>>) -> Res<Option<Val>> {
+        match e {
+            Some(x) => Ok(Some(self.eval(x)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// simpleeval.simple_eval(expression): parse, then evaluate the first statement.
+/// Like simpleeval, a multi-statement input is parsed in full and only its first statement runs.
+pub fn simple_eval(expression: &str) -> Res<Val> {
+    let stmts = parse(expression.trim(), expression)?;
+    let Some(first) = stmts.first() else {
+        return fail("Sorry, cannot evaluate empty string");
+    };
+    Evaluator { expression }.exec(first)
+}
