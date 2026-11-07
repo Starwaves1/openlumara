@@ -8,7 +8,7 @@
 #[path = "../../../generated/modules/scheduler.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, fromisoformat_value, iso, now, py_int, py_int_str, py_type, replace_time, total_seconds, weekday};
+use crate::util::{body_get, body_str, dict_body, fromisoformat_value, iso, now, py_int, py_int_str, py_type, replace_time, total_seconds, weekday};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDateTime};
@@ -78,7 +78,8 @@ pub fn parse_duration(s: &str) -> Option<[i64; 5]> {
     let mut any = false;
     for c in RE.captures_iter(s) {
         any = true;
-        let val: i64 = c[1].parse().unwrap_or(0);
+        // python keeps the unbounded int and its timedelta rejects it later; saturating keeps it huge
+        let val: i64 = c[1].parse().unwrap_or(i64::MAX);
         let idx = match &c[2] {
             "w" => 0,
             "d" => 1,
@@ -162,7 +163,7 @@ pub fn calculate_next_from(base: &NaiveDateTime, recur: &Value) -> Result<Option
                 interval_days = 1;
             }
             if candidate <= *base {
-                candidate += Duration::days(interval_days);
+                candidate = add_timedelta_secs(&candidate, interval_days as f64 * 86400.0)?;
             }
         }
         return Ok(Some(candidate));
@@ -172,7 +173,20 @@ pub fn calculate_next_from(base: &NaiveDateTime, recur: &Value) -> Result<Option
     if secs == 0.0 {
         return Ok(None);
     }
-    Ok(Some(*base + Duration::microseconds((secs * 1e6).round() as i64)))
+    add_timedelta_secs(base, secs).map(Some)
+}
+
+/// python `base + datetime.timedelta(...)` for a whole number of seconds. timedelta rejects a day count
+/// past C int, then past 999999999 days (the same messages as CPython); datetime rejects a result past year 9999.
+fn add_timedelta_secs(base: &NaiveDateTime, secs: f64) -> Result<NaiveDateTime, String> {
+    let days = (secs / 86400.0).floor();
+    if days.abs() > i32::MAX as f64 {
+        return Err("Python int too large to convert to C int".into());
+    }
+    if days.abs() > 999_999_999.0 {
+        return Err(format!("days={}; must have magnitude <= 999999999", days as i64));
+    }
+    base.checked_add_signed(Duration::microseconds((secs * 1e6).round() as i64)).ok_or_else(|| "date value out of range".to_string())
 }
 
 fn weekday_name(wd: i64) -> &'static str {
@@ -867,6 +881,7 @@ impl Inner {
     }
 
     async fn route_create_or_update(&self, body: &Option<Value>, update: bool) -> anyhow::Result<Value> {
+        dict_body(body)?;
         let mut index = -1;
         let job_id = body_get(body, "id").unwrap_or(Value::Null);
         if update {
@@ -996,6 +1011,7 @@ impl Module for Scheduler {
             ("create", "POST") => self.inner.route_create_or_update(&body, false).await,
             ("update", "POST") => self.inner.route_create_or_update(&body, true).await,
             ("delete", "POST") => {
+                dict_body(&body)?;
                 let Some(id) = body_get(&body, "id").filter(truthy) else {
                     return Ok(self.inner.base.result("no job id given", false));
                 };
@@ -1043,6 +1059,28 @@ mod tests {
         let zero = json!({"weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0});
         assert_eq!(calculate_next_from(&base, &zero).unwrap(), None);
         assert_eq!(calculate_next_from(&base, &Value::Null).unwrap(), None);
+    }
+
+    #[test]
+    fn overflowing_relative_offsets_raise_like_timedelta() {
+        let base = dt("2026-11-07T01:02:03");
+        let days = |n: i64| json!({"weeks": 0, "days": n, "hours": 0, "minutes": 0, "seconds": 0});
+        // python: base + timedelta(days=N) fails in datetime for N = 1e8 (year out of range)
+        assert_eq!(calculate_next_from(&base, &days(100_000_000)).unwrap_err(), "date value out of range");
+        assert_eq!(calculate_next_from(&base, &days(1_000_000_000)).unwrap_err(), "days=1000000000; must have magnitude <= 999999999");
+        assert_eq!(calculate_next_from(&base, &days(10_000_000_000)).unwrap_err(), "Python int too large to convert to C int");
+        // a digit run too big for i64 is not read as zero: python raises the C int overflow for it
+        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap();
+        assert_eq!(calculate_next_from(&base, &huge).unwrap_err(), "Python int too large to convert to C int");
+    }
+
+    #[test]
+    fn truthy_non_object_bodies_raise_like_python() {
+        // python `body = body or {}` keeps a truthy list and then calls .get() on it
+        assert_eq!(dict_body(&Some(json!([1]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+        assert_eq!(dict_body(&Some(json!("x"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        assert!(dict_body(&Some(json!({"action": "x"}))).is_ok());
+        assert!(dict_body(&Some(json!(""))).is_ok());
     }
 
     #[test]

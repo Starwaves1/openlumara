@@ -10,10 +10,10 @@
 #[path = "../../../generated/modules/calendar.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, fromisoformat, fromisoformat_value, iso, midnight, now, py_datetime, py_type, query_int, total_seconds};
+use crate::util::{body_get, body_str, dict_body, fromisoformat, fromisoformat_value, iso, midnight, now, py_datetime, py_type, query_int, total_seconds};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use chrono::{Duration, NaiveDateTime};
+use chrono::{Datelike, Duration, NaiveDateTime};
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, py_str_opt, truthy};
 use ol_core::storage::{StorageList, StorageType};
@@ -408,7 +408,8 @@ impl Inner {
         if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M").ok()
+        // python's datetime has no year 0 ("year must be in 1..9999"), chrono does
+        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M").ok().filter(|dt| dt.year() >= 1)
     }
 
     async fn route_create(&self, body: &Option<Value>) -> anyhow::Result<Value> {
@@ -478,14 +479,6 @@ impl Inner {
             self.schedule_notification(event.clone()).await?;
         }
         Ok(self.base.result(format!("event {} edited", py_str_opt(event.get("id"))), true))
-    }
-}
-
-/// python `body = body or {}` followed by `.get(...)`: a truthy non-object body raises AttributeError
-fn dict_body(body: &Option<Value>) -> anyhow::Result<()> {
-    match body {
-        Some(v) if truthy(v) && !v.is_object() => Err(anyhow!("'{}' object has no attribute 'get'", py_type(v))),
-        _ => Ok(()),
     }
 }
 
@@ -622,6 +615,8 @@ mod tests {
         // python's %Y needs exactly four digits: strptime rejects "26-10-14"
         assert_eq!(Inner::ui_parse_dt("26-10-14", "09:05"), None);
         assert_eq!(Inner::ui_parse_dt("0026-10-14", "09:05"), Some(dt("0026-10-14T09:05:00")));
+        // python's datetime has no year 0 (strptime: "year must be in 1..9999, not 0"), chrono accepts it
+        assert_eq!(Inner::ui_parse_dt("0000-10-14", "09:05"), None);
     }
 
     #[test]

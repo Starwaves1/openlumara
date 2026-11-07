@@ -151,6 +151,14 @@ pub fn body_str(body: &Option<Value>, key: &str, default: &str) -> String {
     body_get(body, key).map(|v| py_str(&v)).unwrap_or_else(|| default.to_string())
 }
 
+/// python `body = body or {}` followed by `.get(...)`: a truthy non-object body raises AttributeError
+pub fn dict_body(body: &Option<Value>) -> anyhow::Result<()> {
+    match body {
+        Some(v) if truthy(v) && !v.is_object() => Err(anyhow::anyhow!("'{}' object has no attribute 'get'", py_type(v))),
+        _ => Ok(()),
+    }
+}
+
 /// python truthiness of an optional value
 pub fn truthy_opt(v: Option<&Value>) -> bool {
     v.map(truthy).unwrap_or(false)
