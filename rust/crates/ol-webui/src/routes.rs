@@ -822,6 +822,11 @@ fn changed_modules_of(obj: &Map<String, Value>) -> Option<Vec<Value>> {
 
 /// the body of settings/save: `(changed_modules, categories)`. python's `await request.json()` takes
 /// NaN and Infinity, which the lenient reader reads as null (a plain 500 where python raises on them)
+/// python settings_save's except branch: `channel.log(channel.name, f"Error reloading module {module_name}: {core.detail_error(e)}")`
+fn reload_error_line(module_name: &str, e: &anyhow::Error) -> String {
+    format!("Error reloading module {}: {}", module_name, ol_core::detail_error(e))
+}
+
 fn settings_save_request(body: &[u8]) -> Option<(Vec<Value>, Map<String, Value>)> {
     let obj = py_json_loads_lenient(body).ok()?.as_object().cloned()?;
     let changed_modules = changed_modules_of(&obj)?;
@@ -848,9 +853,10 @@ async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response 
     let manager = ch.manager();
     for item in &changed_modules {
         match item {
-            // python: reload_module(name) logs a failed reload itself and carries on with the next module
             Value::String(name) => {
-                manager.reload_module(name).await;
+                if let Err(e) = manager.reload_module(name).await {
+                    ch.log(&ch.name, &reload_error_line(name, &e));
+                }
             }
             // python's `name not in self.modules` raises for an unhashable list or dict, which settings_save
             // logs as its reload error and carries on past
@@ -1231,5 +1237,12 @@ mod tests {
         let (page, more) = page_of(&chats, 4, 10);
         assert_eq!(page, vec![json!(4)]);
         assert!(!more);
+    }
+
+    #[test]
+    fn reload_error_line_matches_python_settings_save_log() {
+        // python: f"Error reloading module {module_name}: {core.detail_error(e)}" with debug off (str(e))
+        let e = anyhow::anyhow!("on_ready blew up");
+        assert_eq!(reload_error_line("coder", &e), "Error reloading module coder: on_ready blew up");
     }
 }
