@@ -4,6 +4,7 @@
 //! accepts that same (edited) tree and flattens it back into raw config.
 
 use indexmap::IndexMap;
+use crate::util::py_type_name;
 use ol_core::pyjson::truthy;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -69,13 +70,19 @@ fn get_null(m: &Map<String, Value>, key: &str) -> Value {
     m.get(key).cloned().unwrap_or(Value::Null)
 }
 
-pub fn build_field_settings(obj: &Value, schema: &Value, prefix: &str) -> Map<String, Value> {
-    let Value::Object(obj) = obj else { return Map::new() };
+/// python `build_field_settings`. `schema` is the section/module schema after python's `or {}`:
+/// a truthy non-dict raises AttributeError on `schema.get(key)` (only reached for non-empty `obj`)
+pub fn build_field_settings(obj: &Value, schema: &Value, prefix: &str) -> Result<Map<String, Value>, String> {
+    let Value::Object(obj) = obj else { return Ok(Map::new()) };
     if obj.is_empty() {
-        return Map::new();
+        return Ok(Map::new());
     }
     let empty = Map::new();
-    let schema = schema.as_object().unwrap_or(&empty);
+    let schema = match schema {
+        Value::Object(m) => m,
+        v if !truthy(v) => &empty,
+        other => return Err(format!("'{}' object has no attribute 'get'", py_type_name(other))),
+    };
     let mut settings = Map::new();
 
     for (key, value) in obj {
@@ -106,12 +113,13 @@ pub fn build_field_settings(obj: &Value, schema: &Value, prefix: &str) -> Map<St
                 "depends": or_none(&field_schema, "depends"),
             })
         } else if value.is_object() && !is_toggle_list(value) {
+            let nested = build_field_settings(value, &Value::Object(field_schema.clone()), &full_key)?;
             json!({
                 "type": "object",
                 "title": label_value(key),
                 "description": or_none(&field_schema, "description"),
                 "depends": or_none(&field_schema, "depends"),
-                "settings": build_field_settings(value, &Value::Object(field_schema.clone()), &full_key),
+                "settings": nested,
             })
         } else if is_toggle_list(value) {
             json!({
@@ -143,20 +151,21 @@ pub fn build_field_settings(obj: &Value, schema: &Value, prefix: &str) -> Map<St
         };
         settings.insert(key.clone(), entry);
     }
-    settings
+    Ok(settings)
 }
 
 fn theme_category(title: &str, description: &str, order: i64) -> Value {
     json!({"title": title, "description": description, "order": order, "isThemeCategory": true})
 }
 
-/// module_info: {name: {"description","unsafe","category","settings_schema"}};
-/// core_sections: {section: {"description","unsafe","settings_schema"}}
+/// python `build_settings_structure`. module_info: {name: {"description","unsafe","category",
+/// "settings_schema"}}; core_sections: {section: {"description","unsafe","settings_schema"}}.
+/// Err where python raises AttributeError on a truthy non-dict value
 pub fn build_settings_structure(
     original_data: &Map<String, Value>,
     module_info: &IndexMap<String, Value>,
     core_sections: &Map<String, Value>,
-) -> Map<String, Value> {
+) -> Result<Map<String, Value>, String> {
     let mut categories = Map::new();
     let mut order: i64 = 0;
 
@@ -198,14 +207,14 @@ pub fn build_settings_structure(
         category.insert("order".into(), json!(section_order(top_key).unwrap_or(order)));
         order += 1;
 
-        let empty = Map::new();
-        // `(top_value or {})`
-        let top_map = match top_value {
-            Value::Object(m) => m,
-            _ => &empty,
-        };
-
         if MODULE_CATEGORY_KEYS.contains(&top_key.as_str()) {
+            // `(top_value or {}).get(...)`: falsy becomes {}, a truthy non-dict raises
+            let empty = Map::new();
+            let top_map = match top_value {
+                Value::Object(m) => m,
+                v if !truthy(v) => &empty,
+                other => return Err(format!("'{}' object has no attribute 'get'", py_type_name(other))),
+            };
             category.insert("isModuleCategory".into(), json!(true));
             category.insert("enabled".into(), top_map.get("enabled").filter(|v| truthy(v)).cloned().unwrap_or(json!([])));
             category.insert("disabled".into(), top_map.get("disabled").filter(|v| truthy(v)).cloned().unwrap_or(json!([])));
@@ -242,7 +251,7 @@ pub fn build_settings_structure(
                             "title": format_label(item_name),
                             "description": item_info.get("description").filter(|v| truthy(v)).cloned().unwrap_or(json!("")),
                             "unsafe": item_info.get("unsafe").cloned().unwrap_or(json!(false)),
-                            "value": build_field_settings(item_settings, &item_schema, item_name),
+                            "value": build_field_settings(item_settings, &item_schema, item_name)?,
                         }),
                     );
                 }
@@ -257,7 +266,7 @@ pub fn build_settings_structure(
                 .cloned()
                 .unwrap_or(json!({}));
             let settings = if top_value.is_object() && truthy(top_value) {
-                build_field_settings(top_value, &section_schema, top_key)
+                build_field_settings(top_value, &section_schema, top_key)?
             } else {
                 Map::new()
             };
@@ -270,27 +279,36 @@ pub fn build_settings_structure(
     if !categories.contains_key("module_library") {
         categories.insert("module_library".into(), module_library());
     }
-    categories
+    Ok(categories)
 }
 
-/// reduces a (possibly edited) field tree back to plain key -> value config
-pub fn flatten_field_settings(settings: &Map<String, Value>) -> Map<String, Value> {
+/// python `flatten_field_settings`. Falsy input is `{}` (every call site passes `x or {}`);
+/// a truthy non-dict raises AttributeError on `.items()`
+pub fn flatten_field_settings(settings: &Value) -> Result<Map<String, Value>, String> {
+    let empty = Map::new();
+    let settings = match settings {
+        Value::Object(m) => m,
+        v if !truthy(v) => &empty,
+        other => return Err(format!("'{}' object has no attribute 'items'", py_type_name(other))),
+    };
     let mut result = Map::new();
     for (key, setting) in settings {
         let Value::Object(setting) = setting else { continue };
         let nested = setting.get("settings").filter(|v| truthy(v));
-        if setting.get("type").and_then(|t| t.as_str()) == Some("object") && nested.is_some() {
-            let nested = nested.and_then(|n| n.as_object()).cloned().unwrap_or_default();
-            result.insert(key.clone(), Value::Object(flatten_field_settings(&nested)));
-        } else {
-            result.insert(key.clone(), setting.get("value").cloned().unwrap_or(Value::Null));
+        match (setting.get("type").and_then(Value::as_str), nested) {
+            (Some("object"), Some(nested)) => {
+                result.insert(key.clone(), Value::Object(flatten_field_settings(nested)?));
+            }
+            _ => {
+                result.insert(key.clone(), setting.get("value").cloned().unwrap_or(Value::Null));
+            }
         }
     }
-    result
+    Ok(result)
 }
 
 /// inverse of build_settings_structure: category tree -> raw config dict
-pub fn flatten_categories(categories: &Map<String, Value>) -> Map<String, Value> {
+pub fn flatten_categories(categories: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     let mut result = Map::new();
     for (cat_key, category) in categories {
         let Value::Object(category) = category else { continue };
@@ -300,7 +318,7 @@ pub fn flatten_categories(categories: &Map<String, Value>) -> Map<String, Value>
         if !has_settings && !has_enabled && !has_disabled {
             continue;
         }
-        let settings = category.get("settings").and_then(|s| s.as_object()).cloned().unwrap_or_default();
+        let settings = category.get("settings").cloned().unwrap_or(Value::Null);
         if category.get("isModuleCategory").map(truthy).unwrap_or(false) {
             let mut entry = Map::new();
             if has_enabled {
@@ -310,12 +328,14 @@ pub fn flatten_categories(categories: &Map<String, Value>) -> Map<String, Value>
                 entry.insert("disabled".into(), category["disabled"].clone());
             }
             if has_settings {
+                let Value::Object(settings) = &settings else {
+                    return Err(format!("'{}' object has no attribute 'items'", py_type_name(&settings)));
+                };
                 let mut module_settings = Map::new();
-                for (name, module) in &settings {
+                for (name, module) in settings {
                     if let Value::Object(m) = module {
                         if let Some(v) = m.get("value").filter(|v| truthy(v)) {
-                            let v = v.as_object().cloned().unwrap_or_default();
-                            module_settings.insert(name.clone(), Value::Object(flatten_field_settings(&v)));
+                            module_settings.insert(name.clone(), Value::Object(flatten_field_settings(v)?));
                         }
                     }
                 }
@@ -323,10 +343,10 @@ pub fn flatten_categories(categories: &Map<String, Value>) -> Map<String, Value>
             }
             result.insert(cat_key.clone(), Value::Object(entry));
         } else {
-            result.insert(cat_key.clone(), Value::Object(flatten_field_settings(&settings)));
+            result.insert(cat_key.clone(), Value::Object(flatten_field_settings(&settings)?));
         }
     }
-    result
+    Ok(result)
 }
 
 /// (module_info, core_sections) - python get_module_info()
@@ -393,7 +413,7 @@ mod tests {
             "network_mode": {"type": "select", "options": {"local": "l"}, "default": "local"},
             "plain": {"depends": "x"},
         });
-        let s = build_field_settings(&obj, &schema, "webui");
+        let s = build_field_settings(&obj, &schema, "webui").unwrap();
         let keys: Vec<&String> = s["port"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["title", "type", "description", "unsafe", "value", "options", "min", "max", "step", "depends"]);
         assert_eq!(s["port"]["type"], "number");
@@ -429,14 +449,16 @@ mod tests {
         module_info.insert("webui".to_string(), json!({"description": "web", "unsafe": false, "category": "", "settings_schema": {"port": {"default": 3000}}}));
         module_info.insert("memory".to_string(), json!({"description": "mem", "unsafe": true, "category": "data", "settings_schema": {}}));
         let core_sections = json!({"api": {"settings_schema": {"url": {"default": "", "description": "", "type": null}}}});
-        let cats = build_settings_structure(config.as_object().unwrap(), &module_info, core_sections.as_object().unwrap());
+        let cats = build_settings_structure(config.as_object().unwrap(), &module_info, core_sections.as_object().unwrap()).unwrap();
         let keys: Vec<&String> = cats.keys().collect();
         assert_eq!(
             keys,
             ["appearance", "audio", "system_prompt", "system_logs", "core", "api", "model", "module_library", "channels", "user_channels", "modules", "user_modules"]
         );
-        assert_eq!(cats["core"]["order"], 0);
-        assert_eq!(cats["api"]["order"], 1);
+        // python: appearance takes 0, audio takes 1 without advancing the counter, so the first
+        // config section (core) gets 1 and the next one 2
+        assert_eq!(cats["core"]["order"], 1);
+        assert_eq!(cats["api"]["order"], 2);
         assert_eq!(cats["channels"]["order"], 10);
         assert_eq!(cats["module_library"]["order"], 12);
         assert_eq!(cats["user_modules"]["title"], "Installed Modules");
@@ -449,7 +471,7 @@ mod tests {
         assert!(cats["channels"]["settings"].get("cli").is_none());
         assert_eq!(cats["channels"]["settings"]["webui"]["value"]["port"]["value"], 3000);
 
-        let flat = flatten_categories(&cats);
+        let flat = flatten_categories(&cats).unwrap();
         assert_eq!(flat["api"], config["api"]);
         assert_eq!(flat["model"], config["model"]);
         assert_eq!(flat["core"], config["core"]);
@@ -459,5 +481,37 @@ mod tests {
         assert!(flat.get("theme").is_none());
         let keys: Vec<&String> = flat.keys().collect();
         assert_eq!(keys, ["core", "api", "model", "channels", "user_channels", "modules", "user_modules"]);
+    }
+
+    #[test]
+    fn malformed_values_raise_like_python() {
+        // a truthy non-dict schema raises on schema.get (python AttributeError)
+        assert_eq!(
+            build_field_settings(&json!({"a": 1}), &json!(["x"]), "p").unwrap_err(),
+            "'list' object has no attribute 'get'"
+        );
+        // falsy schema is `or {}`, and an empty obj never reads the schema
+        assert!(build_field_settings(&json!({"a": 1}), &json!(null), "p").is_ok());
+        assert!(build_field_settings(&json!({}), &json!("nope"), "p").is_ok());
+        // a truthy non-dict module section raises on `.get("enabled")`
+        let mut module_info = IndexMap::new();
+        module_info.insert("m".to_string(), json!({"description": "", "unsafe": false, "category": "", "settings_schema": {}}));
+        let config = json!({"modules": ["m"]});
+        assert_eq!(
+            build_settings_structure(config.as_object().unwrap(), &module_info, &Map::new()).unwrap_err(),
+            "'list' object has no attribute 'get'"
+        );
+        // falsy module section is treated as {}
+        let config = json!({"modules": null});
+        assert!(build_settings_structure(config.as_object().unwrap(), &module_info, &Map::new()).is_ok());
+        // a truthy non-dict nested 'settings' or module 'value' raises on .items()
+        let tree = json!({"api": {"title": "API", "type": "object", "settings": ["x"]}});
+        assert_eq!(flatten_field_settings(&tree["api"]["settings"]).unwrap_err(), "'list' object has no attribute 'items'");
+        let cats = json!({"api": {"settings": {"nested": {"type": "object", "settings": "str"}}}});
+        assert!(flatten_categories(cats.as_object().unwrap()).is_err());
+        let mods = json!({"channels": {"enabled": [], "disabled": [], "isModuleCategory": true, "settings": {"m": {"value": [1]}}}});
+        assert_eq!(flatten_categories(mods.as_object().unwrap()).unwrap_err(), "'list' object has no attribute 'items'");
+        let mods = json!({"channels": {"enabled": [], "disabled": [], "isModuleCategory": true, "settings": {"m": {"value": {}}}}});
+        assert_eq!(flatten_categories(mods.as_object().unwrap()).unwrap()["channels"], json!({"enabled": [], "disabled": [], "settings": {}}));
     }
 }

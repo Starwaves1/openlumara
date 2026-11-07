@@ -8,7 +8,7 @@
 #[path = "../../../generated/modules/scheduler.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, fromisoformat_value, iso, now, py_int, py_int_str, replace_time, total_seconds, weekday};
+use crate::util::{body_get, body_str, dict_body, fromisoformat_value, iso, now, py_int, py_int_str, py_type, replace_time, total_seconds, weekday};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDateTime};
@@ -21,6 +21,7 @@ use ol_core::pyjson::{py_str, py_str_opt, truthy};
 use ol_core::storage::{StorageList, StorageType};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// names of all available channels. Equivalent to core.channel.get_available_channels(),
@@ -78,7 +79,8 @@ pub fn parse_duration(s: &str) -> Option<[i64; 5]> {
     let mut any = false;
     for c in RE.captures_iter(s) {
         any = true;
-        let val: i64 = c[1].parse().unwrap_or(0);
+        // python keeps the unbounded int and its timedelta rejects it later; saturating keeps it huge
+        let val: i64 = c[1].parse().unwrap_or(i64::MAX);
         let idx = match &c[2] {
             "w" => 0,
             "d" => 1,
@@ -162,7 +164,7 @@ pub fn calculate_next_from(base: &NaiveDateTime, recur: &Value) -> Result<Option
                 interval_days = 1;
             }
             if candidate <= *base {
-                candidate += Duration::days(interval_days);
+                candidate = add_timedelta_secs(&candidate, interval_days as f64 * 86400.0)?;
             }
         }
         return Ok(Some(candidate));
@@ -172,7 +174,20 @@ pub fn calculate_next_from(base: &NaiveDateTime, recur: &Value) -> Result<Option
     if secs == 0.0 {
         return Ok(None);
     }
-    Ok(Some(*base + Duration::microseconds((secs * 1e6).round() as i64)))
+    add_timedelta_secs(base, secs).map(Some)
+}
+
+/// python `base + datetime.timedelta(...)` for a whole number of seconds. timedelta rejects a day count
+/// past C int, then past 999999999 days (the same messages as CPython); datetime rejects a result past year 9999.
+fn add_timedelta_secs(base: &NaiveDateTime, secs: f64) -> Result<NaiveDateTime, String> {
+    let days = (secs / 86400.0).floor();
+    if days.abs() > i32::MAX as f64 {
+        return Err("Python int too large to convert to C int".into());
+    }
+    if days.abs() > 999_999_999.0 {
+        return Err(format!("days={}; must have magnitude <= 999999999", days as i64));
+    }
+    base.checked_add_signed(Duration::microseconds((secs * 1e6).round() as i64)).ok_or_else(|| "date value out of range".to_string())
 }
 
 fn weekday_name(wd: i64) -> &'static str {
@@ -214,28 +229,120 @@ pub fn format_recurring_time(recur: &Value) -> String {
     }
 }
 
-pub fn format_job_time(job: &Value) -> String {
-    if job.get("recurring").map(truthy).unwrap_or(false) {
-        return format_recurring_time(job.get("recurs_in").unwrap_or(&json!({})));
-    }
-    match fromisoformat_value(Some(job.get("trigger_time").unwrap_or(&json!("")))) {
-        Ok(dt) => format!("one-time, due {}", dt.format("%Y-%m-%d %H:%M")),
-        Err(_) => "one-time, invalid time".into(),
+/// python `_format_job_time`. a missing `recurs_in` is {} (`job.get(k, {})`), but a stored null or other
+/// non-dict raises AttributeError on `.get` inside python's formatter
+/// python `items.sort(key=lambda j: j.get("trigger_time") or "9999")`: the key is the stored value itself when
+/// truthy, so mixed or unorderable stored values raise python's TypeError rather than being coerced to text
+fn sort_by_trigger_time(items: &mut [Value]) -> anyhow::Result<()> {
+    let mut failure: Option<String> = None;
+    items.sort_by(|a, b| {
+        let (ka, kb) = (trigger_sort_key(a), trigger_sort_key(b));
+        match py_order(&ka, &kb) {
+            Ok(order) => order,
+            Err((ta, tb)) => {
+                failure.get_or_insert_with(|| format!("'<' not supported between instances of '{ta}' and '{tb}'"));
+                Ordering::Equal
+            }
+        }
+    });
+    match failure {
+        Some(msg) => anyhow::bail!(msg),
+        None => Ok(()),
     }
 }
 
+fn trigger_sort_key(item: &Value) -> Value {
+    let t = item.get("trigger_time").cloned().unwrap_or(Value::Null);
+    if truthy(&t) {
+        t
+    } else {
+        json!("9999")
+    }
+}
+
+/// python `<` between two sort keys; `Err` carries the operand type names python reports
+fn py_order(a: &Value, b: &Value) -> Result<Ordering, (&'static str, &'static str)> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Ok(x.cmp(y)),
+        (Value::Array(x), Value::Array(y)) => {
+            // python list ordering: the first unequal pair decides, otherwise the shorter list is smaller
+            for (p, q) in x.iter().zip(y.iter()) {
+                if !py_eq(p, q) {
+                    return py_order(p, q);
+                }
+            }
+            Ok(x.len().cmp(&y.len()))
+        }
+        _ => cmp_numbers(a, b).ok_or((py_type(a), py_type(b))),
+    }
+}
+
+/// python `==` for json values (bools and numbers compare by value, lists and dicts element-wise)
+fn py_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| py_eq(p, q)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| py_eq(v, w)))
+        }
+        _ => cmp_numbers(a, b) == Some(Ordering::Equal),
+    }
+}
+
+/// numeric comparison for python's bool/int/float; integers compare exactly, the rest as f64
+fn cmp_numbers(a: &Value, b: &Value) -> Option<Ordering> {
+    fn parts(v: &Value) -> Option<(Option<i64>, f64)> {
+        match v {
+            Value::Bool(b) => Some((Some(*b as i64), *b as i64 as f64)),
+            Value::Number(n) => Some((n.as_i64(), n.as_f64()?)),
+            _ => None,
+        }
+    }
+    let ((ai, af), (bi, bf)) = (parts(a)?, parts(b)?);
+    match (ai, bi) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => af.partial_cmp(&bf),
+    }
+}
+
+pub fn format_job_time(job: &Value) -> anyhow::Result<String> {
+    if job.get("recurring").map(truthy).unwrap_or(false) {
+        let empty = json!({});
+        let recur = match job.get("recurs_in") {
+            None => &empty,
+            Some(v) if v.is_object() => v,
+            Some(other) => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+        };
+        return Ok(format_recurring_time(recur));
+    }
+    Ok(match fromisoformat_value(Some(job.get("trigger_time").unwrap_or(&json!("")))) {
+        Ok(dt) => format!("one-time, due {}", dt.format("%Y-%m-%d %H:%M")),
+        Err(_) => "one-time, invalid time".into(),
+    })
+}
+
 /// python Scheduler.__str__
-pub fn schedule_to_string(schedule: &[Value]) -> String {
-    let lines: Vec<String> = schedule
+pub fn schedule_to_string(schedule: &[Value]) -> anyhow::Result<String> {
+    let lines = schedule
         .iter()
         .map(|job| {
             let id = job.get("id").map(py_str).unwrap_or_else(|| "unknown".into());
             let action = job.get("action").map(py_str).unwrap_or_default();
             let chan = job.get("channel").map(py_str).unwrap_or_else(|| "unknown channel".into());
-            format!("{}: {} on {}: {}", id, format_job_time(job), chan, action)
+            Ok(format!("{}: {} on {}: {}", id, format_job_time(job)?, chan, action))
         })
-        .collect();
-    lines.join("\n")
+        .collect::<anyhow::Result<Vec<String>>>()?;
+    Ok(lines.join("\n"))
+}
+
+/// python `(value or "").<method>()`: a truthy non-string raises AttributeError
+fn str_arg(value: Option<Value>, method: &str) -> anyhow::Result<String> {
+    match value.filter(truthy) {
+        None => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s),
+        Some(other) => anyhow::bail!("'{}' object has no attribute '{}'", py_type(&other), method),
+    }
 }
 
 /// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur)
@@ -810,41 +917,40 @@ impl Inner {
 
     fn route_list(&self) -> anyhow::Result<Value> {
         self.with(|s| s.load())?;
+        // python builds the whole list in one loop: one job whose schedule can't be formatted fails the request
         let mut items: Vec<Value> = self
             .jobs()
             .iter()
             .map(|job| {
-                json!({
+                Ok(json!({
                     "id": job.get("id").cloned().unwrap_or(Value::Null),
                     "action": job.get("action").cloned().unwrap_or(json!("")),
                     "channel": job.get("channel").cloned().unwrap_or(json!("")),
                     "trigger_time": job.get("trigger_time").cloned().unwrap_or(json!("")),
                     "recurring": job.get("recurring").map(truthy).unwrap_or(false),
                     "recurs_in": job.get("recurs_in").cloned().unwrap_or(Value::Null),
-                    "display": format_job_time(job),
-                })
+                    "display": format_job_time(job)?,
+                }))
             })
-            .collect();
-        items.sort_by_key(|j| {
-            let t = &j["trigger_time"];
-            if truthy(t) {
-                py_str(t)
-            } else {
-                "9999".to_string()
-            }
-        });
+            .collect::<anyhow::Result<_>>()?;
+        sort_by_trigger_time(&mut items)?;
         Ok(Value::Array(items))
     }
 
-    fn form_recur(&self, body: &Option<Value>) -> Result<Value, &'static str> {
+    /// python `_ui_build_recur(...)` arguments: `duration` is only read in relative mode, `time` only in clock mode
+    fn form_recur(&self, body: &Option<Value>) -> anyhow::Result<Result<Value, &'static str>> {
         let mode = body_get(body, "mode").map(|v| py_str(&v)).unwrap_or_else(|| "relative".into());
-        let duration = body_get(body, "duration").filter(truthy).map(|v| py_str(&v)).unwrap_or_default();
-        let time = body_get(body, "time").filter(truthy).map(|v| py_str(&v)).unwrap_or_default();
         let weekday = body_get(body, "weekday");
-        ui_build_recur(&mode, &duration, &time, weekday.as_ref())
+        let (duration, time) = if mode == "relative" {
+            (str_arg(body_get(body, "duration"), "strip")?, String::new())
+        } else {
+            (String::new(), str_arg(body_get(body, "time"), "split")?)
+        };
+        Ok(ui_build_recur(&mode, &duration, &time, weekday.as_ref()))
     }
 
     async fn route_create_or_update(&self, body: &Option<Value>, update: bool) -> anyhow::Result<Value> {
+        dict_body(body)?;
         let mut index = -1;
         let job_id = body_get(body, "id").unwrap_or(Value::Null);
         if update {
@@ -861,7 +967,7 @@ impl Inner {
         if action.is_empty() {
             return Ok(self.base.result("job action cannot be empty", false));
         }
-        let recur = match self.form_recur(body) {
+        let recur = match self.form_recur(body)? {
             Ok(r) => r,
             Err(e) => return Ok(self.base.result(e, false)),
         };
@@ -960,7 +1066,7 @@ impl Module for Scheduler {
         if jobs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format!("Your scheduler system will trigger these events at the specified times:\n{}", schedule_to_string(&jobs))))
+        Ok(Some(format!("Your scheduler system will trigger these events at the specified times:\n{}", schedule_to_string(&jobs)?)))
     }
 
     fn ui_routes(&self) -> Vec<UiRoute> {
@@ -974,6 +1080,7 @@ impl Module for Scheduler {
             ("create", "POST") => self.inner.route_create_or_update(&body, false).await,
             ("update", "POST") => self.inner.route_create_or_update(&body, true).await,
             ("delete", "POST") => {
+                dict_body(&body)?;
                 let Some(id) = body_get(&body, "id").filter(truthy) else {
                     return Ok(self.inner.base.result("no job id given", false));
                 };
@@ -992,6 +1099,29 @@ impl Module for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_sorts_on_stored_trigger_time_with_falsy_last() {
+        let mut items = vec![
+            json!({"id": "c", "trigger_time": ""}),
+            json!({"id": "b", "trigger_time": "2026-02-01T00:00:00"}),
+            json!({"id": "a", "trigger_time": "2026-01-01T00:00:00"}),
+        ];
+        sort_by_trigger_time(&mut items).unwrap();
+        let ids: Vec<&str> = items.iter().map(|j| j["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn mixed_stored_trigger_time_fails_like_python_sort() {
+        // python: [{"trigger_time": "2026-..."}, {"trigger_time": 5}].sort(key=...) -> 5 < "2026-..." raises
+        let mut items = vec![json!({"trigger_time": "2026-01-01T00:00:00"}), json!({"trigger_time": 5})];
+        let err = sort_by_trigger_time(&mut items).unwrap_err().to_string();
+        assert_eq!(err, "'<' not supported between instances of 'int' and 'str'");
+        // a single job is never compared, so it cannot fail
+        let mut single = vec![json!({"trigger_time": 5})];
+        assert!(sort_by_trigger_time(&mut single).is_ok());
+    }
 
     fn dt(s: &str) -> NaiveDateTime {
         crate::util::fromisoformat(s).unwrap()
@@ -1024,6 +1154,28 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_relative_offsets_raise_like_timedelta() {
+        let base = dt("2026-11-07T01:02:03");
+        let days = |n: i64| json!({"weeks": 0, "days": n, "hours": 0, "minutes": 0, "seconds": 0});
+        // python: base + timedelta(days=N) fails in datetime for N = 1e8 (year out of range)
+        assert_eq!(calculate_next_from(&base, &days(100_000_000)).unwrap_err(), "date value out of range");
+        assert_eq!(calculate_next_from(&base, &days(1_000_000_000)).unwrap_err(), "days=1000000000; must have magnitude <= 999999999");
+        assert_eq!(calculate_next_from(&base, &days(10_000_000_000)).unwrap_err(), "Python int too large to convert to C int");
+        // a digit run too big for i64 is not read as zero: python raises the C int overflow for it
+        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap();
+        assert_eq!(calculate_next_from(&base, &huge).unwrap_err(), "Python int too large to convert to C int");
+    }
+
+    #[test]
+    fn truthy_non_object_bodies_raise_like_python() {
+        // python `body = body or {}` keeps a truthy list and then calls .get() on it
+        assert_eq!(dict_body(&Some(json!([1]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+        assert_eq!(dict_body(&Some(json!("x"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        assert!(dict_body(&Some(json!({"action": "x"}))).is_ok());
+        assert!(dict_body(&Some(json!(""))).is_ok());
+    }
+
+    #[test]
     fn next_clock_time() {
         // 2026-10-14 is a Wednesday
         let base = dt("2026-10-14T10:00:00");
@@ -1053,7 +1205,21 @@ mod tests {
         assert_eq!(format_recurring_time(&json!({"weeks": 0, "days": 2, "hours": 3})), "every 2 days, 3 hours");
         assert_eq!(format_recurring_time(&json!({})), "invalid schedule");
         let job = json!({"id": "X", "action": "do it", "channel": "webui", "trigger_time": "2026-10-14T10:00:00.123", "recurring": false});
-        assert_eq!(schedule_to_string(&[job]), "X: one-time, due 2026-10-14 10:00 on webui: do it");
+        assert_eq!(schedule_to_string(&[job]).unwrap(), "X: one-time, due 2026-10-14 10:00 on webui: do it");
+        // a recurring job with a stored null recurs_in makes python's formatter raise; a missing key does not
+        let null_recur = json!({"id": "N", "recurring": true, "recurs_in": null});
+        assert_eq!(format_job_time(&null_recur).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
+        let missing = json!({"id": "M", "recurring": true});
+        assert_eq!(format_job_time(&missing).unwrap(), "invalid schedule");
+    }
+
+    #[test]
+    fn recur_argument_types() {
+        // python `(duration or "").strip()` on a truthy number raises instead of reading it as text
+        assert_eq!(str_arg(Some(json!(5)), "strip").unwrap_err().to_string(), "'int' object has no attribute 'strip'");
+        assert_eq!(str_arg(Some(json!(0)), "strip").unwrap(), "");
+        assert_eq!(str_arg(None, "split").unwrap(), "");
+        assert_eq!(str_arg(Some(json!("08:15")), "split").unwrap(), "08:15");
     }
 
     #[test]

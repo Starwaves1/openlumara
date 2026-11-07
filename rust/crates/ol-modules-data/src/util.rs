@@ -151,6 +151,14 @@ pub fn body_str(body: &Option<Value>, key: &str, default: &str) -> String {
     body_get(body, key).map(|v| py_str(&v)).unwrap_or_else(|| default.to_string())
 }
 
+/// python `body = body or {}` followed by `.get(...)`: a truthy non-object body raises AttributeError
+pub fn dict_body(body: &Option<Value>) -> anyhow::Result<()> {
+    match body {
+        Some(v) if truthy(v) && !v.is_object() => Err(anyhow::anyhow!("'{}' object has no attribute 'get'", py_type(v))),
+        _ => Ok(()),
+    }
+}
+
 /// python truthiness of an optional value
 pub fn truthy_opt(v: Option<&Value>) -> bool {
     v.map(truthy).unwrap_or(false)
@@ -171,35 +179,334 @@ pub fn expanduser(p: &str) -> String {
     p.to_string()
 }
 
-/// lenient base64 decode like python's `base64.b64decode` (non-alphabet characters are discarded)
+/// python `base64.b64decode(s)` on bytes (binascii `a2b_base64`, non-strict, python 3.14). non-alphabet
+/// bytes are skipped. a '=' only counts as padding after a partial quad, and the run of pads that directly
+/// follows the last data character must complete the quad: a short run or a 1-character tail is an error
 pub fn b64decode(s: &[u8]) -> Result<Vec<u8>, String> {
     use base64::engine::{general_purpose::GeneralPurpose, DecodePaddingMode, GeneralPurposeConfig};
     use base64::Engine;
-    let filtered: Vec<u8> = s.iter().copied().filter(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/' || *c == b'=').collect();
-    // python stops at the first padding group; strip everything after the padding
-    let cut = match filtered.iter().position(|c| *c == b'=') {
-        Some(p) => {
-            let mut end = p;
-            while end < filtered.len() && filtered[end] == b'=' {
-                end += 1;
+    let mut data: Vec<u8> = Vec::new();
+    let mut quad_pos = 0usize;
+    let mut pad_run = 0usize;
+    for &c in s {
+        if c == b'=' {
+            if quad_pos >= 2 {
+                pad_run += 1;
             }
-            &filtered[..end]
+            continue;
         }
-        None => &filtered[..],
-    };
-    if cut.iter().filter(|c| **c != b'=').count() % 4 == 1 {
-        return Err("Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4".into());
+        if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'/') {
+            continue;
+        }
+        data.push(c);
+        quad_pos = (quad_pos + 1) % 4;
+        pad_run = 0;
+    }
+    match quad_pos {
+        1 => {
+            return Err(format!(
+                "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
+                data.len()
+            ))
+        }
+        2 if pad_run < 2 => return Err("Incorrect padding".into()),
+        3 if pad_run < 1 => return Err("Incorrect padding".into()),
+        _ => {}
     }
     let engine = GeneralPurpose::new(
         &base64::alphabet::STANDARD,
-        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(DecodePaddingMode::RequireNone),
     );
-    engine.decode(cut).map_err(|_| "Incorrect padding".to_string())
+    engine.decode(&data).map_err(|_| "Incorrect padding".to_string())
 }
 
-/// python `str.lower()` + `str.strip()` equality used by several lookups
+/// python `base64.b64decode(str)`: a str argument must be ASCII before it is decoded
+pub fn b64decode_text(s: &str) -> Result<Vec<u8>, String> {
+    if !s.is_ascii() {
+        return Err("string argument should contain only ASCII characters".into());
+    }
+    b64decode(s.as_bytes())
+}
+
+/// python `bytes.decode("utf-8")`, with CPython's UnicodeDecodeError text
+pub fn py_utf8_decode(bytes: &[u8]) -> Result<String, String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(e) => {
+            let start = e.valid_up_to();
+            let (end, reason) = match e.error_len() {
+                Some(n) => {
+                    // a lead byte that is valid on its own fails on the continuation byte after it
+                    let lead_ok = matches!(bytes[start], 0xC2..=0xDF | 0xE0..=0xEF | 0xF0..=0xF4);
+                    (start + n, if lead_ok { "invalid continuation byte" } else { "invalid start byte" })
+                }
+                None => (bytes.len(), "unexpected end of data"),
+            };
+            let at = if end - start == 1 {
+                format!("byte 0x{:02x} in position {}", bytes[start], start)
+            } else {
+                format!("bytes in position {}-{}", start, end - 1)
+            };
+            Err(format!("'utf-8' codec can't decode {}: {}", at, reason))
+        }
+    }
+}
+
+/// python `str.strip()`: strips every char for which `str.isspace()` is true. that set is rust's
+/// White_Space plus U+001C..=U+001F (python counts the file/group/record/unit separators as spaces)
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+/// python `a.lower().strip() == b.lower().strip()` used by several lookups
 pub fn eq_ci_strip(a: &str, b: &str) -> bool {
-    a.to_lowercase().trim() == b.to_lowercase().trim()
+    py_strip(&a.to_lowercase()) == py_strip(&b.to_lowercase())
+}
+
+/// python's json decoder recurses; a container nested deeper than this fails with python's
+/// RecursionError text. python's real limit is its interpreter recursion limit, so the exact depth differs
+const MAX_JSON_DEPTH: usize = 1000;
+
+/// python `json.loads(text)` on a str: the same accepted documents, the same error positions (in
+/// characters) and the same `JSONDecodeError` text as CPython's scanner, returned as python's `str(e)`.
+/// python's NaN, Infinity, -Infinity and out-of-range numbers are read as `true`: they are truthy and
+/// not strings, and a non-dict top level is rejected for them as it is for `true`
+pub fn py_json_loads(text: &str) -> Result<Value, String> {
+    if text.starts_with('\u{feff}') {
+        return Err("Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)".into());
+    }
+    let doc: Vec<char> = text.chars().collect();
+    let scanner = JsonScanner { doc: &doc };
+    let start = scanner.ws(0);
+    let (value, end) = scanner.value(start, 0)?;
+    let end = scanner.ws(end);
+    if end != doc.len() {
+        return Err(decode_error(&doc, "Extra data", end));
+    }
+    Ok(value)
+}
+
+/// python `RecursionError` text for a container nested deeper than `MAX_JSON_DEPTH`
+fn recursion_error(kind: &str) -> String {
+    format!("maximum recursion depth exceeded while decoding a JSON {kind} from a unicode string")
+}
+
+fn decode_error(doc: &[char], msg: &str, pos: usize) -> String {
+    let lineno = doc[..pos].iter().filter(|&&c| c == '\n').count() + 1;
+    let colno = match doc[..pos].iter().rposition(|&c| c == '\n') {
+        Some(newline) => pos - newline,
+        None => pos + 1,
+    };
+    format!("{msg}: line {lineno} column {colno} (char {pos})")
+}
+
+/// recursive-descent mirror of CPython's `_json` scanner. every method takes the index of the
+/// first character it may consume and returns the index just past what it consumed
+struct JsonScanner<'a> {
+    doc: &'a [char],
+}
+
+impl JsonScanner<'_> {
+    fn ws(&self, mut i: usize) -> usize {
+        while matches!(self.doc.get(i), Some(' ' | '\t' | '\n' | '\r')) {
+            i += 1;
+        }
+        i
+    }
+
+    fn word(&self, i: usize, word: &str) -> bool {
+        word.chars().enumerate().all(|(k, c)| self.doc.get(i + k) == Some(&c))
+    }
+
+    /// a value python parses but `Value` cannot hold: a failure, or its stand-in, ending at `end`
+    fn python_only(&self, end: usize) -> Result<(Value, usize), String> {
+        Ok((Value::Bool(true), end))
+    }
+
+    fn value(&self, i: usize, depth: usize) -> Result<(Value, usize), String> {
+        match self.doc.get(i) {
+            Some('"') => {
+                let (text, end) = self.string(i + 1)?;
+                Ok((Value::String(text), end))
+            }
+            Some('{') => self.object(i + 1, depth + 1),
+            Some('[') => self.array(i + 1, depth + 1),
+            Some('n') if self.word(i, "null") => Ok((Value::Null, i + 4)),
+            Some('t') if self.word(i, "true") => Ok((Value::Bool(true), i + 4)),
+            Some('f') if self.word(i, "false") => Ok((Value::Bool(false), i + 5)),
+            Some('N') if self.word(i, "NaN") => self.python_only(i + 3),
+            Some('I') if self.word(i, "Infinity") => self.python_only(i + 8),
+            Some('-') if self.word(i, "-Infinity") => self.python_only(i + 9),
+            _ => self.number(i),
+        }
+    }
+
+    fn number(&self, start: usize) -> Result<(Value, usize), String> {
+        let d = self.doc;
+        let digits = |mut j: usize| {
+            while matches!(d.get(j), Some(c) if c.is_ascii_digit()) {
+                j += 1;
+            }
+            j
+        };
+        let mut j = start;
+        if d.get(j) == Some(&'-') {
+            j += 1;
+        }
+        match d.get(j) {
+            Some('0') => j += 1,
+            Some(c) if c.is_ascii_digit() => j = digits(j),
+            _ => return Err(decode_error(d, "Expecting value", start)),
+        }
+        let mut is_float = false;
+        if d.get(j) == Some(&'.') && matches!(d.get(j + 1), Some(c) if c.is_ascii_digit()) {
+            j = digits(j + 1);
+            is_float = true;
+        }
+        if matches!(d.get(j), Some('e' | 'E')) {
+            let mut k = j + 1;
+            if matches!(d.get(k), Some('+' | '-')) {
+                k += 1;
+            }
+            if matches!(d.get(k), Some(c) if c.is_ascii_digit()) {
+                j = digits(k);
+                is_float = true;
+            }
+        }
+        let text: String = d[start..j].iter().collect();
+        if is_float {
+            return match text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Some(n) => Ok((Value::Number(n), j)),
+                None => self.python_only(j),
+            };
+        }
+        match text.parse::<i64>().map(Value::from).or_else(|_| text.parse::<u64>().map(Value::from)) {
+            Ok(v) => Ok((v, j)),
+            Err(_) => self.python_only(j),
+        }
+    }
+
+    /// `start` is the index just past the opening quote
+    fn string(&self, start: usize) -> Result<(String, usize), String> {
+        let d = self.doc;
+        let begin = start - 1;
+        let mut out = String::new();
+        let mut i = start;
+        loop {
+            let mut j = i;
+            while let Some(&c) = d.get(j) {
+                if c == '"' || c == '\\' || (c as u32) < 0x20 {
+                    break;
+                }
+                j += 1;
+            }
+            out.extend(&d[i..j]);
+            match d.get(j) {
+                None => return Err(decode_error(d, "Unterminated string starting at", begin)),
+                Some('"') => return Ok((out, j + 1)),
+                Some('\\') => {}
+                Some(_) => return Err(decode_error(d, "Invalid control character at", j)),
+            }
+            // j is the backslash
+            let Some(&esc) = d.get(j + 1) else {
+                return Err(decode_error(d, "Unterminated string starting at", begin));
+            };
+            let plain = match esc {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => {
+                    let (unit, next) = self.hex4(j + 1)?;
+                    i = next;
+                    let mut code = unit;
+                    // a high surrogate followed by an escaped low surrogate is one character
+                    if (0xD800..0xDC00).contains(&unit) && d.get(next) == Some(&'\\') && d.get(next + 1) == Some(&'u') {
+                        let (low, after) = self.hex4(next + 1)?;
+                        if (0xDC00..0xE000).contains(&low) {
+                            code = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                            i = after;
+                        }
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                    continue;
+                }
+                _ => return Err(decode_error(d, "Invalid \\escape", j)),
+            };
+            out.push(plain);
+            i = j + 2;
+        }
+    }
+
+    /// the four hex digits of a `\u` escape whose `u` is at `u_at`; returns the code unit and the
+    /// index just past the digits
+    fn hex4(&self, u_at: usize) -> Result<(u32, usize), String> {
+        let unit = (1..=4).try_fold(0u32, |acc, k| {
+            self.doc.get(u_at + k).and_then(|c| c.to_digit(16)).map(|v| acc * 16 + v)
+        });
+        match unit {
+            Some(unit) => Ok((unit, u_at + 5)),
+            None => Err(decode_error(self.doc, "Invalid \\uXXXX escape", u_at)),
+        }
+    }
+
+    /// `start` is the index just past the `{`
+    fn object(&self, start: usize, depth: usize) -> Result<(Value, usize), String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(recursion_error("object"));
+        }
+        let d = self.doc;
+        let mut map = Map::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&'}') {
+            return Ok((Value::Object(map), i + 1));
+        }
+        loop {
+            if d.get(i) != Some(&'"') {
+                return Err(decode_error(d, "Expecting property name enclosed in double quotes", i));
+            }
+            let (key, after_key) = self.string(i + 1)?;
+            let colon = self.ws(after_key);
+            if d.get(colon) != Some(&':') {
+                return Err(decode_error(d, "Expecting ':' delimiter", colon));
+            }
+            let (value, after_value) = self.value(self.ws(colon + 1), depth)?;
+            map.insert(key, value);
+            let next = self.ws(after_value);
+            match d.get(next) {
+                Some('}') => return Ok((Value::Object(map), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
+    }
+
+    /// `start` is the index just past the `[`
+    fn array(&self, start: usize, depth: usize) -> Result<(Value, usize), String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(recursion_error("array"));
+        }
+        let d = self.doc;
+        let mut items = Vec::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&']') {
+            return Ok((Value::Array(items), i + 1));
+        }
+        loop {
+            let (item, after_item) = self.value(i, depth)?;
+            items.push(item);
+            let next = self.ws(after_item);
+            match d.get(next) {
+                Some(']') => return Ok((Value::Array(items), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,8 +546,35 @@ mod tests {
     }
 
     #[test]
+    fn py_strip_and_name_compare_like_python() {
+        // \x1c..\x1f are isspace() in python, so str.strip() removes them
+        assert_eq!(py_strip("\u{1c}\u{1f} Ann \u{85}"), "Ann");
+        assert!(eq_ci_strip("\u{1c}Ann", "ann\u{1d}"));
+        assert!(!eq_ci_strip("Ann", "Anna"));
+    }
+
+    #[test]
     fn base64_lenient() {
         assert_eq!(b64decode(b"aGVs\nbG8=").unwrap(), b"hello");
-        assert_eq!(b64decode(b"aGVsbG8").unwrap(), b"hello");
+        // python rejects missing padding ("Incorrect padding") rather than decoding the partial quad
+        assert_eq!(b64decode(b"aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(b64decode(b"aGVsbG8").unwrap_err(), "Incorrect padding");
+    }
+
+    #[test]
+    fn base64_padding_matches_python_3_14() {
+        // outputs captured from python 3.14 base64.b64decode
+        assert_eq!(b64decode(b"QQ==").unwrap(), b"A");
+        assert_eq!(b64decode(b"QUI=").unwrap(), b"AB");
+        assert_eq!(b64decode(b"QQ==QQ==").unwrap(), b"A\x04\x10");
+        assert_eq!(b64decode(b"QUFE=QUFE=").unwrap(), b"AADAAD");
+        assert_eq!(b64decode(b"QUI=Q").unwrap(), b"AB\x10");
+        assert_eq!(b64decode(b"QQ=").unwrap_err(), "Incorrect padding");
+        assert_eq!(b64decode(b"QQ==Q").unwrap_err(), "Incorrect padding");
+        assert_eq!(b64decode(b"QUI=QUI=").unwrap_err(), "Incorrect padding");
+        assert_eq!(
+            b64decode(b"QUFEF=").unwrap_err(),
+            "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4"
+        );
     }
 }

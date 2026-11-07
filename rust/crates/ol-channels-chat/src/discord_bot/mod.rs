@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(make_progress_bar(0.0, 12), "`░░░░░░░░░░░░` 0%");
         assert_eq!(make_progress_bar(100.0, 12), "`████████████` 100%");
         assert_eq!(make_progress_bar(50.0, 12), "`█████▓░░░░░░` 50%");
-        assert_eq!(make_progress_bar(9.0, 12), "`░░░░░░░░░░░░` 9%");
+        assert_eq!(make_progress_bar(9.0, 12), "`▓░░░░░░░░░░░` 9%");
     }
 
     #[test]
