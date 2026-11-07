@@ -477,7 +477,9 @@ fn write_inner(path: &str, content: &Value, mode: &str) -> Result<(), String> {
     .map_err(|e| os_err(&e, path))?;
     // the file is already opened (and truncated for 'w') when python's f.write() rejects the value
     let Value::String(text) = content else {
-        return Err(format!("write() argument must be str, not {}", py_type_name(content)));
+        // TextIOWrapper.write names None as "None" (verified: python3 -c "f.write(None)"), not "NoneType"
+        let t = if content.is_null() { "None" } else { py_type_name(content) };
+        return Err(format!("write() argument must be str, not {}", t));
     };
     f.write_all(text.as_bytes()).map_err(|e| os_err_bare(&e))
 }
@@ -969,6 +971,18 @@ mod tests {
         // into an existing directory, shutil.move's os.fspath wording applies
         let into = call(&m, "move", json!({"src": 5, "dst": root.clone()})).await.unwrap();
         assert_eq!(into, json!({"status": "error", "content": "expected str, bytes or os.PathLike object, not int"}));
+    }
+
+    #[tokio::test]
+    async fn write_non_str_content_names_python_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("{}/w.txt", dir.path().to_str().unwrap());
+        let m = fm();
+        // python: f.write(None) -> TypeError "write() argument must be str, not None", caught by _write
+        let w = call(&m, "write", json!({"path": path.clone(), "content": null})).await.unwrap();
+        assert_eq!(w, json!({"status": "error", "content": "write() argument must be str, not None"}));
+        let n = call(&m, "write", json!({"path": path.clone(), "content": 5})).await.unwrap();
+        assert_eq!(n, json!({"status": "error", "content": "write() argument must be str, not int"}));
     }
 
     #[tokio::test]

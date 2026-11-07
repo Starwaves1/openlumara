@@ -5,6 +5,8 @@ use super::http::{Method, Net, Session};
 use super::results::{build, collapse_ws};
 use super::{kv, lookup, region_parts, Category, DdgsError, Payload, SearchArgs};
 use crate::ddgs::results::Record;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::Value;
 
 const URL: &str = "https://www.startpage.com/sp/search";
@@ -19,9 +21,17 @@ pub async fn get_sc(session: &mut Session) -> Result<String, DdgsError> {
     sc_from_page(&reply.text())
 }
 
+static LXML_NON_ELEMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<!--.*?-->|<![^>]*>|<\?[^>]*>").unwrap());
+
+/// lxml's `etree.fromstring` yields no root (ParserError `Document is empty`) when the input holds only
+/// whitespace, comments, processing instructions or a doctype; any text or tag gives a root.
+fn lxml_document_is_empty(page: &str) -> bool {
+    LXML_NON_ELEMENT_RE.replace_all(page, "").trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c')).is_empty()
+}
+
 /// the `sc` value of a start page body; a body with no element at all is lxml's `Document is empty`
 pub fn sc_from_page(page: &str) -> Result<String, DdgsError> {
-    if page.trim_ascii().is_empty() {
+    if lxml_document_is_empty(page) {
         return Err(DdgsError::Failed("Document is empty".into()));
     }
     let doc = html::parse(page);
@@ -120,7 +130,15 @@ mod tests {
     fn empty_start_page_body_raises_lxml_document_is_empty() {
         assert_eq!(sc_from_page("").unwrap_err().message(), "Document is empty");
         assert_eq!(sc_from_page(" \n\t").unwrap_err().message(), "Document is empty");
+        // lxml probe (lxml 6.1.3): form feed alone, with comments, or repeated is "Document is empty"; with text it is a root
+        assert_eq!(sc_from_page("\x0c").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0c<!--x-->").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0c\x0c").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("\x0cplain").unwrap(), "");
+        assert_eq!(sc_from_page("<!-- only a comment -->").unwrap_err().message(), "Document is empty");
+        assert_eq!(sc_from_page("<!DOCTYPE html>\n<?pi x?>").unwrap_err().message(), "Document is empty");
         assert_eq!(sc_from_page("<html></html>").unwrap(), "");
+        assert_eq!(sc_from_page("plain text").unwrap(), "");
     }
 
     #[test]

@@ -732,11 +732,7 @@ impl HtmlParser {
         } else if self.starts_with(i, "<![CDATA[") {
             let data = self.text(i + 3, n);
             self.unknown_decl(data);
-        } else if self.starts_with_ci(i, "<!doctype") {
-            self.skip_node();
-        } else if self.starts_with(i, "<!") {
-            self.skip_node();
-        } else if self.starts_with(i, "<?") {
+        } else if self.starts_with_ci(i, "<!doctype") || self.starts_with(i, "<!") || self.starts_with(i, "<?") {
             self.skip_node();
         } else {
             return Err("we should not get here!".to_string());

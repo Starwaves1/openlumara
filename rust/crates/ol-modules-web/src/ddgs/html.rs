@@ -14,7 +14,52 @@ use tendril::TendrilSink;
 pub fn parse(text: &str) -> Html {
     let mut opts = ParseOpts::default();
     opts.tree_builder.scripting_enabled = false;
-    driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(text)
+    let mut doc = driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(text);
+    remove_blank_text(&mut doc);
+    doc
+}
+
+/// elements whose whitespace-only text children survive lxml's `remove_blank_text` (ddgs `base.py`
+/// `LHTMLParser(remove_blank_text=True)`). Probed against lxml 6.1.3: `<X> <b>q</b></X>` keeps the blank
+/// for X in this list and drops it otherwise (`ol`, `ul`, `table`, `tr`, `dl`, `option`, `map`, `menu` drop it).
+const KEEPS_BLANK_TEXT: &[&str] = &[
+    "a", "abbr", "acronym", "address", "applet", "b", "bdo", "big", "blockquote", "body", "button", "caption",
+    "center", "cite", "code", "dd", "del", "dfn", "div", "dt", "em", "font", "form", "h1", "h2", "h3", "h4", "h5",
+    "h6", "i", "iframe", "ins", "kbd", "label", "legend", "li", "noframes", "noscript", "object", "p", "pre", "q", "s",
+    "samp", "small", "span", "strike", "strong", "td", "th", "tt", "u", "var",
+];
+
+/// lxml's `remove_blank_text`: libxml2 drops a whitespace-only text node when a tag (or the end of input)
+/// follows it and the element before it, or its parent when it is the first child, is not in `KEEPS_BLANK_TEXT`.
+/// At the end of input (nothing after the node in document order) it is always dropped (`areBlanks`: `CUR == 0`).
+/// Comments and processing instructions are not counted as siblings (lxml removes them while parsing).
+fn remove_blank_text(doc: &mut Html) {
+    let mut dropped = Vec::new();
+    for node in doc.tree.nodes() {
+        let Some(text) = node.value().as_text() else { continue };
+        let blank = !text.text.is_empty() && text.text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+        if !blank || node.next_sibling().is_some_and(|n| n.value().is_text()) {
+            continue;
+        }
+        let at_end = node.next_sibling().is_none() && node.ancestors().all(|a| a.next_sibling().is_none());
+        if at_end {
+            dropped.push(node.id());
+            continue;
+        }
+        let prev = node.prev_siblings().find(|p| p.value().is_element() || p.value().is_text());
+        let owner = match prev {
+            Some(p) => ElementRef::wrap(p),
+            None => node.parent().and_then(ElementRef::wrap),
+        };
+        if owner.is_some_and(|el| !KEEPS_BLANK_TEXT.contains(&el.value().name())) {
+            dropped.push(node.id());
+        }
+    }
+    for id in dropped {
+        if let Some(mut node) = doc.tree.get_mut(id) {
+            node.detach();
+        }
+    }
 }
 
 /// `//*` of the document (root included), document order
@@ -97,7 +142,7 @@ pub fn ancestor_below<'a>(el: ElementRef<'a>, root: ElementRef<'a>, pred: impl F
         if node.id() == root.id() {
             return false;
         }
-        if ElementRef::wrap(node).is_some_and(|e| pred(e)) {
+        if ElementRef::wrap(node).is_some_and(&pred) {
             return true;
         }
     }
@@ -106,7 +151,7 @@ pub fn ancestor_below<'a>(el: ElementRef<'a>, root: ElementRef<'a>, pred: impl F
 
 /// some ancestor of `el` (any depth) satisfies `pred`
 pub fn has_ancestor<'a>(el: ElementRef<'a>, pred: impl Fn(ElementRef<'a>) -> bool) -> bool {
-    el.ancestors().filter_map(ElementRef::wrap).any(|e| pred(e))
+    el.ancestors().filter_map(ElementRef::wrap).any(pred)
 }
 
 /// `"".join(xpath(".//x//text()"))` over a node-set: every text node under the elements, each
@@ -182,6 +227,34 @@ mod tests {
         let empty = parse("<span><b>x</b></span>");
         let span = desc_named(all_elements(&empty)[0], "span")[0];
         assert_eq!(first_text(span), None);
+    }
+
+    #[test]
+    fn blank_text_is_dropped_where_lxml_remove_blank_text_drops_it() {
+        // blank after an inline element (span is kept by lxml) and before a comment: kept
+        assert_eq!(text_of(&all_elements(&parse("<div><span>a</span> <ul><li>x</li></ul></div>"))), "a x");
+        assert_eq!(text_of(&all_elements(&parse("<div><span>a</span><!--c--> <b>x</b></div>"))), "a x");
+        // blank after <img> (not kept by lxml), and blank as the first child of <dl> (not kept): dropped
+        assert_eq!(text_of(&all_elements(&parse("<p><img src=x> <b>q</b></p>"))), "q");
+        assert_eq!(text_of(&all_elements(&parse("<dl> <dt>a</dt></dl>"))), "a");
+        assert_eq!(text_of(&all_elements(&parse("<div><img><!--c--> <b>x</b></div>"))), "x");
+    }
+
+    #[test]
+    fn blank_text_at_end_of_input_is_dropped_like_lxml() {
+        // libxml2 areBlanks: CUR == 0 drops the blank whatever the element before it (lxml 6.1.3 probes)
+        assert_eq!(text_of(&all_elements(&parse("<span>a</span> "))), "a");
+        assert_eq!(text_of(&all_elements(&parse("<div><b>x</b></div>\n\n"))), "x");
+        assert_eq!(text_of(&all_elements(&parse("<html><body><span>a</span></body></html>\n"))), "a");
+        // a blank before a trailing comment is followed by '<', so the usual rule applies and span keeps it
+        assert_eq!(text_of(&all_elements(&parse("<span>a</span> <!--c-->"))), "a ");
+    }
+
+    #[test]
+    fn blank_text_after_iframe_and_noframes_is_kept_like_lxml() {
+        // lxml (libxml2 remove_blank_text) keeps the blank after these: "<div><iframe></iframe> <b>q</b></div>" -> [' ', 'q']
+        assert_eq!(text_of(&all_elements(&parse("<div><iframe></iframe> <b>q</b></div>"))), " q");
+        assert_eq!(text_of(&all_elements(&parse("<div><noframes></noframes> <b>q</b></div>"))), " q");
     }
 
     #[test]

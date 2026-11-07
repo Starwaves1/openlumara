@@ -81,10 +81,7 @@ mod tests {
         assert_eq!(payload, vec![kv("q", "rust"), kv("source", "web")]);
         assert_eq!(cookies, vec![("us".to_string(), "us".to_string()), ("useLocation".to_string(), "0".to_string())]);
 
-        let mut args = SearchArgs::default();
-        args.safesearch = "off".into();
-        args.timelimit = Some("y".into());
-        args.page = 3;
+        let args = SearchArgs { safesearch: "off".into(), timelimit: Some("y".into()), page: 3, ..Default::default() };
         let (payload, cookies) = build_payload("rust", &args).unwrap();
         assert_eq!(cookies.last().unwrap(), &("safesearch".to_string(), "off".to_string()));
         assert_eq!(payload.last().unwrap(), &kv("offset", 2));

@@ -190,7 +190,13 @@ impl Module for UnsafeShell {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "exec" => self.exec_tool(args.0.get("cmd")).await,
+            "exec" => {
+                // python `exec(**args)`: an unexpected keyword is bound before the missing-argument check
+                if let Some(extra) = args.0.keys().find(|k| k.as_str() != "cmd") {
+                    anyhow::bail!("UnsafeShell.exec() got an unexpected keyword argument '{}'", extra);
+                }
+                self.exec_tool(args.0.get("cmd")).await
+            }
             _ => anyhow::bail!("'UnsafeShell' object has no attribute '{}'", method),
         }
     }
@@ -310,6 +316,24 @@ mod tests {
         let m = UnsafeShell::new_for_test();
         let r = m.exec_tool(Some(&json!(["echo $0", "hi"]))).await.unwrap();
         assert_eq!(r["content"]["stdout"], json!("hi"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_tool_unexpected_kwarg_reported_before_missing_cmd() {
+        // python: exec(**{"extra": 1}) -> unexpected keyword is bound before the missing 'cmd' check
+        let m = UnsafeShell::new_for_test();
+        let mut map = serde_json::Map::new();
+        map.insert("extra".into(), json!(1));
+        let err = m.call_tool("exec", ToolArgs::new(map)).await.unwrap_err().to_string();
+        assert_eq!(err, "UnsafeShell.exec() got an unexpected keyword argument 'extra'");
+
+        // the first unexpected key in dict order is the one reported
+        let mut map = serde_json::Map::new();
+        map.insert("cmd".into(), json!("echo hi"));
+        map.insert("x".into(), json!(1));
+        map.insert("y".into(), json!(2));
+        let err = m.call_tool("exec", ToolArgs::new(map)).await.unwrap_err().to_string();
+        assert_eq!(err, "UnsafeShell.exec() got an unexpected keyword argument 'x'");
     }
 
     #[tokio::test(flavor = "multi_thread")]

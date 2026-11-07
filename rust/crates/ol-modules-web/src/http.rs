@@ -78,7 +78,7 @@ fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
-fn as_items<'a>(v: &'a Value) -> anyhow::Result<&'a Map<String, Value>> {
+fn as_items(v: &Value) -> anyhow::Result<&Map<String, Value>> {
     v.as_object().ok_or_else(|| anyhow!("'{}' object has no attribute 'items'", py_type_name(v)))
 }
 
@@ -554,12 +554,10 @@ fn parse_set_cookie(raw: &str, now: i64) -> CookieAttr {
                     domain = Some(v.to_lowercase());
                 }
             }
-            "path" => {
-                if !path_seen {
-                    path_seen = true;
-                    let Some(v) = val else { return CookieAttr::Drop };
-                    path = Some(v.to_string());
-                }
+            "path" if !path_seen => {
+                path_seen = true;
+                let Some(v) = val else { return CookieAttr::Drop };
+                path = Some(v.to_string());
             }
             _ => {}
         }
@@ -1032,8 +1030,11 @@ impl HttpCore {
             if py_len(&clean_value) > 8000 {
                 clean_value = py_prefix(&clean_value, 8000).to_string();
             }
-            match out.iter_mut().find(|(k, _)| *k == clean_key) {
-                Some(e) => e.1 = clean_value,
+            // requests merges request headers into a CaseInsensitiveDict: a later header whose name
+            // differs only in case replaces the value and spelling, and keeps the first position.
+            let lower = clean_key.to_lowercase();
+            match out.iter_mut().find(|(k, _)| k.to_lowercase() == lower) {
+                Some(e) => *e = (clean_key, clean_value),
                 None => out.push((clean_key, clean_value)),
             }
         }
@@ -1454,6 +1455,32 @@ mod tests {
         );
         assert_eq!(HttpCore::sanitize_headers(Some(&json!({}))).unwrap().len(), 3);
         assert_eq!(HttpCore::sanitize_headers(Some(&json!("x"))).unwrap_err().to_string(), "'str' object has no attribute 'items'");
+    }
+
+    #[test]
+    fn header_case_variants_collapse_like_requests() {
+        // requests CaseInsensitiveDict: last value and last spelling win, first position kept
+        let h = HttpCore::sanitize_headers(Some(&json!({"X-A": "1", "X-B": "2", "x-a": "3", "X-a": "4"}))).unwrap();
+        assert_eq!(
+            h,
+            vec![
+                ("X-a".to_string(), "4".to_string()),
+                ("X-B".to_string(), "2".to_string()),
+                ("User-Agent".to_string(), "OpenLumara/1.0".to_string()),
+                ("Accept".to_string(), "application/json, text/plain, */*".to_string()),
+                ("Accept-Encoding".to_string(), "gzip, deflate".to_string()),
+            ]
+        );
+        // a case-variant of a default header replaces it rather than adding a second one
+        let d = HttpCore::sanitize_headers(Some(&json!({"accept": "text/x"}))).unwrap();
+        assert_eq!(
+            d,
+            vec![
+                ("accept".to_string(), "text/x".to_string()),
+                ("User-Agent".to_string(), "OpenLumara/1.0".to_string()),
+                ("Accept-Encoding".to_string(), "gzip, deflate".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -89,8 +89,7 @@ mod tests {
         let p = build_payload("clip", &args, "v").unwrap();
         assert!(p.contains(&kv("f", ",,,")));
         assert!(p.contains(&kv("p", "-1")));
-        let mut args = SearchArgs::default();
-        args.timelimit = Some("w".into());
+        let mut args = SearchArgs { timelimit: Some("w".into()), ..Default::default() };
         args.extra.insert("resolution".into(), "high".into());
         args.extra.insert("duration".into(), "short".into());
         let p = build_payload("clip", &args, "v").unwrap();

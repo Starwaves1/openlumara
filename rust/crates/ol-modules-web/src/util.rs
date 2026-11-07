@@ -108,9 +108,37 @@ pub fn urljoin(base: &str, url: &str) -> Result<String, String> {
 /// The text python's `json.loads(text)` raises with, for the ddgs engines that parse json.
 /// serde_json decides whether the text parses; when it does not, this reproduces CPython's
 /// `JSONDecodeError` message (`"Expecting value: line 1 column 1 (char 0)"`). A text CPython
-/// accepts but serde rejects (NaN, Infinity, lone surrogates) keeps serde's own text.
+/// accepts but serde rejects (NaN, Infinity, -Infinity, out-of-range numbers, lone surrogates) keeps serde's
+/// own text, except NaN and Infinity, which get an explicit unsupported-value error (see `py_json_nonfinite`).
 pub fn py_json_loads(text: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_str(text).map_err(|e| py_json_error(text).unwrap_or_else(|| e.to_string()))
+    serde_json::from_str(text).map_err(|e| {
+        py_json_error(text)
+            .or_else(|| py_json_nonfinite(text))
+            .unwrap_or_else(|| e.to_string())
+    })
+}
+
+/// NaN / Infinity (and numbers past f64 range, which python reads as inf) are an error, not Value::Null: every
+/// py_json_loads caller would observably differ (bing_images.rs:59 and results.rs:356 name the type in
+/// `'float' object has no attribute 'get'`, and a NaN title or result is dumped as NaN, not null)
+fn py_json_nonfinite(text: &str) -> Option<String> {
+    fn first_nonfinite(v: &PyJson) -> Option<f64> {
+        match v {
+            PyJson::Float(f) if !f.is_finite() => Some(*f),
+            PyJson::List(items) => items.iter().find_map(first_nonfinite),
+            PyJson::Dict(entries) => entries.iter().find_map(|(_, v)| first_nonfinite(v)),
+            _ => None,
+        }
+    }
+    let f = first_nonfinite(&json_loads(text)?)?;
+    let name = if f.is_nan() {
+        "NaN"
+    } else if f > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    Some(format!("json.loads value {name} is not supported: python accepts it, this port cannot represent it"))
 }
 
 /// CPython's `JSONDecodeError` text for `text`, or None when CPython's decoder accepts it.
@@ -610,56 +638,6 @@ pub fn sanitize_json(v: &PyJson) -> PyJson {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn roundtrip(s: &str) -> Option<String> {
-        json_loads(s).map(|v| json_dumps(&v))
-    }
-
-    #[test]
-    fn json_keeps_python_literals_and_integers() {
-        assert_eq!(roundtrip("[NaN, Infinity, -Infinity]").unwrap(), "[NaN, Infinity, -Infinity]");
-        assert_eq!(roundtrip("18446744073709551616").unwrap(), "18446744073709551616");
-        assert_eq!(roundtrip("[-0, 1e400, 1.0, 2.5e-3]").unwrap(), "[0, Infinity, 1.0, 0.0025]");
-        assert_eq!(roundtrip("{\"a\": 1, \"a\": 2, \"b\": null}").unwrap(), "{\"a\": 2, \"b\": null}");
-    }
-
-    #[test]
-    fn json_rejects_what_python_rejects() {
-        for bad in ["", "01", "1.", "[1,]", "{\"a\" 1}", "\"a\u{1}\"", "\"\\x\"", "\"\\ud800\"", "\u{feff}1", "1 2", "[1"] {
-            assert!(json_loads(bad).is_none(), "{:?} should not parse", bad);
-        }
-        assert_eq!(roundtrip("\"\\ud83d\\ude00\\n\\u00e9\""), Some("\"\u{1f600}\\n\u{e9}\"".to_string()));
-    }
-
-    #[test]
-    fn py_json_loads_reports_cpython_decode_error_text() {
-        let msg = |t: &str| py_json_loads(t).unwrap_err();
-        assert_eq!(msg(""), "Expecting value: line 1 column 1 (char 0)");
-        assert_eq!(msg("{\"a\" 1}"), "Expecting ':' delimiter: line 1 column 6 (char 5)");
-        assert_eq!(msg("[1 2]"), "Expecting ',' delimiter: line 1 column 4 (char 3)");
-        assert_eq!(msg("[1,]"), "Expecting value: line 1 column 4 (char 3)");
-        assert_eq!(msg("{\"a\":1} x"), "Extra data: line 1 column 9 (char 8)");
-        assert_eq!(msg("\"abc"), "Unterminated string starting at: line 1 column 1 (char 0)");
-        assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
-        assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
-        assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn json_dumps_escapes_like_python_without_ensure_ascii() {
-        let v = json_loads("{\"k\\u0001\": \"q\\\"\\\\\\t\\u007f\u{e9}\"}").unwrap();
-        assert_eq!(json_dumps(&v), "{\"k\\u0001\": \"q\\\"\\\\\\t\u{7f}\u{e9}\"}");
-    }
-
-    #[test]
-    fn urljoin_is_python_urljoin() {
-        assert_eq!(urljoin("https://a.com/b/c/", "../../../d?q#f").unwrap(), "https://a.com/d?q#f");
-        assert_eq!(urljoin("http://a.com/x", "//b.com/y").unwrap(), "http://b.com/y");
-    }
-}
 
 // ==================== python os / pathlib / shutil helpers (file_manager) ====================
 
@@ -813,8 +791,33 @@ pub fn py_int(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
+static UNICODE_DECIMAL: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
+
+/// value of a decimal digit (category Nd) as python's int() reads it. unicode lays each run of ten digits
+/// out as 0..=9 in order, so the value is the length of the Nd run before the char, modulo ten
+fn decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - '0' as u32);
+    }
+    let is_nd = |c: char| UNICODE_DECIMAL.is_match(c.encode_utf8(&mut [0; 4]));
+    if !is_nd(c) {
+        return None;
+    }
+    let mut run = 0u32;
+    let mut cp = c as u32;
+    while let Some(prev) = cp.checked_sub(1).and_then(char::from_u32).filter(|p| is_nd(*p)) {
+        run += 1;
+        cp = prev as u32;
+    }
+    Some(run % 10)
+}
+
+/// python `int(str)`: python whitespace stripped, an optional sign, unicode decimal digits (category Nd only)
+/// with single underscores between them
 fn py_int_str(s: &str) -> Option<i64> {
-    let t = s.trim();
+    // python int() strips str.isspace() code points, which is exactly the Unicode White_Space set (char::is_whitespace)
+    let t = s.trim_matches(char::is_whitespace);
     let (negative, digits) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
         Some(b'+') => (false, &t[1..]),
@@ -827,8 +830,7 @@ fn py_int_str(s: &str) -> Option<i64> {
     const LIMIT: i128 = i64::MAX as i128 + 1;
     let mut value: i128 = 0;
     for c in digits.chars().filter(|c| *c != '_') {
-        // ASCII digits only; python also accepts other unicode decimal digits
-        let d = c.to_digit(10)? as i128;
+        let d = decimal_value(c)? as i128;
         value = (value * 10 + d).min(LIMIT);
     }
     let signed = if negative { -value } else { value };
@@ -913,7 +915,7 @@ pub fn py_normpath(s: &str) -> String {
     let (lead, rest) = if s.starts_with("//") && !s.starts_with("///") {
         ("//", &s[2..])
     } else if s.starts_with('/') {
-        ("/", &s[1..])
+        ("/", s.strip_prefix('/').unwrap_or(s))
     } else {
         ("", s)
     };
@@ -967,4 +969,87 @@ pub fn universal_newlines(s: &str) -> String {
         return s.to_string();
     }
     s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(s: &str) -> Option<String> {
+        json_loads(s).map(|v| json_dumps(&v))
+    }
+
+    #[test]
+    fn json_keeps_python_literals_and_integers() {
+        assert_eq!(roundtrip("[NaN, Infinity, -Infinity]").unwrap(), "[NaN, Infinity, -Infinity]");
+        assert_eq!(roundtrip("18446744073709551616").unwrap(), "18446744073709551616");
+        assert_eq!(roundtrip("[-0, 1e400, 1.0, 2.5e-3]").unwrap(), "[0, Infinity, 1.0, 0.0025]");
+        assert_eq!(roundtrip("{\"a\": 1, \"a\": 2, \"b\": null}").unwrap(), "{\"a\": 2, \"b\": null}");
+    }
+
+    #[test]
+    fn json_rejects_what_python_rejects() {
+        for bad in ["", "01", "1.", "[1,]", "{\"a\" 1}", "\"a\u{1}\"", "\"\\x\"", "\"\\ud800\"", "\u{feff}1", "1 2", "[1"] {
+            assert!(json_loads(bad).is_none(), "{:?} should not parse", bad);
+        }
+        assert_eq!(roundtrip("\"\\ud83d\\ude00\\n\\u00e9\""), Some("\"\u{1f600}\\n\u{e9}\"".to_string()));
+    }
+
+    #[test]
+    fn py_json_loads_reports_cpython_decode_error_text() {
+        let msg = |t: &str| py_json_loads(t).unwrap_err();
+        assert_eq!(msg(""), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\"a\" 1}"), "Expecting ':' delimiter: line 1 column 6 (char 5)");
+        assert_eq!(msg("[1 2]"), "Expecting ',' delimiter: line 1 column 4 (char 3)");
+        assert_eq!(msg("[1,]"), "Expecting value: line 1 column 4 (char 3)");
+        assert_eq!(msg("{\"a\":1} x"), "Extra data: line 1 column 9 (char 8)");
+        assert_eq!(msg("\"abc"), "Unterminated string starting at: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
+        assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
+        assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn py_int_takes_unicode_decimal_digits_like_python_int() {
+        use serde_json::json;
+        // python: int('١٢') == 12, int('٣_٤') == 34, int(' １２ ') == 12
+        assert_eq!(py_int(&json!("\u{661}\u{662}")), Some(12));
+        assert_eq!(py_int(&json!("\u{663}_\u{664}")), Some(34));
+        assert_eq!(py_int(&json!(" \u{ff11}\u{ff12} ")), Some(12));
+        assert_eq!(py_int(&json!("-\u{661}")), Some(-1));
+        // python: int('\x1c7\x1f') raises ValueError, U+001C-U+001F are not stripped by int()
+        assert_eq!(py_int(&json!("\u{1c}7\u{1f}")), None);
+        // not category Nd: vulgar fraction and superscript are rejected by int()
+        assert_eq!(py_int(&json!("\u{bd}")), None);
+        assert_eq!(py_int(&json!("\u{b2}")), None);
+        // underscores only between digits
+        assert_eq!(py_int(&json!("1__0")), None);
+        assert_eq!(py_int(&json!("_1")), None);
+        assert_eq!(py_int(&json!("1_")), None);
+        assert_eq!(py_int(&json!("")), None);
+    }
+
+    #[test]
+    fn py_json_loads_rejects_nonfinite_constants_instead_of_nulling_them() {
+        // python: json.loads('[NaN]') == [nan], json.loads('-Infinity') == -inf; a Value cannot hold them
+        assert_eq!(py_json_loads("NaN").unwrap_err(), "json.loads value NaN is not supported: python accepts it, this port cannot represent it");
+        assert_eq!(py_json_loads("[1, Infinity]").unwrap_err(), "json.loads value Infinity is not supported: python accepts it, this port cannot represent it");
+        assert_eq!(py_json_loads("{\"a\": -Infinity}").unwrap_err(), "json.loads value -Infinity is not supported: python accepts it, this port cannot represent it");
+        // python: json.loads('1e400') == inf
+        assert!(py_json_loads("[1e400]").unwrap_err().contains("Infinity"));
+        // python rejections keep python's own text
+        assert_eq!(py_json_loads("[NaN").unwrap_err(), "Expecting ',' delimiter: line 1 column 5 (char 4)");
+    }
+
+    #[test]
+    fn json_dumps_escapes_like_python_without_ensure_ascii() {
+        let v = json_loads("{\"k\\u0001\": \"q\\\"\\\\\\t\\u007f\u{e9}\"}").unwrap();
+        assert_eq!(json_dumps(&v), "{\"k\\u0001\": \"q\\\"\\\\\\t\u{7f}\u{e9}\"}");
+    }
+
+    #[test]
+    fn urljoin_is_python_urljoin() {
+        assert_eq!(urljoin("https://a.com/b/c/", "../../../d?q#f").unwrap(), "https://a.com/d?q#f");
+        assert_eq!(urljoin("http://a.com/x", "//b.com/y").unwrap(), "http://b.com/y");
+    }
 }

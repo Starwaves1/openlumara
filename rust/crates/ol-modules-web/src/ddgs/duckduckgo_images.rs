@@ -105,10 +105,7 @@ mod tests {
             p,
             vec![kv("o", "json"), kv("q", "cats"), kv("l", "us-en"), kv("vqd", "4-abc"), kv("p", "1"), kv("ct", "AT")]
         );
-        let mut args = SearchArgs::default();
-        args.timelimit = Some("m".into());
-        args.safesearch = "OFF".into();
-        args.page = 2;
+        let mut args = SearchArgs { timelimit: Some("m".into()), safesearch: "OFF".into(), page: 2, ..Default::default() };
         args.extra.insert("size".into(), "Large".into());
         let p = build_payload("cats", &args, "v").unwrap();
         assert!(p.contains(&kv("p", "-1")));
@@ -118,8 +115,7 @@ mod tests {
 
     #[test]
     fn unknown_timelimit_is_a_key_error() {
-        let mut args = SearchArgs::default();
-        args.timelimit = Some("h".into());
+        let args = SearchArgs { timelimit: Some("h".into()), ..Default::default() };
         assert!(check_timelimit(&args).is_err());
         assert!(build_payload("x", &args, "v").is_err());
     }

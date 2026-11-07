@@ -131,8 +131,7 @@ mod tests {
 
     #[test]
     fn payload_has_bing_paging_and_interval_filters() {
-        let mut args = SearchArgs::default();
-        args.page = 2;
+        let mut args = SearchArgs { page: 2, ..Default::default() };
         let p = build_payload("storm", &args).unwrap();
         assert_eq!(
             p,

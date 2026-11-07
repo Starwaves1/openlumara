@@ -64,10 +64,7 @@ mod tests {
 
     #[test]
     fn payload_and_region_cookies() {
-        let mut args = SearchArgs::default();
-        args.region = "GB-en".into();
-        args.safesearch = "on".into();
-        args.page = 2;
+        let args = SearchArgs { region: "GB-en".into(), safesearch: "on".into(), page: 2, ..Default::default() };
         let (payload, cookies) = build_payload("tea", &args).unwrap();
         assert_eq!(cookies, vec![("arc".to_string(), "gb".to_string()), ("lb".to_string(), "en".to_string())]);
         assert_eq!(payload, vec![kv("q", "tea"), kv("safe", "1"), kv("s", 11)]);

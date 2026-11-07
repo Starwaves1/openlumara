@@ -151,8 +151,7 @@ mod tests {
         let args = SearchArgs::default();
         let p = build_payload("dogs", &args).unwrap();
         assert_eq!(p, vec![kv("q", "dogs"), kv("async", "1"), kv("first", 1), kv("count", 35)]);
-        let mut args = SearchArgs::default();
-        args.page = 2;
+        let mut args = SearchArgs { page: 2, ..Default::default() };
         assert!(build_payload("dogs", &args).unwrap().contains(&kv("first", 36)));
         // the timelimit codes web_search sends (d/w/m/y) are not keys of the table: KeyError
         args.timelimit = Some("w".into());

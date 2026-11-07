@@ -100,9 +100,7 @@ mod tests {
 
     #[test]
     fn payload_paging_and_timelimit() {
-        let mut args = SearchArgs::default();
-        args.page = 3;
-        args.timelimit = Some("m".into());
+        let args = SearchArgs { page: 3, timelimit: Some("m".into()), ..Default::default() };
         let (url, payload) = build_payload("news", &args);
         assert!(url.starts_with("https://search.yahoo.com/search;_ylt="));
         assert!(url.contains(";_ylu="));

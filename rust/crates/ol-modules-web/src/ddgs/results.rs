@@ -263,7 +263,10 @@ impl Aggregator {
     }
 }
 
-static TOKEN_SPLIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\W+").unwrap());
+// python `re` `\w` on str is exactly categories Lu Ll Lt Lm Lo Nd Nl No plus "_" (verified over all code points);
+// rust's `\W` is not the same (it counts marks like U+0301 as word characters), so the class is spelled out.
+static TOKEN_SPLIT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[^\p{Lu}\p{Ll}\p{Lt}\p{Lm}\p{Lo}\p{Nd}\p{Nl}\p{No}_]+").unwrap());
 
 /// `_extract_tokens`: lower-cased words of at least three characters
 fn query_tokens(query: &str) -> Vec<String> {
@@ -395,6 +398,16 @@ mod tests {
         assert_eq!(py_getitem(&json!({"a": 1}), 1).unwrap_err().message(), "1");
         assert_eq!(py_key(&json!([1]), "query").unwrap_err().message(), "list indices must be integers or slices, not str");
         assert_eq!(normalize_url("https://a.test/x%20y z"), "https://a.test/x+y+z");
+    }
+
+    #[test]
+    fn query_tokens_split_like_python_re_word_class() {
+        // python: re.split(r'\W+', q.lower()) filtered to len >= 3 (combining marks are separators, Nd/No are word chars)
+        assert_eq!(query_tokens("abc\u{301}def"), vec!["abc", "def"]);
+        assert_eq!(query_tokens("ab_cd\u{345}efg"), vec!["ab_cd", "efg"]);
+        assert_eq!(query_tokens("caf\u{e9}-x\u{b2}abc"), vec!["caf\u{e9}", "x\u{b2}abc"]);
+        assert_eq!(query_tokens("\u{4e2d}\u{6587}abc\u{661}\u{662}\u{663}xyz"), vec!["\u{4e2d}\u{6587}abc\u{661}\u{662}\u{663}xyz"]);
+        assert_eq!(query_tokens("e\u{301}x"), Vec::<String>::new());
     }
 
     #[test]
