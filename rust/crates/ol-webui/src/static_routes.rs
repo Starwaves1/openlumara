@@ -4,6 +4,7 @@
 //! manifest, the icons and the favicon.
 
 use crate::server::{api_result, detail_response, internal_error, Shared};
+use crate::util::parse_body;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
@@ -68,6 +69,16 @@ fn has_mode(theme: &Value, mode: &str) -> Result<bool, String> {
     }
 }
 
+/// python `json.load(fh)` on a theme file (opened as utf-8): the document, or json's own error text
+fn load_theme(path: &FsPath) -> Result<Value, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    // python's json.loads on str refuses a leading byte order mark, while the bytes path drops it
+    if text.starts_with('\u{feff}') {
+        return Err("Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)".into());
+    }
+    parse_body(text.as_bytes())
+}
+
 /// python `get_themes`: every theme family (except base.json) with the modes it supports
 async fn get_themes(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
@@ -82,9 +93,7 @@ async fn get_themes(State(app): State<Arc<Shared>>) -> Response {
         }
         let family = &file_name[..file_name.len() - 5];
         let filepath = themes_dir.join(&file_name);
-        let parsed = std::fs::read_to_string(&filepath)
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()))
+        let parsed = load_theme(&filepath)
             .and_then(|data| Ok((has_mode(&data, "dark")?, has_mode(&data, "light")?)));
         match parsed {
             Ok((dark, light)) => theme_list.push(json!({"name": family, "dark": dark, "light": light})),
@@ -102,10 +111,7 @@ async fn get_theme(State(app): State<Arc<Shared>>, Path(family_name): Path<Strin
     if !filepath.exists() {
         return Json(api_result(json!(format!("Theme family '{}' not found", family_name)), false)).into_response();
     }
-    let loaded = std::fs::read_to_string(&filepath)
-        .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()));
-    match loaded {
+    match load_theme(&filepath) {
         Ok(theme) => Json(theme).into_response(),
         Err(e) => {
             ch.log(&ch.name, &format!("failed to load theme {}: {}", filepath.display(), e));
@@ -209,16 +215,25 @@ async fn manifest(State(app): State<Arc<Shared>>) -> Response {
     }
 }
 
+/// python `FileResponse(path)`: starlette stats the file when it sends it, and a missing file raises
+/// RuntimeError there, which the client sees as a plain 500 (not a 404)
+async fn serve_static_file(path: PathBuf, req: Request) -> Response {
+    if std::fs::metadata(&path).is_err() {
+        return internal_error();
+    }
+    serve_file(path, req).await
+}
+
 async fn icon_192(State(app): State<Arc<Shared>>, req: Request) -> Response {
-    serve_file(app.webui_dir.join("icon-192.png"), req).await
+    serve_static_file(app.webui_dir.join("icon-192.png"), req).await
 }
 
 async fn icon_512(State(app): State<Arc<Shared>>, req: Request) -> Response {
-    serve_file(app.webui_dir.join("icon-512.png"), req).await
+    serve_static_file(app.webui_dir.join("icon-512.png"), req).await
 }
 
 async fn favicon(State(app): State<Arc<Shared>>, req: Request) -> Response {
-    serve_file(app.webui_dir.join("favicon.ico"), req).await
+    serve_static_file(app.webui_dir.join("favicon.ico"), req).await
 }
 
 #[cfg(test)]
@@ -231,6 +246,32 @@ mod tests {
         assert_eq!(has_mode(&json!({"dark": {}}), "light"), Ok(false));
         assert_eq!(has_mode(&json!(["dark"]), "dark"), Ok(true));
         assert_eq!(has_mode(&json!(7), "dark"), Err("argument of type 'int' is not iterable".to_string()));
+    }
+
+    #[test]
+    fn theme_load_error_text_is_pythons_json_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "").unwrap();
+        // python: json.load on an empty file raises "Expecting value: line 1 column 1 (char 0)"
+        assert_eq!(load_theme(&bad), Err("Expecting value: line 1 column 1 (char 0)".to_string()));
+        let bom = dir.path().join("bom.json");
+        std::fs::write(&bom, "\u{feff}{}").unwrap();
+        assert_eq!(
+            load_theme(&bom),
+            Err("Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)".to_string())
+        );
+        let good = dir.path().join("good.json");
+        std::fs::write(&good, r#"{"dark": {}}"#).unwrap();
+        assert_eq!(load_theme(&good), Ok(json!({"dark": {}})));
+    }
+
+    #[tokio::test]
+    async fn missing_icon_is_a_plain_500_like_python_file_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = axum::http::Request::builder().body(Body::empty()).unwrap();
+        let resp = serve_static_file(dir.path().join("icon-192.png"), req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

@@ -9,7 +9,10 @@ use axum::routing::post;
 use axum::Json;
 use axum::Router;
 use ol_core::pyjson::{py_repr, truthy};
-use serde_json::{json, Value};
+use serde::ser::SerializeMap;
+use serde::{ser, Serialize, Serializer};
+use serde_json::value::RawValue;
+use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// registers `/api/system/data`, `/api/system/context_size`, `/api/system/logs` and `/api/system/restart`
@@ -38,13 +41,41 @@ pub fn py_round0(x: f64) -> i64 {
     x.round() as i64
 }
 
+/// a python int. python ints are unbounded, so it is kept as its exact decimal text (`str()` of the int)
+#[derive(Debug, PartialEq)]
+struct PyInt(String);
+
+impl PyInt {
+    /// a sign and the digits without leading zeros (python: `int("-0012")` is `-12`, `int("-0")` is `0`)
+    fn from_digits(negative: bool, digits: &str) -> PyInt {
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            PyInt("0".into())
+        } else if negative {
+            PyInt(format!("-{digits}"))
+        } else {
+            PyInt(digits.to_string())
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0 == "0"
+    }
+
+    /// the nearest float, which is what the percentage needs (python's int / int is correctly rounded too)
+    fn as_f64(&self) -> f64 {
+        self.0.parse().unwrap_or(f64::NAN)
+    }
+}
+
 /// python `int(value)` for a config value. the error is python's `str(e)` for the TypeError or ValueError
-fn py_int(v: &Value) -> Result<i64, String> {
+fn py_int(v: &Value) -> Result<PyInt, String> {
     match v {
-        Value::Bool(b) => Ok(i64::from(*b)),
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => Ok(i),
-            None => py_int_from_float(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Bool(b) => Ok(PyInt::from_digits(false, if *b { "1" } else { "0" })),
+        Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => Ok(PyInt::from_digits(i < 0, &i.unsigned_abs().to_string())),
+            (None, Some(u)) => Ok(PyInt::from_digits(false, &u.to_string())),
+            (None, None) => py_int_from_float(n.as_f64().unwrap_or(f64::NAN)),
         },
         Value::String(s) => py_int_from_str(s).ok_or_else(|| format!("invalid literal for int() with base 10: {}", py_repr(v))),
         Value::Null => Err("int() argument must be a string, a bytes-like object or a real number, not 'NoneType'".into()),
@@ -54,18 +85,20 @@ fn py_int(v: &Value) -> Result<i64, String> {
 }
 
 /// python `int(float)`: truncates toward zero, and nan / infinity raise
-fn py_int_from_float(f: f64) -> Result<i64, String> {
+fn py_int_from_float(f: f64) -> Result<PyInt, String> {
     if f.is_nan() {
         return Err("cannot convert float NaN to integer".into());
     }
     if f.is_infinite() {
         return Err("cannot convert float infinity to integer".into());
     }
-    Ok(f.trunc() as i64)
+    let t = f.trunc();
+    // `{:.0}` prints the float's exact value, so 1e30 gives every digit python's int(1e30) has
+    Ok(PyInt::from_digits(t < 0.0, &format!("{:.0}", t.abs())))
 }
 
 /// python `int(str)`: surrounding whitespace, an optional sign, and digits with single underscores between them
-fn py_int_from_str(s: &str) -> Option<i64> {
+fn py_int_from_str(s: &str) -> Option<PyInt> {
     let t = s.trim();
     let (negative, body) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -75,12 +108,33 @@ fn py_int_from_str(s: &str) -> Option<i64> {
     if parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
         return None;
     }
-    let n: i64 = parts.concat().parse().ok()?;
-    if negative {
-        n.checked_neg()
-    } else {
-        Some(n)
+    Some(PyInt::from_digits(negative, &parts.concat()))
+}
+
+/// the context breakdown as python's `api_result(size)` writes it: `max_context` first, as python's exact int
+/// text (which can be wider than i64), then the other keys in the order they were added
+struct ContextBody {
+    max_context: PyInt,
+    breakdown: Map<String, Value>,
+}
+
+impl Serialize for ContextBody {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let max_context = RawValue::from_string(self.max_context.0.clone()).map_err(<S::Error as ser::Error>::custom)?;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("max_context", &*max_context)?;
+        for (key, value) in self.breakdown.iter().filter(|(key, _)| key.as_str() != "max_context") {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
+}
+
+/// `api_result(size)` for the context route
+#[derive(Serialize)]
+struct ContextEnvelope {
+    data: ContextBody,
+    success: bool,
 }
 
 /// python `float(value)` for a truthy config value; None where python raises
@@ -145,14 +199,13 @@ async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let max_raw = ol_core::config::get(&["api", "max_context"]).unwrap_or(Value::Null);
     let max_context = match py_int(&max_raw) {
-        Ok(0) => return failure("division by zero".into()),
+        Ok(n) if n.is_zero() => return failure("division by zero".into()),
         Ok(n) => n,
         Err(message) => return failure(message),
     };
     let mut size = ch.context.get_size().await;
     let total = size["total_tokens"].as_i64().unwrap_or(0);
-    size["max_context"] = json!(max_context);
-    size["percent_full"] = json!(py_round0((total as f64 / max_context as f64) * 100.0));
+    size["percent_full"] = json!(py_round0((total as f64 / max_context.as_f64()) * 100.0));
 
     // python: `round(float(threshold) * 100, 1)` outside any try, so a non-numeric or non-finite stored value is an unhandled error (500)
     let raw_threshold = ol_core::config::get(&["model", "context_compression_threshold"]).unwrap_or(Value::Null);
@@ -160,7 +213,8 @@ async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
     size["compression_threshold"] = json!(percent);
     let auto = ol_core::config::get(&["model", "automatically_compress_context"]).unwrap_or(Value::Null);
     size["auto_compress"] = json!(truthy(&auto));
-    reply(size)
+    let Value::Object(breakdown) = size else { return internal_error() };
+    Json(ContextEnvelope { data: ContextBody { max_context, breakdown }, success: true }).into_response()
 }
 
 /// python `get_logs`: `api_result(channel.logs)`, each entry `{"category", "message"}`
@@ -181,8 +235,8 @@ async fn system_restart(State(app): State<Arc<Shared>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{compression_threshold_percent, py_float, py_int, py_round0, py_round1};
-    use serde_json::{json, Value};
+    use super::{compression_threshold_percent, py_float, py_int, py_round0, py_round1, ContextBody, ContextEnvelope, PyInt};
+    use serde_json::{json, Map, Value};
 
     #[test]
     fn py_round1_rounds_the_exact_binary_value_like_python() {
@@ -214,12 +268,43 @@ mod tests {
 
     #[test]
     fn py_int_accepts_what_python_int_accepts_and_reports_its_errors() {
-        assert_eq!(py_int(&json!("16768")), Ok(16768));
-        assert_eq!(py_int(&json!(" 1_000 ")), Ok(1000));
-        assert_eq!(py_int(&json!(16768.9)), Ok(16768));
-        assert_eq!(py_int(&json!(true)), Ok(1));
+        assert_eq!(py_int(&json!("16768")), Ok(PyInt("16768".into())));
+        assert_eq!(py_int(&json!(" 1_000 ")), Ok(PyInt("1000".into())));
+        assert_eq!(py_int(&json!(16768.9)), Ok(PyInt("16768".into())));
+        assert_eq!(py_int(&json!(true)), Ok(PyInt("1".into())));
         assert_eq!(py_int(&json!("1__0")), Err("invalid literal for int() with base 10: '1__0'".to_string()));
         assert_eq!(py_int(&Value::Null), Err("int() argument must be a string, a bytes-like object or a real number, not 'NoneType'".to_string()));
+    }
+
+    #[test]
+    fn py_int_keeps_every_digit_python_would_keep() {
+        // python: int("99999999999999999999999") is exact, and int("-0012") is -12
+        assert_eq!(py_int(&json!("99999999999999999999999")), Ok(PyInt("99999999999999999999999".into())));
+        assert_eq!(py_int(&json!("-0012")), Ok(PyInt("-12".into())));
+        assert_eq!(py_int(&json!("-0")), Ok(PyInt("0".into())));
+        assert!(py_int(&json!("-0")).unwrap().is_zero());
+        // python: int(1e30) is the float's exact value, 1000000000000000019884624838656
+        assert_eq!(py_int(&json!(1e30)), Ok(PyInt("1000000000000000019884624838656".into())));
+        // a JSON integer beyond i64 but within u64 is kept exactly as well
+        assert_eq!(py_int(&json!(18446744073709551615u64)), Ok(PyInt("18446744073709551615".into())));
+        assert_eq!(py_int(&json!(-9223372036854775808i64)), Ok(PyInt("-9223372036854775808".into())));
+    }
+
+    #[test]
+    fn context_body_writes_python_exact_max_context_first() {
+        // python: {"data": {"max_context": <int>, "total_tokens": 5, ...}, "success": true}
+        let mut breakdown = Map::new();
+        breakdown.insert("max_context".into(), json!(16768));
+        breakdown.insert("total_tokens".into(), json!(5));
+        breakdown.insert("percent_full".into(), json!(0));
+        let envelope = ContextEnvelope {
+            data: ContextBody { max_context: PyInt("99999999999999999999999".into()), breakdown },
+            success: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            r#"{"data":{"max_context":99999999999999999999999,"total_tokens":5,"percent_full":0},"success":true}"#
+        );
     }
 
     #[test]

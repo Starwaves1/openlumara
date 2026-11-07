@@ -1394,6 +1394,30 @@ async fn system_context_size_appends_threshold_percent_and_auto_compress_last() 
 }
 
 #[tokio::test]
+async fn system_context_size_writes_a_max_context_wider_than_i64_exactly() {
+    let h = harness(false).await;
+    ol_core::config::update(|m| {
+        m.insert("api".into(), json!({"max_context": "99999999999999999999999"}));
+        m.insert("model".into(), json!({"context_compression_threshold": 0.25, "automatically_compress_context": false}));
+    });
+    let resp = h.get("/api/system/context_size").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    // python: int("99999999999999999999999") is exact, so the answer carries those digits and percent_full is 0
+    assert!(resp.body.starts_with(r#"{"data":{"max_context":99999999999999999999999,"total_tokens":"#), "{}", resp.body);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true));
+    assert_eq!(body["data"]["percent_full"], json!(0));
+}
+
+#[tokio::test]
+async fn system_context_size_reports_a_zero_max_context_as_python_does() {
+    let h = harness(false).await;
+    system_config(0, 0.25, false);
+    let resp = h.get("/api/system/context_size").await;
+    assert_eq!(resp.json(), json!({"data": "division by zero", "success": false}));
+}
+
+#[tokio::test]
 async fn system_logs_lists_each_logged_entry_as_category_and_message() {
     let h = harness(false).await;
     // the webui channel's on_log hook fills this buffer; the harness does not run that hook, so fill it directly
