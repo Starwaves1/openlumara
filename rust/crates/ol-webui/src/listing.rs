@@ -5,7 +5,8 @@
 use crate::util::{html_escape, py_int_str, py_strip, py_type_name};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use ol_core::pyjson::truthy;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use std::cmp::Ordering;
 
 /// the only chat fields list endpoints send
 pub const CHAT_LIST_FIELDS: [&str; 8] = ["id", "title", "category", "tags", "created", "updated", "messages_found", "message_snippets"];
@@ -282,12 +283,100 @@ pub fn group_key(updated: &str, tz_offset_min: i64) -> Result<String, String> {
     group_key_at(updated, tz_offset_min, utcnow())
 }
 
-/// `chat.get("updated", "")` as a string
+/// `chat.get("updated", "")` as a string, non-strings coerced to ""
 pub fn updated_of(chat: &Value) -> String {
     match chat.get("updated") {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
     }
+}
+
+/// `chat.get("updated", "")` as `_local_day` receives it: a falsy value is "", a string is itself,
+/// and any other truthy value makes python's `datetime.fromisoformat` raise TypeError
+pub fn updated_strict(chat: &Value) -> Result<String, String> {
+    match chat.get("updated") {
+        None => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(v) if !truthy(v) => Ok(String::new()),
+        Some(other) => Err(format!("fromisoformat: argument must be str, not {}", py_type_name(other))),
+    }
+}
+
+/// python `a < b` over json values; Err where python raises TypeError
+fn py_lt(a: &Value, b: &Value) -> Result<bool, String> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Ok(x < y),
+        (Value::Array(x), Value::Array(y)) => {
+            for (p, q) in x.iter().zip(y.iter()) {
+                if !py_eq(p, q) {
+                    return py_lt(p, q);
+                }
+            }
+            Ok(x.len() < y.len())
+        }
+        _ => match (num_of(a), num_of(b)) {
+            (Some(x), Some(y)) => Ok(x < y),
+            _ => Err(format!(
+                "'<' not supported between instances of '{}' and '{}'",
+                py_type_name(a),
+                py_type_name(b)
+            )),
+        },
+    }
+}
+
+/// python `==` over json values (bool and numbers compare by value)
+fn py_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| py_eq(p, q)),
+        _ => match (num_of(a), num_of(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => a == b,
+        },
+    }
+}
+
+/// python number value of an int/float/bool
+fn num_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
+/// python `sorted(data, key=lambda c: c.get("updated", ""), reverse=True)` over the chat index.
+/// Err where python's sort raises TypeError (incomparable `updated` values, or a non-dict chat)
+pub fn sorted_updated_desc(data: Vec<Value>) -> Result<Vec<Value>, String> {
+    let mut keyed = Vec::with_capacity(data.len());
+    for chat in data {
+        let key = match &chat {
+            Value::Object(map) => map.get("updated").cloned().unwrap_or_else(|| json!("")),
+            other => return Err(format!("'{}' object has no attribute 'get'", py_type_name(other))),
+        };
+        keyed.push((key, chat));
+    }
+    let mut failure: Option<String> = None;
+    keyed.sort_by(|(ka, _), (kb, _)| {
+        let mut less = |x: &Value, y: &Value| match py_lt(x, y) {
+            Ok(v) => v,
+            Err(e) => {
+                failure.get_or_insert(e);
+                false
+            }
+        };
+        if less(kb, ka) {
+            Ordering::Less
+        } else if less(ka, kb) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    Ok(keyed.into_iter().map(|(_, chat)| chat).collect())
 }
 
 /// python `item in (chat.get("tags") or [])`
@@ -362,6 +451,44 @@ mod tests {
 
     fn at(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn updated_strict_follows_local_day_inputs() {
+        assert_eq!(updated_strict(&json!({})).unwrap(), "");
+        assert_eq!(updated_strict(&json!({"updated": null})).unwrap(), "");
+        assert_eq!(updated_strict(&json!({"updated": 0})).unwrap(), "");
+        assert_eq!(updated_strict(&json!({"updated": "2026-01-02T03:04:05"})).unwrap(), "2026-01-02T03:04:05");
+        // a truthy non-string reaches fromisoformat, which raises TypeError in python
+        assert!(updated_strict(&json!({"updated": 5})).is_err());
+        assert!(updated_strict(&json!({"updated": ["x"]})).is_err());
+    }
+
+    #[test]
+    fn sorted_updated_desc_orders_strings_and_numbers_like_python() {
+        let data = vec![
+            json!({"id": "a", "updated": "2026-01-01T00:00:00"}),
+            json!({"id": "b", "updated": "2026-03-01T00:00:00"}),
+            json!({"id": "c"}),
+        ];
+        let ids: Vec<String> = sorted_updated_desc(data).unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids, vec!["b", "a", "c"]);
+
+        // numbers sort numerically, not as empty strings
+        let nums = vec![json!({"id": "x", "updated": 1}), json!({"id": "y", "updated": 3}), json!({"id": "z", "updated": 2})];
+        let ids: Vec<String> = sorted_updated_desc(nums).unwrap().iter().map(|c| c["id"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ids, vec!["y", "z", "x"]);
+    }
+
+    #[test]
+    fn sorted_updated_desc_raises_where_python_compares_incomparable_values() {
+        // str vs None: python's sort raises TypeError, so every listing 500s
+        let mixed = vec![json!({"updated": "2026-01-01"}), json!({"updated": null})];
+        assert!(sorted_updated_desc(mixed).is_err());
+        // a lone chat is never compared, so it sorts fine
+        assert!(sorted_updated_desc(vec![json!({"updated": null})]).is_ok());
+        // str vs int in the index also raises
+        assert!(sorted_updated_desc(vec![json!({"updated": "x"}), json!({"updated": 4})]).is_err());
     }
 
     #[test]

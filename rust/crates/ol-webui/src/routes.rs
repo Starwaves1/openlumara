@@ -5,8 +5,8 @@
 //! `server::api_result`, and a python exception that would reach starlette becomes the plain 500.
 
 use crate::listing::{
-    chats_for_category, day_label_from_key, group_key, highlight_query, local_day, project_chat, updated_of,
-    validate_category_format, validate_category_name,
+    chats_for_category, day_label_from_key, group_key, highlight_query, local_day, project_chat, sorted_updated_desc,
+    updated_of, updated_strict, validate_category_format, validate_category_name,
 };
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
@@ -124,9 +124,14 @@ fn category_filter(raw: Option<&str>) -> Option<&str> {
     raw.filter(|c| !c.is_empty())
 }
 
+/// python `chat_store.get_all()`: the index sorted by `updated`, newest first (TypeError as Err)
+fn all_chats(ch: &Channel) -> Result<Vec<Value>, String> {
+    sorted_updated_desc(ch.chat.data())
+}
+
 /// python `_chats_for_category(category, tags)` over `get_all()`
 fn chats_in(ch: &Channel, category: Option<&str>, tags: &[String]) -> Result<Vec<Value>, String> {
-    let all = ch.chat.get_all();
+    let all = all_chats(ch)?;
     chats_for_category(&all, category, tags).map(|v| v.into_iter().cloned().collect())
 }
 
@@ -140,7 +145,7 @@ fn page_of(chats: &[Value], offset: i64, limit: i64) -> (Vec<Value>, bool) {
 fn group_counts(chats: &[Value], tz: i64) -> Result<IndexMap<String, (i64, String)>, String> {
     let mut groups: IndexMap<String, (i64, String)> = IndexMap::new();
     for chat in chats {
-        let updated = updated_of(chat);
+        let updated = updated_strict(chat)?;
         let key = group_key(&updated, tz)?;
         let day = local_day(&updated, tz)?;
         let entry = groups.entry(key).or_insert((0, String::new()));
@@ -267,6 +272,10 @@ async fn chat_load(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>) 
 
 async fn chat_current(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
+    // python `chat.get()` raises 'No chat is currently loaded!' when nothing is loaded
+    if ch.chat.current().is_none() {
+        return internal_error();
+    }
     reply(chat_with_details(&ch).await, true)
 }
 
@@ -277,7 +286,14 @@ async fn stream_state(State(app): State<Arc<Shared>>) -> Response {
 async fn chat_export(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let Ok(content) = ch.chat.export().await else { return internal_error() };
-    let title = ch.chat.get_str("title").unwrap_or_default();
+    // python `chat.get("title") or ""` fed to re.sub: a truthy non-string title raises TypeError
+    let title = match ch.chat.get("title") {
+        Some(v) if truthy(&v) => match v {
+            Value::String(s) => s,
+            _ => return internal_error(),
+        },
+        _ => String::new(),
+    };
     reply(json!({"content": content, "filename": export_filename(&title)}), true)
 }
 
@@ -290,9 +306,10 @@ async fn get_chats(State(app): State<Arc<Shared>>, RawQuery(raw): RawQuery) -> R
     let q = QueryParams::parse(raw.as_deref());
     let (Some(offset), Some(limit)) = (q.int("offset", 0), q.int("limit", 50)) else { return internal_error() };
     let category = category_filter(q.get("category"));
+    let Ok(sorted) = all_chats(&ch) else { return internal_error() };
     let all = match category {
-        Some(c) => ch.chat.get_all().into_iter().filter(|x| x.get("category") == Some(&json!(c))).collect(),
-        None => ch.chat.get_all(),
+        Some(c) => sorted.into_iter().filter(|x| x.get("category") == Some(&json!(c))).collect(),
+        None => sorted,
     };
     let (page, has_more) = page_of(&all, offset, limit);
     let messages: Vec<Value> = page.iter().map(|c| project_chat(c, &[])).collect();
@@ -330,10 +347,9 @@ async fn get_chats_for_day(State(app): State<Arc<Shared>>, RawQuery(raw): RawQue
 
     let mut day_chats = Vec::new();
     for chat in chats {
-        match group_key(&updated_of(&chat), tz) {
-            Ok(key) if key == day => day_chats.push(chat),
-            Ok(_) => {}
-            Err(_) => return internal_error(),
+        let Ok(key) = updated_strict(&chat).and_then(|updated| group_key(&updated, tz)) else { return internal_error() };
+        if key == day {
+            day_chats.push(chat);
         }
     }
     let (page, has_more) = page_of(&day_chats, offset, limit);

@@ -404,6 +404,7 @@ async fn trailing_slash_variants_redirect_with_307_like_starlette() {
 #[tokio::test]
 async fn percent_encoded_paths_route_on_the_decoded_path_like_python() {
     let h = harness_with_probe().await;
+    h.ch.chat.new_chat("general", "Encoded", None).await;
     // "%61" is "a": starlette sees /api/chat/current and /api/ext/probe/ping
     assert_eq!(h.get("/%61pi/chat/current").await.json(), h.get("/api/chat/current").await.json());
     assert_eq!(h.get("/api/ext/%70robe/ping").await.json(), json!({"data": "pong", "success": true}));
@@ -490,6 +491,48 @@ async fn chat_export_falls_back_to_chat_export_for_a_blank_title() {
     h.ch.chat.new_chat("general", "   ", None).await;
     let body = h.get("/api/chat/export").await.json();
     assert_eq!(body, json!({"data": {"content": "", "filename": "chat-export.txt"}, "success": true}));
+}
+
+#[tokio::test]
+async fn chat_current_without_a_loaded_chat_is_the_plain_500() {
+    // a fresh channel has no chat loaded
+    let h = harness(false).await;
+    assert!(h.ch.chat.current().is_none());
+    let resp = h.get("/api/chat/current").await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.body, "Internal Server Error");
+}
+
+#[tokio::test]
+async fn chat_export_of_a_truthy_non_string_title_is_the_plain_500() {
+    let h = harness(false).await;
+    let id = h.ch.chat.new_chat("general", "placeholder", None).await;
+    h.ch.chat.with_data_mut(|data| {
+        for chat in data.iter_mut().filter(|c| c["id"] == json!(id)) {
+            chat["title"] = json!(42);
+        }
+    });
+    let resp = h.get("/api/chat/export").await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // a falsy non-string title is the blank-title fallback, as in python `or ""`
+    h.ch.chat.with_data_mut(|data| {
+        for chat in data.iter_mut().filter(|c| c["id"] == json!(id)) {
+            chat["title"] = json!(0);
+        }
+    });
+    let body = h.get("/api/chat/export").await.json();
+    assert_eq!(body["data"]["filename"], json!("chat-export.txt"));
+}
+
+#[tokio::test]
+async fn chat_listings_500_on_corrupt_updated_values_like_python() {
+    let h = harness(false).await;
+    chat_at(&h, "general", "Fine", "2026-01-01T10:00:00", &[]).await;
+    h.ch.chat.with_data_mut(|data| data.push(json!({"id": "broken", "title": "x", "category": "general", "updated": 7})));
+    // python sorts the index first, then the day grouping raises on the numeric 'updated'
+    assert_eq!(h.get("/api/chats?offset=0&limit=5").await.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(h.get("/api/chats/days?tz_offset=0").await.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(h.get("/api/chats/day?day=2026-01-01&tz_offset=0").await.status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]
