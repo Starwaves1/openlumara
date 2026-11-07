@@ -13,6 +13,7 @@ pub mod token_threshold;
 pub mod tutorial;
 pub mod util;
 pub mod webui_extension_example;
+pub mod writing_style;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
 
@@ -125,5 +126,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: docs::meta::UNSAFE,
         category: docs::meta::CATEGORY,
         factory: docs::Docs::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "writing_style",
+        class_name: writing_style::meta::CLASS_NAME,
+        doc: writing_style::meta::DOC,
+        settings: writing_style::meta::settings,
+        unsafe_: writing_style::meta::UNSAFE,
+        category: writing_style::meta::CATEGORY,
+        factory: writing_style::WritingStyle::factory,
     });
 }

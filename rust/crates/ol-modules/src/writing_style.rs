@@ -4,15 +4,20 @@ use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase};
 use ol_core::pyjson::{py_str, truthy};
 use serde_json::Value;
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/writing_style.rs"]
-pub(crate) mod meta;
+pub mod meta;
 
 pub struct WritingStyle {
     base: ModuleBase,
 }
 
 impl WritingStyle {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base }
     }
@@ -273,5 +278,43 @@ mod tests {
         cfg.insert("mood".into(), json!("custom"));
         // flair None -> a space is appended to the last constraint (verified against python)
         assert_eq!(build_prompt(&cfg).unwrap(), "- Style: Messaging app (Telegram/Discord). \n- Mood: Annoyed at user for not specifying a custom mood");
+    }
+
+    #[test]
+    fn custom_fields_fall_back_like_python_or() {
+        // python: self.config.get("custom_writing_flair") or "Not sure" (empty/None -> fallback)
+        let mut cfg = defaults();
+        cfg.insert("writing_flair".into(), json!("custom"));
+        cfg.insert("custom_writing_flair".into(), json!("Yarr"));
+        cfg.insert("desire".into(), json!("custom"));
+        cfg.insert("custom_desire".into(), json!(""));
+        assert_eq!(build_prompt(&cfg).unwrap(), "- Yarr\n- Desire: Not sure");
+    }
+
+    #[test]
+    fn forbid_flags_and_markdown_precedence() {
+        // python: tables/headers are only checked when markdown is NOT forbidden
+        let mut cfg = defaults();
+        cfg.insert("forbid_em_dash".into(), json!(true));
+        cfg.insert("forbid_markdown".into(), json!(true));
+        cfg.insert("forbid_tables".into(), json!(true));
+        cfg.insert("forbid_headers".into(), json!(true));
+        cfg.insert("forbid_relentless_praise".into(), json!(true));
+        cfg.insert("forbid_negative_parallelism".into(), json!(true));
+        assert_eq!(
+            build_prompt(&cfg).unwrap(),
+            "- Don't use `—`, use `-` instead\n- Don't use markdown\n- No negative parallelism (e.g., 'Not just X, but Y').\n- No excessive user praise (e.g., 'You're absolutely right!')."
+        );
+        let mut cfg = defaults();
+        cfg.insert("forbid_tables".into(), json!(true));
+        cfg.insert("forbid_headers".into(), json!(true));
+        assert_eq!(build_prompt(&cfg).unwrap(), "- No tables\n- No headers");
+    }
+
+    #[test]
+    fn header_and_registration_metadata() {
+        assert_eq!(meta::HEADER, Some("STYLE CONSTRAINTS"));
+        assert_eq!(meta::CLASS_NAME, "WritingStyle");
+        assert_eq!(meta::CATEGORY, "creative");
     }
 }
