@@ -537,9 +537,9 @@ mod tests {
 
     #[test]
     fn chat_metadata_character_flag_and_python_errors() {
-        assert_eq!(metadata_has_character(Some(serde_json::json!({"character": "Ann"}))).unwrap(), true);
-        assert_eq!(metadata_has_character(Some(serde_json::json!({"character": ""}))).unwrap(), false);
-        assert_eq!(metadata_has_character(Some(serde_json::json!({}))).unwrap(), false);
+        assert!(metadata_has_character(Some(serde_json::json!({"character": "Ann"}))).unwrap());
+        assert!(!metadata_has_character(Some(serde_json::json!({"character": ""}))).unwrap());
+        assert!(!metadata_has_character(Some(serde_json::json!({}))).unwrap());
         assert_eq!(metadata_has_character(None).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
         assert_eq!(
             metadata_has_character(Some(serde_json::json!("s"))).unwrap_err().to_string(),

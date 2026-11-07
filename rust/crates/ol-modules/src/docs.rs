@@ -56,21 +56,25 @@ impl Docs {
             .collect()
     }
 
-    /// python `_get_folder_path(folder)` for a folder argument that may be None (a JSON null). A None
-    /// folder fails on the first configured entry at `folder.rstrip()`, and is not found without entries.
-    fn folder_path_of(&self, folder: Option<&str>) -> anyhow::Result<Option<String>> {
+    /// python `_get_folder_path(folder)` for a folder argument as `py_arg` yields it. A folder that is not
+    /// a str fails at `folder.rstrip()` on the first configured entry, and is not found without entries.
+    fn folder_path_of(&self, folder: &PyArg) -> anyhow::Result<Option<String>> {
         match folder {
-            Some(f) => self.get_folder_path(f),
-            None => {
-                if let Some(first) = self.folder_items()?.first() {
-                    if first.as_str().is_none() {
-                        anyhow::bail!("'{}' object has no attribute 'rstrip'", util::py_type_name(first));
-                    }
-                    anyhow::bail!("'NoneType' object has no attribute 'rstrip'");
-                }
-                Ok(None)
-            }
+            Ok(Some(f)) => self.get_folder_path(f),
+            Ok(None) => self.non_str_folder_path(util::py_type_name(&Value::Null)),
+            Err(v) => self.non_str_folder_path(util::py_type_name(v)),
         }
+    }
+
+    fn non_str_folder_path(&self, type_name: &str) -> anyhow::Result<Option<String>> {
+        // the first iteration calls f.rstrip() on the entry, then folder.rstrip() on the argument
+        if let Some(first) = self.folder_items()?.first() {
+            if first.as_str().is_none() {
+                anyhow::bail!("'{}' object has no attribute 'rstrip'", util::py_type_name(first));
+            }
+            anyhow::bail!("'{}' object has no attribute 'rstrip'", type_name);
+        }
+        Ok(None)
     }
 
     /// resolves a folder basename to its full path
@@ -118,12 +122,17 @@ fn strip_folder(path: &str, folder: &str) -> String {
     }
 }
 
-/// a required string argument as python sees it: None for a JSON null (ToolArgs::str drops nulls, so
-/// they would otherwise read as ''), and '' for an absent key
-fn py_arg(args: &ToolArgs, key: &str) -> Option<String> {
+/// a required argument as python holds it: Ok(None) for a JSON null (python None), Ok(Some) for a str
+/// (an absent key reads as ''), and Err(value) for any other JSON value. Python cannot call str methods on
+/// those, so the caller raises the AttributeError or TypeError that python would, with that value's type.
+type PyArg = Result<Option<String>, Value>;
+
+fn py_arg(args: &ToolArgs, key: &str) -> PyArg {
     match args.0.get(key) {
-        Some(Value::Null) => None,
-        _ => Some(args.str(key).unwrap_or_default()),
+        None => Ok(Some(String::new())),
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(other.clone()),
     }
 }
 
@@ -182,10 +191,15 @@ impl Module for Docs {
             "get_topics" => Ok(self.base.result(json!(self.get_folder_names()?), true)),
             "list" => {
                 let folder = py_arg(&args, "folder");
-                let folder_name = folder.clone().unwrap_or_else(|| "None".to_string());
+                // python f"Folder '{folder}'" shows str(folder) for every value
+                let folder_name = match &folder {
+                    Ok(Some(f)) => f.clone(),
+                    Ok(None) => "None".to_string(),
+                    Err(v) => py_str(v),
+                };
                 let subfolder = args.str("subfolder");
                 let attempt = || -> Result<(Vec<String>, Vec<String>), Result<String, String>> {
-                    let folder_path = self.folder_path_of(folder.as_deref()).map_err(|e| Err(e.to_string()))?;
+                    let folder_path = self.folder_path_of(&folder).map_err(|e| Err(e.to_string()))?;
                     let Some(folder_path) = folder_path.filter(|p| !p.is_empty()) else {
                         return Err(Ok(format!("Folder '{}' does not exist within the docs module configuration.", folder_name)));
                     };
@@ -204,14 +218,18 @@ impl Module for Docs {
             "read" => {
                 let folder = py_arg(&args, "folder");
                 let path = py_arg(&args, "path");
-                let folder_path = self.folder_path_of(folder.as_deref())?;
-                // python `path.startswith(folder)` runs before the folder check: a None path fails on the
-                // attribute lookup, and a None folder fails as the argument of startswith
-                let Some(path) = path else {
-                    anyhow::bail!("'NoneType' object has no attribute 'startswith'");
+                let folder_path = self.folder_path_of(&folder)?;
+                // python `path.startswith(folder)` runs before the folder check: a non-str path fails on the
+                // attribute lookup, and a non-str folder fails as the argument of startswith
+                let path = match path {
+                    Ok(Some(p)) => p,
+                    Ok(None) => anyhow::bail!("'NoneType' object has no attribute 'startswith'"),
+                    Err(v) => anyhow::bail!("'{}' object has no attribute 'startswith'", util::py_type_name(&v)),
                 };
-                let Some(folder) = folder else {
-                    anyhow::bail!("startswith first arg must be str or a tuple of str, not NoneType");
+                let folder = match folder {
+                    Ok(Some(f)) => f,
+                    Ok(None) => anyhow::bail!("startswith first arg must be str or a tuple of str, not NoneType"),
+                    Err(v) => anyhow::bail!("startswith first arg must be str or a tuple of str, not {}", util::py_type_name(&v)),
                 };
                 let path = strip_folder(&path, &folder);
                 let Some(folder_path) = folder_path.filter(|p| !p.is_empty()) else {
@@ -369,6 +387,32 @@ mod tests {
         let out = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": "missing.md"})))).unwrap();
         assert_eq!(out["status"], "error");
         assert!(out["content"].as_str().unwrap().starts_with("[Errno 2] No such file or directory: "), "{}", out);
+    }
+
+    #[test]
+    fn non_str_arguments_raise_the_python_error_text() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // python read(): _get_folder_path(folder) runs first, so a non-str folder fails at folder.rstrip()
+        // when the config has entries
+        let (m, _dir) = setup(true);
+        let err = block_on(m.call_tool("read", args(json!({"folder": 5, "path": "a.md"})))).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'rstrip'");
+        // then path.startswith(folder): a non-str path fails on the attribute lookup
+        let err = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": 5})))).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'startswith'");
+        let err = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": false})))).unwrap_err();
+        assert_eq!(err.to_string(), "'bool' object has no attribute 'startswith'");
+
+        // with no configured folders the folder is never rstripped, so python reaches startswith(folder)
+        let _ = install_config(json!([]), true);
+        let err = block_on(m.call_tool("read", args(json!({"folder": 7, "path": "a.md"})))).unwrap_err();
+        assert_eq!(err.to_string(), "startswith first arg must be str or a tuple of str, not int");
+        let err = block_on(m.call_tool("read", args(json!({"folder": "x", "path": 1.5})))).unwrap_err();
+        assert_eq!(err.to_string(), "'float' object has no attribute 'startswith'");
+
+        // list with no folders is not an error in python: it reports the not-found text with str(folder)
+        let out = block_on(m.call_tool("list", args(json!({"folder": 7})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "Folder '7' does not exist within the docs module configuration."}));
     }
 
     #[test]

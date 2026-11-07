@@ -36,7 +36,7 @@ fn unicode_escape(b: &[u8], i: usize) -> Option<u32> {
 /// python's json accepts NaN, Infinity and -Infinity outside strings; each is rewritten to `0.0`, a float that
 /// python's flatten loop also treats as neither str, list nor dict
 fn non_json_literal(b: &[u8], i: usize) -> Option<(usize, &'static str)> {
-    let after_ok = |j: usize| b.get(j).map_or(true, |n| b" \t\r\n,]}".contains(n));
+    let after_ok = |j: usize| b.get(j).is_none_or(|n| b" \t\r\n,]}".contains(n));
     for t in [&b"-Infinity"[..], b"Infinity", b"NaN"] {
         if b[i..].starts_with(t) && after_ok(i + t.len()) {
             return Some((t.len(), "0.0"));
@@ -114,7 +114,7 @@ fn py_json_compat(src: &str) -> String {
             out.push(c);
             i += 1;
         } else {
-            let before_ok = out.last().map_or(true, |p| b" \t\r\n[,:".contains(p));
+            let before_ok = out.last().is_none_or(|p| b" \t\r\n[,:".contains(p));
             let rewrite = if before_ok { non_json_literal(b, i).or_else(|| out_of_range_number(b, i)) } else { None };
             match rewrite {
                 Some((len, rep)) => {

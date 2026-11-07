@@ -56,6 +56,7 @@ pub fn settings() -> Value {
 /// host's TZif files (python's `available_timezones()`) plus chrono-tz's compiled list, which keeps the
 /// built-in zones available on hosts without tzdata.
 fn timezone_options() -> Value {
+    // one sorted, duplicate-free set over both sources, so chrono-only names sit in sorted position too
     let mut names = host_zone_names();
     names.extend(chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name().to_string()));
     let mut options = Map::new();
@@ -307,7 +308,7 @@ fn parse_tzif_block(
         .collect();
     let abbr_chars = &body[types_end..types_end + chars];
     let mut all_types = Vec::with_capacity(types);
-    for b in body[idx_end..types_end].chunks_exact(6) {
+    for b in body[idx_end..types_end].as_chunks::<6>().0 {
         let rest = abbr_chars.get(b[5] as usize..).ok_or_else(|| invalid_tzif("bad abbreviation index"))?;
         let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
         all_types.push(TzType {
@@ -1119,5 +1120,35 @@ mod tests {
         assert!(!opts.contains_key("posixrules"));
         assert!(!opts.contains_key("zone.tab"));
         assert!(!opts.keys().any(|k| k.starts_with("LinkDir")));
+    }
+
+    #[test]
+    fn timezone_options_are_local_then_every_zone_sorted_and_unique() {
+        let _g = crate::util::CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // python: TIMEZONES = {"local": ...} then update() with sorted(available_timezones()), so "local"
+        // is first and the zone names follow in code-point order with no repeats
+        let dir = std::env::temp_dir().join(format!("time-order-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Mid")).unwrap();
+        std::fs::write(dir.join("Zzz_Last"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        std::fs::write(dir.join("Aaa_First"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        std::fs::write(dir.join("Mid/Zone"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        let saved = std::env::var_os("PYTHONTZPATH");
+        std::env::set_var("PYTHONTZPATH", &dir);
+        let options = timezone_options();
+        match saved {
+            Some(v) => std::env::set_var("PYTHONTZPATH", v),
+            None => std::env::remove_var("PYTHONTZPATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let keys: Vec<&String> = options.as_object().unwrap().keys().collect();
+        assert_eq!(keys[0], "local");
+        let zones: Vec<&str> = keys[1..].iter().map(|k| k.as_str()).collect();
+        let mut sorted = zones.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(zones, sorted, "zone names must be sorted and unique after 'local'");
+        // the host files and chrono-tz's built-in names are merged into one sorted run
+        assert!(zones.contains(&"Aaa_First") && zones.contains(&"Mid/Zone") && zones.contains(&"Zzz_Last"));
+        assert!(zones.len() > 3, "chrono-tz names must join the host names");
     }
 }

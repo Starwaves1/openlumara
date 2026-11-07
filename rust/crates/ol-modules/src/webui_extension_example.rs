@@ -120,7 +120,7 @@ mod tests {
     fn metadata_matches_python_class() {
         assert_eq!(meta::CLASS_NAME, "WebuiExtensionExample");
         assert_eq!(meta::CATEGORY, "development");
-        assert!(!meta::UNSAFE);
+        const _: () = assert!(!meta::UNSAFE);
         assert_eq!(meta::settings(), json!({}));
         assert!(meta::tools().is_empty());
         assert!(meta::commands().is_empty());

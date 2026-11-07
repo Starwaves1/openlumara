@@ -840,7 +840,7 @@ fn fold_plain(text: &str) -> String {
             if pending_breaks == 0 {
                 out.push(' ');
             } else {
-                out.extend(std::iter::repeat('\n').take(pending_breaks));
+                out.extend(std::iter::repeat_n('\n', pending_breaks));
             }
             pending_breaks = 0;
             out.push_str(t);

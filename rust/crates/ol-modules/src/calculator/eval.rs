@@ -53,6 +53,9 @@ impl std::fmt::Display for PyErr {
 
 type Res<T> = Result<T, PyErr>;
 
+/// positional and keyword arguments of a call
+type CallArgs = (Vec<Expr>, Vec<(String, Expr)>);
+
 fn fail<T>(msg: impl Into<String>) -> Res<T> {
     Err(PyErr(msg.into()))
 }
@@ -1350,7 +1353,7 @@ impl Parser {
     }
 
     /// arguments after `(`, through the closing `)`
-    fn call_args(&mut self) -> Res<(Vec<Expr>, Vec<(String, Expr)>)> {
+    fn call_args(&mut self) -> Res<CallArgs> {
         let mut args = Vec::new();
         let mut kwargs: Vec<(String, Expr)> = Vec::new();
         // a `**` unpacking is kept among the keywords under a name no identifier can have
@@ -2225,12 +2228,12 @@ fn parse_int_str(s: &str, base: i64) -> Res<Val> {
     let mut clean = String::new();
     for (k, &c) in chars.iter().enumerate() {
         if c == '_' {
-            let prev_ok = k > 0 && chars[k - 1].to_digit(radix).is_some();
-            let next_ok = chars.get(k + 1).is_some_and(|n| n.to_digit(radix).is_some());
+            let prev_ok = k > 0 && chars[k - 1].is_digit(radix);
+            let next_ok = chars.get(k + 1).is_some_and(|n| n.is_digit(radix));
             if !(prev_ok && next_ok) {
                 return invalid();
             }
-        } else if c.to_digit(radix).is_some() {
+        } else if c.is_digit(radix) {
             clean.push(c);
         } else {
             return invalid();

@@ -112,7 +112,7 @@ mod tests {
     fn metadata_matches_python_class() {
         assert_eq!(meta::CLASS_NAME, "Tutorial");
         assert_eq!(meta::CATEGORY, "core");
-        assert!(!meta::UNSAFE);
+        const _: () = assert!(!meta::UNSAFE);
         assert_eq!(meta::settings(), serde_json::json!({}));
         assert!(meta::tools().is_empty());
         assert!(meta::commands().is_empty());

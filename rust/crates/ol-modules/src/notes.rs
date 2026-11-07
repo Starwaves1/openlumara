@@ -32,7 +32,7 @@ impl Notes {
 const NO_CATEGORY: &str = "category doesn't exist. use get_categories first!";
 
 /// `self.data[category]` used as a dict (`.keys()` etc.)
-fn as_dict<'a>(v: &'a Value) -> anyhow::Result<&'a Map<String, Value>> {
+fn as_dict(v: &Value) -> anyhow::Result<&Map<String, Value>> {
     v.as_object().ok_or_else(|| anyhow::anyhow!("'{}' object has no attribute 'keys'", py_type_name(v)))
 }
 
