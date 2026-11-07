@@ -4,8 +4,9 @@
 //!
 //! The config is process-global, so every harness holds `HARNESS` for its whole lifetime.
 
-use crate::server::{build_router, build_shared};
+use crate::server::{build_router, build_shared, Shared};
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
@@ -30,6 +31,7 @@ const CLIENT: &str = "198.51.100.2:5000";
 /// a webui served over the real router, plus the objects it must keep alive
 struct Harness {
     router: Router,
+    shared: Arc<Shared>,
     manager: Arc<Manager>,
     ch: Arc<Channel>,
     _lock: MutexGuard<'static, ()>,
@@ -82,7 +84,7 @@ async fn harness(require_login: bool) -> Harness {
     manager.insert_channel(ch.clone());
     ch.set_as_active_channel().await;
     let shared = build_shared(&ch).expect("webui shared state");
-    Harness { router: build_router(shared), manager, ch, _lock: lock, _data: data }
+    Harness { router: build_router(shared.clone()), shared, manager, ch, _lock: lock, _data: data }
 }
 
 fn request(method: Method, uri: &str, cookie: Option<&str>, content_type: Option<&str>, body: &str) -> Request<Body> {
@@ -418,4 +420,175 @@ async fn encoded_prefix_is_authenticated_as_the_decoded_api_path() {
     let resp = h.get("/%61pi/chat/current").await;
     assert_eq!(resp.status, StatusCode::UNAUTHORIZED);
     assert_eq!(resp.json(), json!({"detail": "Unauthorized"}));
+}
+
+// ------------------
+// chat current / stream state / export / chat listings
+// ------------------
+
+/// creates a chat in `category` and pins its `updated` stamp and tags in the index, returning its id
+async fn chat_at(h: &Harness, category: &str, title: &str, updated: &str, tags: &[&str]) -> String {
+    let id = h.ch.chat.new_chat(category, title, None).await;
+    let tags = json!(tags);
+    h.ch.chat.with_data_mut(|data| {
+        for chat in data.iter_mut().filter(|c| c["id"] == json!(id)) {
+            chat["updated"] = json!(updated);
+            chat["tags"] = tags.clone();
+        }
+    });
+    id
+}
+
+/// the `id` of every message in a listing response, in order
+fn message_ids(body: &Value) -> Vec<String> {
+    body["data"]["messages"].as_array().unwrap().iter().map(|m| py_str(&m["id"])).collect()
+}
+
+#[tokio::test]
+async fn chat_current_returns_the_loaded_chat_with_its_turn_history() {
+    let h = harness(false).await;
+    let id = h.ch.chat.new_chat("general", "Current chat", None).await;
+    let body = h.get("/api/chat/current").await.json();
+    assert_eq!(body["success"], json!(true));
+    assert_eq!(body["data"]["id"], json!(id));
+    assert_eq!(body["data"]["title"], json!("Current chat"));
+    assert_eq!(body["data"]["turn_history"], json!([]));
+    assert!(body["data"]["token_usage"].is_number());
+    // turn_history is not a stored chat key, so it is appended after the chat's own keys
+    let keys: Vec<&str> = body["data"].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys.last(), Some(&"turn_history"));
+
+    // a user message shows up as a turn in the live history
+    let msg = json!({"role": "user", "content": "hi there"});
+    assert!(h.ch.chat.messages_add(&msg, false, false).await);
+    let body = h.get("/api/chat/current").await.json();
+    assert_eq!(body["data"]["turn_history"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stream_state_reports_the_backend_stream_state() {
+    let h = harness(false).await;
+    assert_eq!(h.get("/api/stream/state").await.json(), json!({"data": {"state": "idle"}, "success": true}));
+    h.shared.ws.set_stream_state("processing");
+    assert_eq!(h.get("/api/stream/state").await.json(), json!({"data": {"state": "processing"}, "success": true}));
+}
+
+#[tokio::test]
+async fn chat_export_returns_the_transcript_and_a_sanitized_filename() {
+    let h = harness(false).await;
+    h.ch.chat.new_chat("general", r#"a/b:c*?"<>|"#, None).await;
+    assert!(h.ch.chat.messages_add(&json!({"role": "user", "content": "hello"}), false, false).await);
+    let resp = h.get("/api/chat/export").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body = resp.json();
+    assert_eq!(body, json!({"data": {"content": "--- user ---\nhello", "filename": "a_b_c______.txt"}, "success": true}));
+}
+
+#[tokio::test]
+async fn chat_export_falls_back_to_chat_export_for_a_blank_title() {
+    let h = harness(false).await;
+    h.ch.chat.new_chat("general", "   ", None).await;
+    let body = h.get("/api/chat/export").await.json();
+    assert_eq!(body, json!({"data": {"content": "", "filename": "chat-export.txt"}, "success": true}));
+}
+
+#[tokio::test]
+async fn get_chats_pages_the_index_newest_first_with_has_more() {
+    let h = harness(false).await;
+    let oldest = chat_at(&h, "general", "Oldest", "2026-01-01T10:00:00", &[]).await;
+    let middle = chat_at(&h, "general", "Middle", "2026-02-01T10:00:00", &[]).await;
+    let newest = chat_at(&h, "general", "Newest", "2026-03-01T10:00:00", &[]).await;
+
+    let first = h.get("/api/chats?limit=2").await.json();
+    assert_eq!(first["success"], json!(true));
+    assert_eq!(message_ids(&first), vec![newest.clone(), middle.clone()]);
+    assert_eq!(first["data"]["has_more"], json!(true));
+
+    let second = h.get("/api/chats?offset=2&limit=2").await.json();
+    assert_eq!(message_ids(&second), vec![oldest]);
+    assert_eq!(second["data"]["has_more"], json!(false));
+
+    // the list projection keeps only the python CHAT_LIST_FIELDS, in that order
+    let keys: Vec<&str> = first["data"]["messages"][0].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["id", "title", "category", "tags", "created", "updated"]);
+    assert_eq!(first["data"]["messages"][0]["title"], json!("Newest"));
+}
+
+#[tokio::test]
+async fn get_chats_filters_by_category_and_rejects_a_non_integer_offset() {
+    let h = harness(false).await;
+    chat_at(&h, "general", "Plain", "2026-01-01T10:00:00", &[]).await;
+    let work = chat_at(&h, "work", "Work item", "2026-02-01T10:00:00", &[]).await;
+
+    let filtered = h.get("/api/chats?category=work").await.json();
+    assert_eq!(message_ids(&filtered), vec![work]);
+    assert_eq!(filtered["data"]["has_more"], json!(false));
+
+    // an empty category is falsy in python, so it does not filter
+    assert_eq!(message_ids(&h.get("/api/chats?category=").await.json()).len(), 2);
+
+    // python int("x") raises, which starlette answers as a plain 500
+    let bad = h.get("/api/chats?offset=abc").await;
+    assert_eq!(bad.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_chat_days_groups_chats_by_day_month_and_counts_them_newest_first() {
+    let h = harness(false).await;
+    let today = Utc::now().date_naive();
+    let today_key = today.format("%Y-%m-%d").to_string();
+    let old_key = (today - Duration::days(40)).format("%Y-%m").to_string();
+
+    chat_at(&h, "general", "Old chat", &format!("{}T12:00:00", (today - Duration::days(40)).format("%Y-%m-%d")), &[]).await;
+    chat_at(&h, "general", "Morning", &format!("{today_key}T09:00:00"), &[]).await;
+    chat_at(&h, "general", "Evening", &format!("{today_key}T10:00:00"), &["alpha"]).await;
+
+    let groups = h.get("/api/chats/days").await.json();
+    assert_eq!(groups["success"], json!(true));
+    let groups = groups["data"].as_array().unwrap().clone();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0], json!({"key": today_key, "count": 2, "label": "Today"}));
+    assert_eq!(groups[1]["key"], json!(old_key));
+    assert_eq!(groups[1]["count"], json!(1));
+    // a month group is labelled "<Month> <year>"
+    assert_eq!(groups[1]["label"], json!((today - Duration::days(40)).format("%B %Y").to_string()));
+
+    // repeated tags narrow the listing with AND semantics
+    let tagged = h.get("/api/chats/days?tags=alpha").await.json();
+    assert_eq!(tagged["data"], json!([{"key": today_key, "count": 1, "label": "Today"}]));
+    let both = h.get("/api/chats/days?tags=alpha&tags=beta").await.json();
+    assert_eq!(both["data"], json!([]));
+}
+
+#[tokio::test]
+async fn get_chats_for_day_pages_one_group_and_reports_its_count() {
+    let h = harness(false).await;
+    let today = Utc::now().date_naive();
+    let today_key = today.format("%Y-%m-%d").to_string();
+    let old_key = (today - Duration::days(40)).format("%Y-%m").to_string();
+
+    let morning = chat_at(&h, "general", "Morning", &format!("{today_key}T09:00:00"), &[]).await;
+    let evening = chat_at(&h, "general", "Evening", &format!("{today_key}T10:00:00"), &[]).await;
+    let old = chat_at(&h, "general", "Old chat", &format!("{}T12:00:00", (today - Duration::days(40)).format("%Y-%m-%d")), &[]).await;
+
+    let page = h.get(&format!("/api/chats/day?day={today_key}&limit=1")).await.json();
+    assert_eq!(page["success"], json!(true));
+    assert_eq!(message_ids(&page), vec![evening.clone()]);
+    assert_eq!(page["data"]["has_more"], json!(true));
+    assert_eq!(page["data"]["count"], json!(2));
+
+    let rest = h.get(&format!("/api/chats/day?day={today_key}&offset=1&limit=1")).await.json();
+    assert_eq!(message_ids(&rest), vec![morning]);
+    assert_eq!(rest["data"]["has_more"], json!(false));
+
+    let month = h.get(&format!("/api/chats/day?day={old_key}")).await.json();
+    assert_eq!(message_ids(&month), vec![old]);
+    assert_eq!(month["data"]["count"], json!(1));
+
+    let empty = h.get("/api/chats/day?day=1999-01-01").await.json();
+    assert_eq!(empty["data"], json!({"messages": [], "has_more": false, "count": 0}));
+
+    // repeated tags narrow the day group as well: no chat carries "nope"
+    let tagged = h.get(&format!("/api/chats/day?day={today_key}&tags=nope")).await.json();
+    assert_eq!(tagged["data"]["count"], json!(0));
 }
