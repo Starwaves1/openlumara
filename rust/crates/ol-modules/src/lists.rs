@@ -72,7 +72,8 @@ fn arg(args: &ToolArgs, name: &str) -> Value {
 /// the pinned-lists system prompt (python on_system_prompt body)
 pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::Result<String> {
     let mut output = String::new();
-    let mut pinned_by_cat: IndexMap<String, Vec<(String, Vec<Value>)>> = IndexMap::new();
+    // the raw items value is kept during the walk: python only iterates it while writing the output
+    let mut pinned_by_cat: IndexMap<String, Vec<(String, Value)>> = IndexMap::new();
     let mut unpinned_by_cat: IndexMap<String, Vec<String>> = IndexMap::new();
     let mut count: i64 = 1;
 
@@ -94,13 +95,6 @@ pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::R
                 continue;
             }
             if lst.get("pinned").map(truthy).unwrap_or(false) {
-                // python joins over the items: a str yields characters, a dict yields its keys
-                let items = match items {
-                    Value::Array(a) => a,
-                    Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
-                    Value::Object(m) => m.keys().map(|k| Value::String(k.clone())).collect(),
-                    other => anyhow::bail!("'{}' object is not iterable", py_type_name(&other)),
-                };
                 pinned_by_cat.entry(cat.clone()).or_default().push((name.clone(), items));
             } else {
                 unpinned_by_cat.entry(cat.clone()).or_default().push(name.clone());
@@ -111,6 +105,13 @@ pub fn system_prompt(data: &Map<String, Value>, max_pinned: &Value) -> anyhow::R
     for (cat, items) in &pinned_by_cat {
         output.push_str(&format!("## {}\n", cat));
         for (name, lst_items) in items {
+            // python joins over the items: a str yields characters, a dict yields its keys
+            let lst_items: Vec<Value> = match lst_items {
+                Value::Array(a) => a.clone(),
+                Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+                Value::Object(m) => m.keys().map(|k| Value::String(k.clone())).collect(),
+                other => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
+            };
             let lines: Vec<String> = lst_items.iter().map(|it| format!("- {}", py_str(it))).collect();
             output.push_str(&format!("### {}\n{}\n", name, lines.join("\n")));
         }
@@ -141,7 +142,13 @@ fn verify_target(data: &mut StorageDict, category: &Value, list_name: &Value) ->
     // StorageDict.get reloads from disk before the lookup
     let Some(container) = data.get(cat_key).cloned() else { return Ok(false) };
     match &container {
-        Value::Object(m) => Ok(matches!(list_name, Value::String(n) if m.contains_key(n))),
+        // a dict membership test hashes the key: a list or dict key raises, other non-str keys are simply absent
+        Value::Object(m) => match list_name {
+            Value::String(n) => Ok(m.contains_key(n)),
+            Value::Array(_) => anyhow::bail!("unhashable type: 'list'"),
+            Value::Object(_) => anyhow::bail!("unhashable type: 'dict'"),
+            _ => Ok(false),
+        },
         Value::Array(a) => Ok(a.contains(list_name)),
         Value::String(s) => match list_name {
             Value::String(n) => Ok(s.contains(n.as_str())),
@@ -173,12 +180,17 @@ fn stored_key(key: &Value, what: &str) -> anyhow::Result<String> {
     match key {
         Value::String(s) => Ok(s.clone()),
         Value::Null => anyhow::bail!("unsupported: a null {} cannot be stored in lists.yml (python would use a None key)", what),
-        other => anyhow::bail!(
-            "unsupported: the {} of type {} cannot be stored in lists.yml (python would use a {} key)",
-            what,
-            py_type_name(other),
-            py_type_name(other)
-        ),
+        other => {
+            let ty = py_type_name(other);
+            let article = if ty.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            anyhow::bail!(
+                "unsupported: the {} of type {} cannot be stored in lists.yml (python would use {} {} key)",
+                what,
+                ty,
+                article,
+                ty
+            )
+        }
     }
 }
 
@@ -307,6 +319,13 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             ok(if method == "pin" { "list pinned!" } else { "list unpinned!" })
         }
         "search" => {
+            // `query: str` is required, so an absent query is python's TypeError (validate_tool_args
+            // raises the same text before a call; this covers direct calls)
+            if !args.0.contains_key("query") {
+                anyhow::bail!("Lists.search() missing 1 required positional argument: 'query'");
+            }
+            // python's search() returns [] for a None query (`not query`), but the message still shows 'None'
+            let query_is_null = matches!(args.0.get("query"), Some(Value::Null));
             let query = args.str_or("query", "None");
             data.load();
             let mut list_entries = Vec::new();
@@ -339,8 +358,14 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             w_name.insert("name".to_string(), 1.0);
             let mut w_item = IndexMap::new();
             w_item.insert("item".to_string(), 1.0);
-            let list_results = ol_core::search::search(&list_entries, &query, "id", Some(&w_name), 5);
-            let item_results = ol_core::search::search(&item_entries, &query, "id", Some(&w_item), 15);
+            let (list_results, item_results) = if query_is_null {
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    ol_core::search::search(&list_entries, &query, "id", Some(&w_name), 5),
+                    ol_core::search::search(&item_entries, &query, "id", Some(&w_item), 15),
+                )
+            };
             if list_results.is_empty() && item_results.is_empty() {
                 return ok(&format!("no lists or list items found matching '{}'", query));
             }
@@ -628,7 +653,7 @@ mod tests {
         let err = run(&base, &mut d, "create", &args(json!({"category": 5, "name": "x"}))).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported: the category of type int cannot be stored in lists.yml (python would use a int key)"
+            "unsupported: the category of type int cannot be stored in lists.yml (python would use an int key)"
         );
         // python: a non-str prefix reaches `starts_with.strip()` on the first item and raises
         let err = run(&base, &mut d, "edit_item", &args(json!({"category": "5", "list_name": "5", "item_starts_with": 5, "item_content": "y"}))).unwrap_err();
@@ -645,5 +670,48 @@ mod tests {
         bad.insert("home".into(), json!({"shopping": {"items": 5, "pinned": true}}));
         let err = system_prompt(&bad, &json!(10)).unwrap_err();
         assert_eq!(err.to_string(), "'int' object is not iterable");
+    }
+
+    #[test]
+    fn prompt_walk_reports_a_later_malformed_entry_before_pinned_items_are_iterated() {
+        // python walks every category before it joins any pinned items, so the non-dict entry in "a"
+        // (walked last) raises its .get error, not the non-iterable items of "b" (walked first)
+        let mut data = Map::new();
+        data.insert("a".into(), json!({"y": "notdict"}));
+        data.insert("b".into(), json!({"x": {"items": 5, "pinned": true}}));
+        let err = system_prompt(&data, &json!(10)).unwrap_err();
+        assert_eq!(err.to_string(), "'str' object has no attribute 'get'");
+    }
+
+    #[test]
+    fn unhashable_list_names_raise_in_a_dict_category_and_other_keys_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        run(&base, &mut d, "create", &args(json!({"category": "home", "name": "shopping"}))).unwrap();
+        // python: `[] not in {...}` raises TypeError: unhashable type: 'list'
+        let err = run(&base, &mut d, "pin", &args(json!({"category": "home", "list_name": []}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'list'");
+        let err = run(&base, &mut d, "get", &args(json!({"category": "home", "list_name": {}}))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'dict'");
+        // python: `None not in {...}` is True, so a hashable non-str name is just a missing list
+        let r = run(&base, &mut d, "get", &args(json!({"category": "home", "list_name": null}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "that list doesn't exist"}));
+    }
+
+    #[test]
+    fn null_search_query_finds_nothing_and_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("lists", StorageType::Yaml, Some(&p)).unwrap();
+        let base = ModuleBase::detached("lists");
+        run(&base, &mut d, "add_item", &args(json!({"category": "home", "list_name": "notes", "item_content": "none of this"}))).unwrap();
+        // python: search(None) returns [] because `not query` is true, so the literal word "none" in an item does not match
+        let r = run(&base, &mut d, "search", &args(json!({"query": null}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching 'None'"}));
+        // the same item is found by a real query
+        let r = run(&base, &mut d, "search", &args(json!({"query": "none"}))).unwrap();
+        assert!(r["content"].as_str().unwrap().starts_with("list items matching the query:\n- [home] notes: none of this"), "{}", r);
     }
 }
