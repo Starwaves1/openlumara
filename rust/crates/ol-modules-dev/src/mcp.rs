@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use ol_core::channel::Channel;
 use ol_core::manager::Manager;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec};
-use ol_core::pyjson::{self, py_str, py_str_opt, truthy};
+use ol_core::pyjson::{self, py_repr, py_str, py_str_opt, truthy};
 use ol_core::tool_loader::CatalogEntry;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
@@ -297,32 +297,36 @@ fn is_url_scheme(text: &str) -> bool {
 /// python `urllib.parse.urlparse(url).hostname`: the raw netloc host, lowercased, with no IDNA
 /// encoding (so `bücher.de` keeps its unicode label). The netloc follows `scheme://` or a leading
 /// `//` (scheme-relative), so `//mcp.example.com/mcp` has the host `mcp.example.com`.
-fn url_hostname(url: &str) -> String {
+/// Err is the ValueError urlsplit raises for an unbalanced `[` or `]` in the netloc.
+fn url_hostname(url: &str) -> Result<String, &'static str> {
     let rest = match url.strip_prefix("//") {
         Some(rest) => rest,
         None => match url.split_once("://") {
             Some((scheme, rest)) if is_url_scheme(scheme) => rest,
-            _ => return String::new(),
+            _ => return Ok(String::new()),
         },
     };
     let netloc = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if netloc.contains('[') != netloc.contains(']') {
+        return Err("Invalid IPv6 URL");
+    }
     let hostinfo = netloc.rsplit_once('@').map(|(_, host)| host).unwrap_or(netloc);
     let host = match hostinfo.strip_prefix('[') {
         Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
         None => hostinfo.split(':').next().unwrap_or(""),
     };
-    host.to_lowercase()
+    Ok(host.to_lowercase())
 }
 
 /// python `_derive_url_name`: mcp.exa.ai -> exa
-fn derive_url_name(url: &str) -> String {
-    let hostname = url_hostname(url);
+fn derive_url_name(url: &str) -> Result<String, &'static str> {
+    let hostname = url_hostname(url)?;
     for label in hostname.split('.') {
         if !label.is_empty() && !GENERIC_HOST_LABELS.contains(&label.to_lowercase().as_str()) {
-            return sanitize(label);
+            return Ok(sanitize(label));
         }
     }
-    "unnamed".to_string()
+    Ok("unnamed".to_string())
 }
 
 /// python `_derive_stdio_name`: 'uvx mcp-server-time' -> mcp-server-time
@@ -343,60 +347,122 @@ fn derive_stdio_name(argv: &[String]) -> String {
     sanitize(command)
 }
 
-/// message python puts in `_parse_error` for a shlex failure (ValueError text).
-/// Follows shlex's posix state machine: a backslash escapes the next char outside quotes and
-/// inside double quotes (single quotes keep it literal); hitting EOF while escaping gives
-/// "No escaped character", hitting EOF inside a quote gives "No closing quotation".
-fn shlex_error(entry: &str) -> &'static str {
-    #[derive(PartialEq)]
-    enum Quote {
-        None,
-        Single,
+/// python `shlex.split(s)` (posix=True, comments=False): a port of CPython Lib/shlex.py `read_token`.
+/// Err holds the ValueError text python raises: "No closing quotation" or "No escaped character".
+/// Single quotes are literal. Inside double quotes a backslash escapes only `\` and `"`; before any
+/// other character it stays literal, so `"a\nb"` is `a\nb`.
+fn shlex_split(s: &str) -> Result<Vec<String>, &'static str> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Return {
+        Word,
         Double,
     }
-    let mut quote = Quote::None;
-    let mut chars = entry.chars();
-    while let Some(c) = chars.next() {
-        match quote {
-            Quote::None => match c {
-                '\\' => {
-                    if chars.next().is_none() {
-                        return "No escaped character";
-                    }
-                }
-                '\'' => quote = Quote::Single,
-                '"' => quote = Quote::Double,
-                _ => {}
-            },
-            Quote::Single => {
-                if c == '\'' {
-                    quote = Quote::None;
+    #[derive(Clone, Copy)]
+    enum State {
+        Space,
+        Word,
+        Single,
+        Double,
+        Escape(Return),
+    }
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
+    let mut words = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut state = State::Space;
+    let mut chars = s.chars();
+    loop {
+        let next = chars.next();
+        state = match (state, next) {
+            (State::Space, None) | (State::Word, None) => break,
+            (State::Space, Some(c)) if is_space(c) => State::Space,
+            (State::Space, Some('\\')) => State::Escape(Return::Word),
+            (State::Space, Some(q @ ('\'' | '"'))) => {
+                quoted = true;
+                if q == '\'' {
+                    State::Single
+                } else {
+                    State::Double
                 }
             }
-            Quote::Double => match c {
-                '\\' => {
-                    if chars.next().is_none() {
-                        return "No escaped character";
-                    }
+            (State::Space, Some(c)) => {
+                token.push(c);
+                State::Word
+            }
+            (State::Word, Some(c)) if is_space(c) => {
+                if !token.is_empty() || quoted {
+                    words.push(std::mem::take(&mut token));
+                    quoted = false;
                 }
-                '"' => quote = Quote::None,
-                _ => {}
-            },
-        }
+                State::Space
+            }
+            (State::Word, Some('\\')) => State::Escape(Return::Word),
+            (State::Word, Some(q @ ('\'' | '"'))) => {
+                quoted = true;
+                if q == '\'' {
+                    State::Single
+                } else {
+                    State::Double
+                }
+            }
+            (State::Word, Some(c)) => {
+                token.push(c);
+                State::Word
+            }
+            (State::Single, None) | (State::Double, None) => return Err("No closing quotation"),
+            (State::Single, Some('\'')) => State::Word,
+            (State::Single, Some(c)) => {
+                token.push(c);
+                State::Single
+            }
+            (State::Double, Some('"')) => State::Word,
+            (State::Double, Some('\\')) => State::Escape(Return::Double),
+            (State::Double, Some(c)) => {
+                token.push(c);
+                State::Double
+            }
+            (State::Escape(_), None) => return Err("No escaped character"),
+            (State::Escape(ret), Some(c)) => {
+                // CPython keeps the backslash in front of any character but `\` and `"` (in double quotes)
+                if ret == Return::Double && c != '\\' && c != '"' {
+                    token.push('\\');
+                }
+                token.push(c);
+                match ret {
+                    Return::Word => State::Word,
+                    Return::Double => State::Double,
+                }
+            }
+        };
     }
-    "No closing quotation"
+    if !token.is_empty() || quoted {
+        words.push(token);
+    }
+    Ok(words)
 }
 
-/// parse one config entry: Ok(None) = skip, Err = invalid entry (python `_parse_error`)
-fn parse_entry(setting: &str, entry: &str) -> Result<Option<(String, ServerCfg)>, String> {
+/// why one config entry gave no server
+#[derive(Debug, PartialEq)]
+enum EntryError {
+    /// python `_parse_error`: logged, the other entries still load
+    Invalid(String),
+    /// an exception python lets escape `_build_server_configs`, so startup fails with it
+    Fatal(String),
+}
+
+/// parse one config entry: Ok(None) = skip, Err = see `EntryError`
+fn parse_entry(setting: &str, entry: &str) -> Result<Option<(String, ServerCfg)>, EntryError> {
     let entry = entry.trim();
     if entry.is_empty() {
         return Ok(None);
     }
     let transport = setting.to_lowercase();
     if transport == "stdio" {
-        let Some(argv) = shlex::split(entry) else {
-            return Err(format!("invalid command in '{}': '{}' ({})", setting, entry, shlex_error(entry)));
+        let argv = match shlex_split(entry) {
+            Ok(argv) => argv,
+            Err(reason) => {
+                return Err(EntryError::Invalid(format!("invalid command in '{}': '{}' ({})", setting, entry, reason)))
+            }
         };
         if argv.is_empty() {
             return Ok(None);
@@ -404,13 +470,68 @@ fn parse_entry(setting: &str, entry: &str) -> Result<Option<(String, ServerCfg)>
         let name = derive_stdio_name(&argv);
         return Ok(Some((name, ServerCfg::Stdio { command: argv[0].clone(), args: argv[1..].to_vec() })));
     }
-    let name = derive_url_name(entry);
+    let name = derive_url_name(entry).map_err(|reason| EntryError::Fatal(reason.to_string()))?;
     let cfg = if transport == "sse" {
         ServerCfg::Sse { url: entry.to_string() }
     } else {
         ServerCfg::Http { url: entry.to_string() }
     };
     Ok(Some((name, cfg)))
+}
+
+/// python `for entry in self.config.get(setting, default=[])`: each str item is yielded, and the
+/// first item python cannot use (`entry.strip()` fails) or a non-iterable value ends the loop with
+/// the exception text, which is always the last element
+fn config_items(value: Option<Value>) -> Vec<Result<String, String>> {
+    match value {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(Ok(s)),
+                    other => {
+                        out.push(Err(format!("'{}' object has no attribute 'strip'", py_type_name(&other))));
+                        break;
+                    }
+                }
+            }
+            out
+        }
+        Some(Value::String(s)) => s.chars().map(|c| Ok(c.to_string())).collect(),
+        Some(Value::Object(o)) => o.keys().map(|k| Ok(k.clone())).collect(),
+        Some(other) => vec![Err(format!("'{}' object is not iterable", py_type_name(&other)))],
+    }
+}
+
+/// python `float(value)` for a config value, with python's ValueError / TypeError text
+fn python_float(value: &Value) -> Result<f64, String> {
+    match value {
+        Value::Number(n) => Ok(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        Value::String(s) => parse_python_float(s)
+            .ok_or_else(|| format!("could not convert string to float: {}", py_repr(value))),
+        other => Err(format!("float() argument must be a string or a real number, not '{}'", py_type_name(other))),
+    }
+}
+
+/// python `float(str)`: surrounding whitespace is ignored and `_` may only sit between two digits
+fn parse_python_float(text: &str) -> Option<f64> {
+    let text = text.trim();
+    if !text.contains('_') {
+        return text.parse::<f64>().ok();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '_' {
+            let digit_before = i > 0 && chars[i - 1].is_ascii_digit();
+            let digit_after = chars.get(i + 1).is_some_and(|n| n.is_ascii_digit());
+            if !(digit_before && digit_after) {
+                return None;
+            }
+        }
+    }
+    chars.iter().filter(|c| **c != '_').collect::<String>().parse::<f64>().ok()
 }
 
 /// append _2, _3, ... until the server name no longer clashes
@@ -1647,27 +1768,20 @@ impl Mcp {
         Self { base, inner }
     }
 
-    /// python `self.config.get(setting, default=[])`, iterated like a python list
-    fn config_entries(&self, setting: &str) -> Vec<String> {
-        match self.base.config.get1(setting) {
-            Some(Value::Array(items)) => items.iter().map(py_str).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
-            Some(Value::Object(o)) => o.keys().cloned().collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// python `_build_server_configs`: {unique name: cfg}; bad entries set the parse error
-    fn build_server_configs(&self) -> IndexMap<String, ServerCfg> {
+    /// python `_build_server_configs`: {unique name: cfg}; bad entries set the parse error, and an
+    /// exception python lets escape (see `config_items`, `EntryError::Fatal`) fails startup
+    fn build_server_configs(&self) -> anyhow::Result<IndexMap<String, ServerCfg>> {
         *self.inner.parse_error.lock() = None;
         let mut configs = IndexMap::new();
         for setting in ["http", "SSE", "stdio"] {
-            for entry in self.config_entries(setting) {
+            for item in config_items(self.base.config.get1(setting)) {
+                let entry = item.map_err(anyhow::Error::msg)?;
                 match parse_entry(setting, &entry) {
-                    Err(message) => {
+                    Err(EntryError::Invalid(message)) => {
                         *self.inner.parse_error.lock() = Some(message.clone());
                         self.inner.log(&message);
                     }
+                    Err(EntryError::Fatal(message)) => anyhow::bail!(message),
                     Ok(None) => {}
                     Ok(Some((name, cfg))) => {
                         let unique = unique_server_name(&configs, name);
@@ -1676,12 +1790,12 @@ impl Mcp {
                 }
             }
         }
-        configs
+        Ok(configs)
     }
 
     /// python `_start_servers`
-    async fn start_servers(&self) {
-        let configs = self.build_server_configs();
+    async fn start_servers(&self) -> anyhow::Result<()> {
+        let configs = self.build_server_configs()?;
         for (name, cfg) in configs {
             let srv = Arc::new(Server::new(cfg));
             let task = tokio::spawn(connection_lifecycle(self.inner.clone(), name.clone(), srv.clone()));
@@ -1690,7 +1804,8 @@ impl Mcp {
         }
 
         // then wait for them to settle
-        let timeout = self.base.config.get_f64("connect_timeout").unwrap_or(30.0);
+        let timeout = python_float(&self.base.config.get1("connect_timeout").unwrap_or_else(|| json!(30)))
+            .map_err(anyhow::Error::msg)?;
         for (name, srv) in self.inner.snapshot() {
             let mut ready = srv.ready.subscribe();
             if tokio::time::timeout(secs(timeout), ready.wait_for(|up| *up)).await.is_err() {
@@ -1702,6 +1817,7 @@ impl Mcp {
                 self.inner.log(&format!("server '{}' timed out while connecting", name));
             }
         }
+        Ok(())
     }
 
     /// python `_stop_servers`: signal every task, give it time, then force
@@ -1752,12 +1868,12 @@ impl Mcp {
     }
 
     /// python `mcp_command`
-    async fn mcp_command(&self, args: &[String]) -> String {
+    async fn mcp_command(&self, args: &[String]) -> anyhow::Result<String> {
         let reload = args.first().map(|a| a.to_lowercase() == "reload").unwrap_or(false);
         let mut lines: Vec<String> = Vec::new();
         if reload {
             self.stop_servers().await;
-            self.start_servers().await;
+            self.start_servers().await?;
             lines.push("reloaded MCP servers:".to_string());
         } else {
             lines.push("MCP servers:".to_string());
@@ -1782,7 +1898,7 @@ impl Mcp {
         if let Some(parse_error) = parse_error {
             lines.push(format!("  config error: {}", parse_error));
         }
-        lines.join("\n")
+        Ok(lines.join("\n"))
     }
 }
 
@@ -1808,8 +1924,7 @@ impl Module for Mcp {
         self.inner.servers.lock().clear();
         *self.inner.parse_error.lock() = None;
         self.inner.used_names.lock().clear();
-        self.start_servers().await;
-        Ok(())
+        self.start_servers().await
     }
 
     async fn on_shutdown(&self) -> anyhow::Result<()> {
@@ -1823,7 +1938,7 @@ impl Module for Mcp {
 
     async fn run_command(&self, name: &str, args: Vec<String>) -> anyhow::Result<Option<String>> {
         match name {
-            "mcp" => Ok(Some(self.mcp_command(&args).await)),
+            "mcp" => Ok(Some(self.mcp_command(&args).await?)),
             _ => anyhow::bail!("unknown command {}", name),
         }
     }
@@ -1846,9 +1961,9 @@ mod tests {
 
     #[test]
     fn server_names_follow_python_rules() {
-        assert_eq!(derive_url_name("https://mcp.exa.ai/mcp"), "exa");
-        assert_eq!(derive_url_name("http://localhost:8000/mcp"), "localhost");
-        assert_eq!(derive_url_name("http://mcp.example.com/mcp"), "example");
+        assert_eq!(derive_url_name("https://mcp.exa.ai/mcp").unwrap(), "exa");
+        assert_eq!(derive_url_name("http://localhost:8000/mcp").unwrap(), "localhost");
+        assert_eq!(derive_url_name("http://mcp.example.com/mcp").unwrap(), "example");
         assert_eq!(derive_stdio_name(&["uvx".into(), "mcp-server-time".into()]), "mcp-server-time");
         assert_eq!(derive_stdio_name(&["/usr/bin/python3".into(), "-m".into(), "pkg.sub.tool".into()]), "tool");
         assert_eq!(derive_stdio_name(&["npx".into(), "-y".into(), "@scope/thing".into()]), "scope_thing");
@@ -1862,7 +1977,10 @@ mod tests {
         assert_eq!(name, "h");
         assert_eq!(cfg, ServerCfg::Sse { url: "http://h.example.org:9000/sse".into() });
         assert_eq!(parse_entry("stdio", "   ").unwrap(), None);
-        assert_eq!(parse_entry("stdio", "run 'unclosed").unwrap_err(), "invalid command in 'stdio': 'run 'unclosed' (No closing quotation)");
+        assert_eq!(
+            parse_entry("stdio", "run 'unclosed").unwrap_err(),
+            EntryError::Invalid("invalid command in 'stdio': 'run 'unclosed' (No closing quotation)".to_string())
+        );
 
         let mut configs = IndexMap::new();
         configs.insert("exa".to_string(), ServerCfg::Http { url: "x".into() });
@@ -1937,17 +2055,77 @@ mod tests {
 
     #[test]
     fn shlex_failures_name_the_python_reason() {
-        assert_eq!(shlex_error("run \"a\\\""), "No closing quotation");
-        assert_eq!(shlex_error("run 'abc\\"), "No closing quotation");
-        assert_eq!(shlex_error("run abc\\"), "No escaped character");
-        assert_eq!(shlex_error("run \"abc\\"), "No escaped character");
+        assert_eq!(shlex_split("run \"a\\\"").unwrap_err(), "No closing quotation");
+        assert_eq!(shlex_split("run 'abc\\").unwrap_err(), "No closing quotation");
+        assert_eq!(shlex_split("run abc\\").unwrap_err(), "No escaped character");
+        assert_eq!(shlex_split("run \"abc\\").unwrap_err(), "No escaped character");
+    }
+
+    #[test]
+    fn shlex_split_matches_python_posix_split() {
+        // python: shlex.split('uvx  mcp-server-time') == ['uvx', 'mcp-server-time']
+        assert_eq!(shlex_split("uvx  mcp-server-time\t--flag").unwrap(), vec!["uvx", "mcp-server-time", "--flag"]);
+        // single quotes are literal, a backslash included
+        assert_eq!(shlex_split(r"run 'a\b c'").unwrap(), vec!["run", r"a\b c"]);
+        // escaped quote inside double quotes
+        assert_eq!(shlex_split(r#"run "say \"hi\"""#).unwrap(), vec!["run", r#"say "hi""#]);
+        // backslash-n inside double quotes stays two characters
+        assert_eq!(shlex_split(r#"run "a\nb""#).unwrap(), vec!["run", r"a\nb"]);
+        // a backslash before any other character inside double quotes is kept
+        assert_eq!(shlex_split(r#""a\$b" "c\\d""#).unwrap(), vec![r"a\$b", r"c\d"]);
+        // outside quotes a backslash escapes the next character, whitespace included
+        assert_eq!(shlex_split(r"a\ b c").unwrap(), vec!["a b", "c"]);
+        // adjacent pieces form one word and empty quotes make an empty word
+        assert_eq!(shlex_split(r#"pre"fix"'x' """#).unwrap(), vec!["prefixx", ""]);
+        assert_eq!(shlex_split("   ").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn config_items_match_python_iteration() {
+        assert_eq!(
+            config_items(Some(json!(["http://a", null, "http://b"]))),
+            vec![Ok("http://a".to_string()), Err("'NoneType' object has no attribute 'strip'".to_string())]
+        );
+        assert_eq!(config_items(Some(json!([5]))), vec![Err("'int' object has no attribute 'strip'".to_string())]);
+        assert_eq!(config_items(Some(json!([1.5]))), vec![Err("'float' object has no attribute 'strip'".to_string())]);
+        assert_eq!(config_items(Some(json!([["x"]]))), vec![Err("'list' object has no attribute 'strip'".to_string())]);
+        assert_eq!(config_items(Some(Value::Null)), vec![Err("'NoneType' object is not iterable".to_string())]);
+        assert_eq!(config_items(Some(json!(7))), vec![Err("'int' object is not iterable".to_string())]);
+        assert_eq!(config_items(Some(json!(true))), vec![Err("'bool' object is not iterable".to_string())]);
+        assert_eq!(config_items(None), Vec::<Result<String, String>>::new());
+        assert_eq!(config_items(Some(json!("ab"))), vec![Ok("a".to_string()), Ok("b".to_string())]);
+    }
+
+    #[test]
+    fn connect_timeout_is_python_float() {
+        assert_eq!(python_float(&json!(30)).unwrap(), 30.0);
+        assert_eq!(python_float(&json!(2.5)).unwrap(), 2.5);
+        assert_eq!(python_float(&json!(" 4 ")).unwrap(), 4.0);
+        assert_eq!(python_float(&json!("1_000")).unwrap(), 1000.0);
+        assert_eq!(python_float(&json!(true)).unwrap(), 1.0);
+        assert_eq!(python_float(&json!("abc")).unwrap_err(), "could not convert string to float: 'abc'");
+        assert_eq!(python_float(&json!("1__0")).unwrap_err(), "could not convert string to float: '1__0'");
+        assert_eq!(python_float(&Value::Null).unwrap_err(), "float() argument must be a string or a real number, not 'NoneType'");
+        assert_eq!(python_float(&json!([1])).unwrap_err(), "float() argument must be a string or a real number, not 'list'");
+    }
+
+    #[test]
+    fn unbalanced_ipv6_brackets_fail_the_entry_like_urlsplit() {
+        assert_eq!(url_hostname("http://a[b/x"), Err("Invalid IPv6 URL"));
+        assert_eq!(url_hostname("http://a]b/x"), Err("Invalid IPv6 URL"));
+        assert_eq!(url_hostname("http://u[x@h/"), Err("Invalid IPv6 URL"));
+        assert_eq!(
+            parse_entry("http", "http://a[b/x"),
+            Err(EntryError::Fatal("Invalid IPv6 URL".to_string()))
+        );
+        assert_eq!(url_hostname("http://[::1]:80/x").unwrap(), "::1");
     }
 
     #[test]
     fn url_hostnames_are_not_idna_encoded() {
-        assert_eq!(url_hostname("https://bücher.de/mcp"), "bücher.de");
-        assert_eq!(derive_url_name("https://bücher.de/mcp"), "b_cher");
-        assert_eq!(derive_url_name("http://user:pw@[::1]:8000/mcp"), "1");
+        assert_eq!(url_hostname("https://bücher.de/mcp").unwrap(), "bücher.de");
+        assert_eq!(derive_url_name("https://bücher.de/mcp").unwrap(), "b_cher");
+        assert_eq!(derive_url_name("http://user:pw@[::1]:8000/mcp").unwrap(), "1");
     }
 
     #[test]
@@ -2136,12 +2314,12 @@ mod tests {
 
     #[test]
     fn scheme_relative_urls_name_the_server() {
-        assert_eq!(url_hostname("//mcp.example.com/mcp"), "mcp.example.com");
-        assert_eq!(derive_url_name("//mcp.example.com/mcp"), "example");
-        assert_eq!(url_hostname("https://x.test/a?u=http://evil.test"), "x.test");
-        assert_eq!(url_hostname("//x.test/a?u=http://evil.test"), "x.test");
-        assert_eq!(url_hostname("localhost:8000/mcp"), "");
-        assert_eq!(derive_url_name("localhost:8000/mcp"), "unnamed");
+        assert_eq!(url_hostname("//mcp.example.com/mcp").unwrap(), "mcp.example.com");
+        assert_eq!(derive_url_name("//mcp.example.com/mcp").unwrap(), "example");
+        assert_eq!(url_hostname("https://x.test/a?u=http://evil.test").unwrap(), "x.test");
+        assert_eq!(url_hostname("//x.test/a?u=http://evil.test").unwrap(), "x.test");
+        assert_eq!(url_hostname("localhost:8000/mcp").unwrap(), "");
+        assert_eq!(derive_url_name("localhost:8000/mcp").unwrap(), "unnamed");
     }
 
     #[test]
