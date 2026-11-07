@@ -97,7 +97,7 @@ pub fn ancestor_below<'a>(el: ElementRef<'a>, root: ElementRef<'a>, pred: impl F
         if node.id() == root.id() {
             return false;
         }
-        if ElementRef::wrap(node).is_some_and(|e| pred(e)) {
+        if ElementRef::wrap(node).is_some_and(&pred) {
             return true;
         }
     }
@@ -106,7 +106,7 @@ pub fn ancestor_below<'a>(el: ElementRef<'a>, root: ElementRef<'a>, pred: impl F
 
 /// some ancestor of `el` (any depth) satisfies `pred`
 pub fn has_ancestor<'a>(el: ElementRef<'a>, pred: impl Fn(ElementRef<'a>) -> bool) -> bool {
-    el.ancestors().filter_map(ElementRef::wrap).any(|e| pred(e))
+    el.ancestors().filter_map(ElementRef::wrap).any(pred)
 }
 
 /// `"".join(xpath(".//x//text()"))` over a node-set: every text node under the elements, each

@@ -104,8 +104,7 @@ mod tests {
 
     #[test]
     fn payload_and_mirror_base() {
-        let mut args = SearchArgs::default();
-        args.page = 2;
+        let args = SearchArgs { page: 2, ..Default::default() };
         assert_eq!(build_payload("dune", &args), vec![kv("q", "dune"), kv("page", 2)]);
         assert!(["https://annas-archive.gd", "https://annas-archive.gl", "https://annas-archive.pk"].contains(&base_url().as_str()));
     }

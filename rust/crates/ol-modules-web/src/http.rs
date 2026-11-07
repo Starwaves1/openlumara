@@ -78,7 +78,7 @@ fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
-fn as_items<'a>(v: &'a Value) -> anyhow::Result<&'a Map<String, Value>> {
+fn as_items(v: &Value) -> anyhow::Result<&Map<String, Value>> {
     v.as_object().ok_or_else(|| anyhow!("'{}' object has no attribute 'items'", py_type_name(v)))
 }
 
@@ -554,12 +554,10 @@ fn parse_set_cookie(raw: &str, now: i64) -> CookieAttr {
                     domain = Some(v.to_lowercase());
                 }
             }
-            "path" => {
-                if !path_seen {
-                    path_seen = true;
-                    let Some(v) = val else { return CookieAttr::Drop };
-                    path = Some(v.to_string());
-                }
+            "path" if !path_seen => {
+                path_seen = true;
+                let Some(v) = val else { return CookieAttr::Drop };
+                path = Some(v.to_string());
             }
             _ => {}
         }

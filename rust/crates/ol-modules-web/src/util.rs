@@ -610,56 +610,6 @@ pub fn sanitize_json(v: &PyJson) -> PyJson {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn roundtrip(s: &str) -> Option<String> {
-        json_loads(s).map(|v| json_dumps(&v))
-    }
-
-    #[test]
-    fn json_keeps_python_literals_and_integers() {
-        assert_eq!(roundtrip("[NaN, Infinity, -Infinity]").unwrap(), "[NaN, Infinity, -Infinity]");
-        assert_eq!(roundtrip("18446744073709551616").unwrap(), "18446744073709551616");
-        assert_eq!(roundtrip("[-0, 1e400, 1.0, 2.5e-3]").unwrap(), "[0, Infinity, 1.0, 0.0025]");
-        assert_eq!(roundtrip("{\"a\": 1, \"a\": 2, \"b\": null}").unwrap(), "{\"a\": 2, \"b\": null}");
-    }
-
-    #[test]
-    fn json_rejects_what_python_rejects() {
-        for bad in ["", "01", "1.", "[1,]", "{\"a\" 1}", "\"a\u{1}\"", "\"\\x\"", "\"\\ud800\"", "\u{feff}1", "1 2", "[1"] {
-            assert!(json_loads(bad).is_none(), "{:?} should not parse", bad);
-        }
-        assert_eq!(roundtrip("\"\\ud83d\\ude00\\n\\u00e9\""), Some("\"\u{1f600}\\n\u{e9}\"".to_string()));
-    }
-
-    #[test]
-    fn py_json_loads_reports_cpython_decode_error_text() {
-        let msg = |t: &str| py_json_loads(t).unwrap_err();
-        assert_eq!(msg(""), "Expecting value: line 1 column 1 (char 0)");
-        assert_eq!(msg("{\"a\" 1}"), "Expecting ':' delimiter: line 1 column 6 (char 5)");
-        assert_eq!(msg("[1 2]"), "Expecting ',' delimiter: line 1 column 4 (char 3)");
-        assert_eq!(msg("[1,]"), "Expecting value: line 1 column 4 (char 3)");
-        assert_eq!(msg("{\"a\":1} x"), "Extra data: line 1 column 9 (char 8)");
-        assert_eq!(msg("\"abc"), "Unterminated string starting at: line 1 column 1 (char 0)");
-        assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
-        assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
-        assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn json_dumps_escapes_like_python_without_ensure_ascii() {
-        let v = json_loads("{\"k\\u0001\": \"q\\\"\\\\\\t\\u007f\u{e9}\"}").unwrap();
-        assert_eq!(json_dumps(&v), "{\"k\\u0001\": \"q\\\"\\\\\\t\u{7f}\u{e9}\"}");
-    }
-
-    #[test]
-    fn urljoin_is_python_urljoin() {
-        assert_eq!(urljoin("https://a.com/b/c/", "../../../d?q#f").unwrap(), "https://a.com/d?q#f");
-        assert_eq!(urljoin("http://a.com/x", "//b.com/y").unwrap(), "http://b.com/y");
-    }
-}
 
 // ==================== python os / pathlib / shutil helpers (file_manager) ====================
 
@@ -913,7 +863,7 @@ pub fn py_normpath(s: &str) -> String {
     let (lead, rest) = if s.starts_with("//") && !s.starts_with("///") {
         ("//", &s[2..])
     } else if s.starts_with('/') {
-        ("/", &s[1..])
+        ("/", s.strip_prefix('/').unwrap_or(s))
     } else {
         ("", s)
     };
@@ -967,4 +917,55 @@ pub fn universal_newlines(s: &str) -> String {
         return s.to_string();
     }
     s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(s: &str) -> Option<String> {
+        json_loads(s).map(|v| json_dumps(&v))
+    }
+
+    #[test]
+    fn json_keeps_python_literals_and_integers() {
+        assert_eq!(roundtrip("[NaN, Infinity, -Infinity]").unwrap(), "[NaN, Infinity, -Infinity]");
+        assert_eq!(roundtrip("18446744073709551616").unwrap(), "18446744073709551616");
+        assert_eq!(roundtrip("[-0, 1e400, 1.0, 2.5e-3]").unwrap(), "[0, Infinity, 1.0, 0.0025]");
+        assert_eq!(roundtrip("{\"a\": 1, \"a\": 2, \"b\": null}").unwrap(), "{\"a\": 2, \"b\": null}");
+    }
+
+    #[test]
+    fn json_rejects_what_python_rejects() {
+        for bad in ["", "01", "1.", "[1,]", "{\"a\" 1}", "\"a\u{1}\"", "\"\\x\"", "\"\\ud800\"", "\u{feff}1", "1 2", "[1"] {
+            assert!(json_loads(bad).is_none(), "{:?} should not parse", bad);
+        }
+        assert_eq!(roundtrip("\"\\ud83d\\ude00\\n\\u00e9\""), Some("\"\u{1f600}\\n\u{e9}\"".to_string()));
+    }
+
+    #[test]
+    fn py_json_loads_reports_cpython_decode_error_text() {
+        let msg = |t: &str| py_json_loads(t).unwrap_err();
+        assert_eq!(msg(""), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\"a\" 1}"), "Expecting ':' delimiter: line 1 column 6 (char 5)");
+        assert_eq!(msg("[1 2]"), "Expecting ',' delimiter: line 1 column 4 (char 3)");
+        assert_eq!(msg("[1,]"), "Expecting value: line 1 column 4 (char 3)");
+        assert_eq!(msg("{\"a\":1} x"), "Extra data: line 1 column 9 (char 8)");
+        assert_eq!(msg("\"abc"), "Unterminated string starting at: line 1 column 1 (char 0)");
+        assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
+        assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
+        assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn json_dumps_escapes_like_python_without_ensure_ascii() {
+        let v = json_loads("{\"k\\u0001\": \"q\\\"\\\\\\t\\u007f\u{e9}\"}").unwrap();
+        assert_eq!(json_dumps(&v), "{\"k\\u0001\": \"q\\\"\\\\\\t\u{7f}\u{e9}\"}");
+    }
+
+    #[test]
+    fn urljoin_is_python_urljoin() {
+        assert_eq!(urljoin("https://a.com/b/c/", "../../../d?q#f").unwrap(), "https://a.com/d?q#f");
+        assert_eq!(urljoin("http://a.com/x", "//b.com/y").unwrap(), "http://b.com/y");
+    }
 }
