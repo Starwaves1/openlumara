@@ -11,6 +11,7 @@ pub mod modules;
 pub mod notes;
 pub mod replacer;
 pub mod token_threshold;
+pub mod time;
 pub mod tutorial;
 pub mod util;
 pub mod webui_extension_example;
@@ -145,5 +146,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: calculator::meta::UNSAFE,
         category: calculator::meta::CATEGORY,
         factory: calculator::Calculator::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "time",
+        class_name: time::meta::CLASS_NAME,
+        doc: time::meta::DOC,
+        settings: time::settings,
+        unsafe_: time::meta::UNSAFE,
+        category: time::meta::CATEGORY,
+        factory: time::Time::factory,
     });
 }
