@@ -10,7 +10,7 @@
 #[path = "../../../generated/modules/calendar.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, fromisoformat, fromisoformat_value, iso, midnight, now, py_datetime, query_int, total_seconds};
+use crate::util::{body_get, body_str, fromisoformat, fromisoformat_value, iso, midnight, now, py_datetime, py_type, query_int, total_seconds};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDateTime};
@@ -139,6 +139,18 @@ impl Inner {
 
     fn index_of(&self, id: &str) -> i64 {
         self.with(|s| Self::get_event_by_id(&s.data, id)).unwrap_or(-1)
+    }
+
+    /// python `_get_event_by_id` for any JSON id: a non-string id only fails once there is an event to compare
+    /// against (`id.strip()` raises AttributeError)
+    fn find_event(data: &[Value], id: &Value) -> anyhow::Result<i64> {
+        if data.is_empty() {
+            return Ok(-1);
+        }
+        match id {
+            Value::String(s) => Ok(Self::get_event_by_id(data, s)),
+            other => Err(anyhow!("'{}' object has no attribute 'strip'", py_type(other))),
+        }
     }
 
     /// the live (stored) version of an event, or the given copy if it was deleted
@@ -306,20 +318,20 @@ impl Inner {
         Ok(self.base.result(format!("event {} edited", py_str_opt(event.get("id"))), true))
     }
 
-    async fn delete_event(&self, id: &str) -> anyhow::Result<Value> {
-        let removed = self.with(|s| {
-            let i = Self::get_event_by_id(&s.data, id);
+    async fn delete_event(&self, id: &Value) -> anyhow::Result<Value> {
+        let removed = self.with(|s| -> anyhow::Result<bool> {
+            let i = Self::find_event(&s.data, id)?;
             if i < 0 {
-                return false;
+                return Ok(false);
             }
             s.data.remove(i as usize);
             s.save();
-            true
-        })?;
+            Ok(true)
+        })??;
         if !removed {
             return Ok(self.base.result("Error: Event with that ID does not exist", false));
         }
-        Ok(self.base.result(format!("event {} deleted", id), true))
+        Ok(self.base.result(format!("event {} deleted", py_str(id)), true))
     }
 
     fn cmd_calendar(&self, args: &[String]) -> anyhow::Result<String> {
@@ -390,10 +402,17 @@ impl Inner {
 
     /// parses 'YYYY-MM-DD' + 'HH:MM' (python strptime "%Y-%m-%d %H:%M")
     fn ui_parse_dt(date: &str, time: &str) -> Option<NaiveDateTime> {
-        NaiveDateTime::parse_from_str(&format!("{} {}", date.trim(), time.trim()), "%Y-%m-%d %H:%M").ok()
+        let s = format!("{} {}", date.trim(), time.trim());
+        // python's %Y matches exactly four digits; chrono's %Y also takes one to three
+        let year = s.split('-').next().unwrap_or("");
+        if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M").ok()
     }
 
     async fn route_create(&self, body: &Option<Value>) -> anyhow::Result<Value> {
+        dict_body(body)?;
         let title = body_str(body, "title", "").trim().to_string();
         if title.is_empty() {
             return Ok(self.base.result("event title cannot be empty", false));
@@ -415,19 +434,27 @@ impl Inner {
     }
 
     async fn route_update(&self, body: &Option<Value>) -> anyhow::Result<Value> {
+        dict_body(body)?;
         let Some(event_id) = body_get(body, "id").filter(truthy) else {
             return Ok(self.base.result("no event id given", false));
         };
         self.with(|s| s.load())?;
-        let index = self.index_of(&py_str(&event_id));
+        let index = self.with(|s| Self::find_event(&s.data, &event_id))??;
         if index < 0 {
             return Ok(self.base.result("event with that ID does not exist", false));
         }
-        let mut event = self.with(|s| s.data[index as usize].clone())?;
+        let idx = index as usize;
+        // python edits the stored dict in place, so a title change is already in memory when a later
+        // date fails to parse; it is only written out by the next save of the list
         let title = body_str(body, "title", "").trim().to_string();
         if !title.is_empty() {
-            event["title"] = json!(title);
+            self.with(|s| {
+                if let Some(e) = s.data.get_mut(idx) {
+                    e["title"] = json!(title);
+                }
+            })?;
         }
+        let mut event = self.with(|s| s.data.get(idx).cloned())?.unwrap_or(Value::Null);
         if body_get(body, "date").map(|v| truthy(&v)).unwrap_or(false) {
             let Some(dt) = Self::ui_parse_dt(&body_str(body, "date", ""), &body_str(body, "time", "00:00")) else {
                 return Ok(self.base.result("invalid date/time. expected YYYY-MM-DD and HH:MM", false));
@@ -442,7 +469,7 @@ impl Inner {
         }
         let stored = event.clone();
         self.with(|s| {
-            if let Some(slot) = s.data.get_mut(index as usize) {
+            if let Some(slot) = s.data.get_mut(idx) {
                 *slot = stored;
             }
             s.save();
@@ -451,6 +478,14 @@ impl Inner {
             self.schedule_notification(event.clone()).await?;
         }
         Ok(self.base.result(format!("event {} edited", py_str_opt(event.get("id"))), true))
+    }
+}
+
+/// python `body = body or {}` followed by `.get(...)`: a truthy non-object body raises AttributeError
+fn dict_body(body: &Option<Value>) -> anyhow::Result<()> {
+    match body {
+        Some(v) if truthy(v) && !v.is_object() => Err(anyhow!("'{}' object has no attribute 'get'", py_type(v))),
+        _ => Ok(()),
     }
 }
 
@@ -468,7 +503,7 @@ impl Module for Calendar {
         match method {
             "add_event" => self.inner.add_event(&args).await,
             "edit_event" => self.inner.edit_event(&args).await,
-            "delete_event" => self.inner.delete_event(&args.str_or("id", "")).await,
+            "delete_event" => self.inner.delete_event(&json!(args.str_or("id", ""))).await,
             "read_calendar_range" => Ok(self.inner.read_calendar_range(&args.str_or("start_date", ""), &args.str_or("end_date", ""))),
             _ => anyhow::bail!("'Calendar' object has no attribute '{}'", method),
         }
@@ -529,11 +564,12 @@ impl Module for Calendar {
             ("create", "POST") => self.inner.route_create(&body).await,
             ("update", "POST") => self.inner.route_update(&body).await,
             ("delete", "POST") => {
+                dict_body(&body)?;
                 let Some(id) = body_get(&body, "id").filter(truthy) else {
                     return Ok(self.inner.base.result("no event id given", false));
                 };
                 self.inner.with(|s| s.load())?;
-                self.inner.delete_event(&py_str(&id)).await
+                self.inner.delete_event(&id).await
             }
             _ => anyhow::bail!("route not found: {}", path),
         }
@@ -583,5 +619,21 @@ mod tests {
         assert_eq!(Inner::ui_parse_dt("2026-10-14", "09:05"), Some(dt("2026-10-14T09:05:00")));
         assert_eq!(Inner::ui_parse_dt(" 2026-10-14 ", " 9:05 "), Some(dt("2026-10-14T09:05:00")));
         assert_eq!(Inner::ui_parse_dt("2026-10-14", "None"), None);
+        // python's %Y needs exactly four digits: strptime rejects "26-10-14"
+        assert_eq!(Inner::ui_parse_dt("26-10-14", "09:05"), None);
+        assert_eq!(Inner::ui_parse_dt("0026-10-14", "09:05"), Some(dt("0026-10-14T09:05:00")));
+    }
+
+    #[test]
+    fn non_object_bodies_and_ids_raise_like_python() {
+        // a truthy non-dict body fails on .get(); falsy ones are replaced by {} (python `body or {}`)
+        assert_eq!(dict_body(&Some(json!([1]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+        assert!(dict_body(&Some(json!(0))).is_ok());
+        assert!(dict_body(&None).is_ok());
+        // with no events the id is never compared, so any id just misses
+        assert_eq!(Inner::find_event(&[], &json!(5)).unwrap(), -1);
+        let data = vec![json!({"id": " a ", "title": "A"})];
+        assert_eq!(Inner::find_event(&data, &json!("a")).unwrap(), 0);
+        assert_eq!(Inner::find_event(&data, &json!(5)).unwrap_err().to_string(), "'int' object has no attribute 'strip'");
     }
 }

@@ -8,7 +8,7 @@
 #[path = "../../../generated/modules/scheduler.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, fromisoformat_value, iso, now, py_int, py_int_str, replace_time, total_seconds, weekday};
+use crate::util::{body_get, body_str, fromisoformat_value, iso, now, py_int, py_int_str, py_type, replace_time, total_seconds, weekday};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDateTime};
@@ -214,28 +214,45 @@ pub fn format_recurring_time(recur: &Value) -> String {
     }
 }
 
-pub fn format_job_time(job: &Value) -> String {
+/// python `_format_job_time`. a missing `recurs_in` is {} (`job.get(k, {})`), but a stored null or other
+/// non-dict raises AttributeError on `.get` inside python's formatter
+pub fn format_job_time(job: &Value) -> anyhow::Result<String> {
     if job.get("recurring").map(truthy).unwrap_or(false) {
-        return format_recurring_time(job.get("recurs_in").unwrap_or(&json!({})));
+        let empty = json!({});
+        let recur = match job.get("recurs_in") {
+            None => &empty,
+            Some(v) if v.is_object() => v,
+            Some(other) => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+        };
+        return Ok(format_recurring_time(recur));
     }
-    match fromisoformat_value(Some(job.get("trigger_time").unwrap_or(&json!("")))) {
+    Ok(match fromisoformat_value(Some(job.get("trigger_time").unwrap_or(&json!("")))) {
         Ok(dt) => format!("one-time, due {}", dt.format("%Y-%m-%d %H:%M")),
         Err(_) => "one-time, invalid time".into(),
-    }
+    })
 }
 
 /// python Scheduler.__str__
-pub fn schedule_to_string(schedule: &[Value]) -> String {
-    let lines: Vec<String> = schedule
+pub fn schedule_to_string(schedule: &[Value]) -> anyhow::Result<String> {
+    let lines = schedule
         .iter()
         .map(|job| {
             let id = job.get("id").map(py_str).unwrap_or_else(|| "unknown".into());
             let action = job.get("action").map(py_str).unwrap_or_default();
             let chan = job.get("channel").map(py_str).unwrap_or_else(|| "unknown channel".into());
-            format!("{}: {} on {}: {}", id, format_job_time(job), chan, action)
+            Ok(format!("{}: {} on {}: {}", id, format_job_time(job)?, chan, action))
         })
-        .collect();
-    lines.join("\n")
+        .collect::<anyhow::Result<Vec<String>>>()?;
+    Ok(lines.join("\n"))
+}
+
+/// python `(value or "").<method>()`: a truthy non-string raises AttributeError
+fn str_arg(value: Option<Value>, method: &str) -> anyhow::Result<String> {
+    match value.filter(truthy) {
+        None => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s),
+        Some(other) => anyhow::bail!("'{}' object has no attribute '{}'", py_type(&other), method),
+    }
 }
 
 /// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur)
@@ -810,21 +827,22 @@ impl Inner {
 
     fn route_list(&self) -> anyhow::Result<Value> {
         self.with(|s| s.load())?;
+        // python builds the whole list in one loop: one job whose schedule can't be formatted fails the request
         let mut items: Vec<Value> = self
             .jobs()
             .iter()
             .map(|job| {
-                json!({
+                Ok(json!({
                     "id": job.get("id").cloned().unwrap_or(Value::Null),
                     "action": job.get("action").cloned().unwrap_or(json!("")),
                     "channel": job.get("channel").cloned().unwrap_or(json!("")),
                     "trigger_time": job.get("trigger_time").cloned().unwrap_or(json!("")),
                     "recurring": job.get("recurring").map(truthy).unwrap_or(false),
                     "recurs_in": job.get("recurs_in").cloned().unwrap_or(Value::Null),
-                    "display": format_job_time(job),
-                })
+                    "display": format_job_time(job)?,
+                }))
             })
-            .collect();
+            .collect::<anyhow::Result<_>>()?;
         items.sort_by_key(|j| {
             let t = &j["trigger_time"];
             if truthy(t) {
@@ -836,12 +854,16 @@ impl Inner {
         Ok(Value::Array(items))
     }
 
-    fn form_recur(&self, body: &Option<Value>) -> Result<Value, &'static str> {
+    /// python `_ui_build_recur(...)` arguments: `duration` is only read in relative mode, `time` only in clock mode
+    fn form_recur(&self, body: &Option<Value>) -> anyhow::Result<Result<Value, &'static str>> {
         let mode = body_get(body, "mode").map(|v| py_str(&v)).unwrap_or_else(|| "relative".into());
-        let duration = body_get(body, "duration").filter(truthy).map(|v| py_str(&v)).unwrap_or_default();
-        let time = body_get(body, "time").filter(truthy).map(|v| py_str(&v)).unwrap_or_default();
         let weekday = body_get(body, "weekday");
-        ui_build_recur(&mode, &duration, &time, weekday.as_ref())
+        let (duration, time) = if mode == "relative" {
+            (str_arg(body_get(body, "duration"), "strip")?, String::new())
+        } else {
+            (String::new(), str_arg(body_get(body, "time"), "split")?)
+        };
+        Ok(ui_build_recur(&mode, &duration, &time, weekday.as_ref()))
     }
 
     async fn route_create_or_update(&self, body: &Option<Value>, update: bool) -> anyhow::Result<Value> {
@@ -861,7 +883,7 @@ impl Inner {
         if action.is_empty() {
             return Ok(self.base.result("job action cannot be empty", false));
         }
-        let recur = match self.form_recur(body) {
+        let recur = match self.form_recur(body)? {
             Ok(r) => r,
             Err(e) => return Ok(self.base.result(e, false)),
         };
@@ -960,7 +982,7 @@ impl Module for Scheduler {
         if jobs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(format!("Your scheduler system will trigger these events at the specified times:\n{}", schedule_to_string(&jobs))))
+        Ok(Some(format!("Your scheduler system will trigger these events at the specified times:\n{}", schedule_to_string(&jobs)?)))
     }
 
     fn ui_routes(&self) -> Vec<UiRoute> {
@@ -1053,7 +1075,21 @@ mod tests {
         assert_eq!(format_recurring_time(&json!({"weeks": 0, "days": 2, "hours": 3})), "every 2 days, 3 hours");
         assert_eq!(format_recurring_time(&json!({})), "invalid schedule");
         let job = json!({"id": "X", "action": "do it", "channel": "webui", "trigger_time": "2026-10-14T10:00:00.123", "recurring": false});
-        assert_eq!(schedule_to_string(&[job]), "X: one-time, due 2026-10-14 10:00 on webui: do it");
+        assert_eq!(schedule_to_string(&[job]).unwrap(), "X: one-time, due 2026-10-14 10:00 on webui: do it");
+        // a recurring job with a stored null recurs_in makes python's formatter raise; a missing key does not
+        let null_recur = json!({"id": "N", "recurring": true, "recurs_in": null});
+        assert_eq!(format_job_time(&null_recur).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
+        let missing = json!({"id": "M", "recurring": true});
+        assert_eq!(format_job_time(&missing).unwrap(), "invalid schedule");
+    }
+
+    #[test]
+    fn recur_argument_types() {
+        // python `(duration or "").strip()` on a truthy number raises instead of reading it as text
+        assert_eq!(str_arg(Some(json!(5)), "strip").unwrap_err().to_string(), "'int' object has no attribute 'strip'");
+        assert_eq!(str_arg(Some(json!(0)), "strip").unwrap(), "");
+        assert_eq!(str_arg(None, "split").unwrap(), "");
+        assert_eq!(str_arg(Some(json!("08:15")), "split").unwrap(), "08:15");
     }
 
     #[test]
