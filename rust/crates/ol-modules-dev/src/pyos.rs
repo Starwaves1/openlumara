@@ -87,9 +87,55 @@ pub fn readlines(s: &str) -> Vec<&str> {
     out
 }
 
+/// python `str.isspace()`: unicode whitespace plus the ASCII file/group/record/unit separators
+/// (U+001C..U+001F), which python counts as whitespace but rust's `char::is_whitespace` does not
+pub fn py_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
 /// python `str.rstrip()` (whitespace)
 pub fn rstrip(s: &str) -> &str {
-    s.trim_end_matches(|c: char| c.is_whitespace())
+    s.trim_end_matches(py_isspace)
+}
+
+/// python `for line in open(path, encoding="utf-8")` as far as it gets before a decode error.
+/// The file is decoded in 8 KB chunks, and python yields every complete line decoded from the
+/// chunks before the one holding the bad byte. Returns the (universal-newline translated) text of
+/// those lines, and whether the whole file decoded cleanly. Read errors are python-formatted.
+pub fn read_text_chunked(path: &str) -> Result<(String, bool), String> {
+    const CHUNK: usize = 8192;
+    let bytes = std::fs::read(path).map_err(|e| os_err(&e, path))?;
+    let mut text = String::new();
+    let mut pending: Vec<u8> = Vec::new();
+    for chunk in bytes.chunks(CHUNK) {
+        pending.extend_from_slice(chunk);
+        match std::str::from_utf8(&pending) {
+            Ok(s) => {
+                text.push_str(s);
+                pending.clear();
+            }
+            // an incomplete multi-byte sequence at the end of a chunk waits for the next chunk
+            Err(e) if e.error_len().is_none() => {
+                let valid = e.valid_up_to();
+                text.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or_default());
+                pending.drain(..valid);
+            }
+            Err(_) => return Ok((complete_lines_only(&text), false)),
+        }
+    }
+    if !pending.is_empty() {
+        // python's final decode fails on the dangling sequence; the unterminated last line is lost
+        return Ok((complete_lines_only(&text), false));
+    }
+    Ok((universal_newlines(&text), true))
+}
+
+/// the text up to and including the last newline, universal-newline translated
+fn complete_lines_only(text: &str) -> String {
+    match text.rfind('\n') {
+        Some(i) => universal_newlines(&text[..=i]),
+        None => String::new(),
+    }
 }
 
 /// os.path.expanduser

@@ -83,16 +83,71 @@ fn py_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// the coder's POST routes that read `(body or {}).get(...)`
+const BODY_ROUTES: &[&str] = &[
+    "save",
+    "lint",
+    "create",
+    "move",
+    "delete",
+    "duplicate",
+    "search",
+    "git_stage",
+    "git_unstage",
+    "git_commit",
+    "git_branch",
+    "git_push",
+    "git_fetch",
+    "git_pull",
+    "git_branch_create",
+    "git_branch_delete",
+    "git_resolve",
+    "git_revert_file",
+];
+
 /// python's `(body or {})` in the coder's POST routes: a truthy body that is not a dict makes
 /// `.get` raise AttributeError, which the webui reports with that exception text
 fn body_dict(path: &str, body: Option<Value>) -> anyhow::Result<Map<String, Value>> {
     match body {
         Some(Value::Object(m)) => Ok(m),
-        Some(v) if truthy(&v) && matches!(path, "save" | "lint" | "create" | "move" | "delete" | "duplicate") => {
+        Some(v) if truthy(&v) && BODY_ROUTES.contains(&path) => {
             anyhow::bail!("'{}' object has no attribute 'get'", py_type_name(&v))
         }
         _ => Ok(Map::new()),
     }
+}
+
+/// python's `os.path.join` / `os.fspath` / `os.walk` text for a None path (no sandbox_paths)
+const FSPATH_NONE: &str = "expected str, bytes or os.PathLike object, not NoneType";
+
+/// python's `_get_full_sandbox_path(requested)` for a raw request value: a str is looked up; any
+/// other truthy value fails on `.rstrip` when sandbox_paths is set, and is None (no path) when it
+/// is not
+fn raw_sandbox_root(coder: &Coder, sandbox: &Value) -> R<Option<String>> {
+    match sandbox {
+        Value::String(s) => coder.get_full_sandbox_path(s),
+        _ if coder.cfg_list("sandbox_paths").is_empty() => Ok(None),
+        other => Err(format!("'{}' object has no attribute 'rstrip'", py_type_name(other))),
+    }
+}
+
+/// python `int(s)` for a str: surrounding whitespace, an optional sign and single underscores
+/// between digits are accepted (`int(" 1_000 ") == 1000`)
+fn parse_py_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, body) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    if !body.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        return None;
+    }
+    let n: i64 = body.replace('_', "").parse().ok()?;
+    Some(if neg { -n } else { n })
 }
 
 /// python's `(body or {}).get("content", "")` passed on unchanged: only a str can be written or
@@ -138,6 +193,74 @@ fn compile_regex(pattern: &str, ignore_case: bool) -> R<fancy_regex::Regex> {
 fn re_search(re: &fancy_regex::Regex, line: &str) -> R<bool> {
     let l = line.strip_suffix('\n').unwrap_or(line);
     re.is_match(l).map_err(|e| e.to_string())
+}
+
+/// python `_route_search`'s os.walk: flat (file, line, text) hits under `root`, skipping hidden
+/// and blacklisted folders, hidden files and oversized files. Returns the hits and `truncated`.
+fn search_tree(
+    root: &str,
+    pattern: Option<&fancy_regex::Regex>,
+    needle: &Value,
+    blacklist: &[String],
+    max_matches: i64,
+) -> anyhow::Result<(Vec<Value>, bool)> {
+    // non-regex: python evaluates `needle.lower()` per line, so a non-str needle only fails
+    // once a file with a line is reached
+    let needle_lower = match needle {
+        Value::String(s) => Some(s.to_lowercase()),
+        _ => None,
+    };
+    let mut results: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    let mut fatal: Option<String> = None;
+    pyos::walk::<()>(root, &mut |dirpath, dirnames, filenames| {
+        dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+        for fname in filenames {
+            if fname.starts_with('.') {
+                continue;
+            }
+            let fpath = pyos::join(dirpath, fname);
+            match std::fs::metadata(&fpath) {
+                Ok(m) if m.len() > UI_MAX_READ_BYTES => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            // a decode error keeps the lines python had already yielded from earlier chunks
+            let Ok((content, _)) = pyos::read_text_chunked(&fpath) else { continue };
+            for (i, line) in pyos::readlines(&content).iter().enumerate() {
+                let hit = match (pattern, &needle_lower) {
+                    (Some(p), _) => match re_search(p, line) {
+                        Ok(h) => h,
+                        Err(_) => continue,
+                    },
+                    (None, Some(n)) => line.to_lowercase().contains(n.as_str()),
+                    (None, None) => {
+                        fatal = Some(format!("'{}' object has no attribute 'lower'", py_type_name(needle)));
+                        return ControlFlow::Break(());
+                    }
+                };
+                if hit {
+                    let text: String = pyos::rstrip(line).chars().take(300).collect();
+                    results.push(json!({"file": pyos::relpath(&fpath, root), "line": i + 1, "text": text}));
+                    // python breaks only the line loop here: the remaining files of this
+                    // directory still each append their first hit before the walk stops
+                    if results.len() as i64 >= max_matches {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if truncated {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    if let Some(msg) = fatal {
+        anyhow::bail!(msg);
+    }
+    Ok((results, truncated))
 }
 
 /// python list slicing helper for possibly negative start
@@ -196,8 +319,15 @@ async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
         Ok(Err(e)) => return (false, e.to_string()),
         Ok(Ok(o)) => o,
     };
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    // python's text=True decodes strictly (and translates newlines); a decode error is the failure
+    let stdout = match pyos::decode_utf8(&out.stdout) {
+        Ok(s) => pyos::universal_newlines(&s).trim().to_string(),
+        Err(e) => return (false, e),
+    };
+    let stderr = match pyos::decode_utf8(&out.stderr) {
+        Ok(s) => pyos::universal_newlines(&s).trim().to_string(),
+        Err(e) => return (false, e),
+    };
     let rc = out.status.code().unwrap_or(-1);
     if !accept.contains(&rc) {
         let msg = if !stderr.is_empty() {
@@ -358,7 +488,7 @@ fn py_int(v: Option<&Value>, default: i64) -> anyhow::Result<i64> {
         None => Ok(default),
         Some(Value::Number(n)) => Ok(n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)),
         Some(Value::Bool(b)) => Ok(*b as i64),
-        Some(Value::String(s)) => s.trim().parse::<i64>().map_err(|_| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
+        Some(Value::String(s)) => parse_py_int(s).ok_or_else(|| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
         Some(other) => Err(anyhow!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(other))),
     }
 }
@@ -1092,103 +1222,92 @@ impl Coder {
     }
 
     fn route_search(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
-        let sandbox = sget(b, "sandbox");
-        let needle = sget(b, "query");
         let use_regex = present(b, "regex");
-        let mm = b.get("max_matches").filter(|v| truthy(v));
-        let max_matches = py_int(mm, 200)?.min(500);
-        if sandbox.is_empty() || needle.is_empty() {
+        let max_matches = py_int(b.get("max_matches").filter(|v| truthy(v)), 200)?.min(500);
+        // python tests `not sandbox or not needle` on the raw values
+        let (Some(sandbox), Some(needle)) = (required_field(b, "sandbox"), required_field(b, "query")) else {
             return Ok(self.result("sandbox and query are both required", false));
-        }
-        let root = match self.full_sandbox(&sandbox) {
+        };
+        let root = match raw_sandbox_root(self, sandbox) {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
         let pattern = if use_regex {
-            match compile_regex(&needle, true) {
+            let compiled = match needle {
+                Value::String(s) => compile_regex(s, true).map_err(|e| format!("invalid regex: {}", e)),
+                _ => Err("invalid regex: first argument must be string or compiled pattern".to_string()),
+            };
+            match compiled {
                 Ok(p) => Some(p),
-                Err(e) => return Ok(self.result(format!("invalid regex: {}", e), false)),
+                Err(e) => return Ok(self.result(e, false)),
             }
         } else {
             None
         };
-        let needle_lower = needle.to_lowercase();
+        // python's `os.walk(None)` raises (after the regex compile, before any file is read)
+        let Some(root) = root else { anyhow::bail!(FSPATH_NONE) };
         let blacklist = self.blacklist();
-        let mut results: Vec<Value> = Vec::new();
-        let mut truncated = false;
-        pyos::walk::<()>(&root, &mut |dirpath, dirnames, filenames| {
-            dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
-            for fname in filenames {
-                if fname.starts_with('.') {
-                    continue;
-                }
-                let fpath = pyos::join(dirpath, fname);
-                match std::fs::metadata(&fpath) {
-                    Ok(m) if m.len() > UI_MAX_READ_BYTES => continue,
-                    Ok(_) => {}
-                    Err(_) => continue,
-                }
-                let Ok(content) = pyos::read_text(&fpath) else { continue };
-                for (i, line) in pyos::readlines(&content).iter().enumerate() {
-                    let hit = match &pattern {
-                        Some(p) => match re_search(p, line) {
-                            Ok(h) => h,
-                            Err(_) => continue,
-                        },
-                        None => line.to_lowercase().contains(&needle_lower),
-                    };
-                    if hit {
-                        let text: String = pyos::rstrip(line).chars().take(300).collect();
-                        results.push(json!({"file": pyos::relpath(&fpath, &root), "line": i + 1, "text": text}));
-                        if results.len() as i64 >= max_matches {
-                            truncated = true;
-                            break;
-                        }
-                    }
-                }
-                if truncated {
-                    break;
-                }
-            }
-            if truncated {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        });
+        let (results, truncated) = search_tree(&root, pattern.as_ref(), needle, &blacklist, max_matches)?;
         Ok(json!({"results": results, "truncated": truncated}))
     }
 
     // ---------------- git
 
     fn git_root(&self, sandbox: &str, subpath: &str) -> R<String> {
-        let full = self.full_sandbox(sandbox)?;
+        self.value_git_root(&Value::String(sandbox.to_string()), subpath)
+    }
+
+    /// python `_git_root(sandbox, subpath)` on a raw request value. A None sandbox root is refused
+    /// here (python would run git in the server's own working directory).
+    fn value_git_root(&self, sandbox: &Value, subpath: &str) -> R<String> {
+        let full = raw_sandbox_root(self, sandbox)?.ok_or_else(|| FSPATH_NONE.to_string())?;
         if subpath.is_empty() {
             return Ok(full);
         }
         ol_core::paths::sandbox_path(&full, Some(subpath)).map_err(|e| e.to_string())
     }
 
-    fn check_git_paths(root: &str, paths: &[String]) -> R<()> {
+    /// python `for p in paths` over a raw request value: a list yields its items, a str its
+    /// characters, a dict its keys, and any other value is not iterable
+    fn path_items(paths: &Value) -> R<Vec<Value>> {
+        match paths {
+            Value::Array(a) => Ok(a.clone()),
+            Value::String(s) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+            Value::Object(m) => Ok(m.keys().map(|k| Value::String(k.clone())).collect()),
+            other => Err(format!("'{}' object is not iterable", py_type_name(other))),
+        }
+    }
+
+    /// python `_check_git_paths(root, paths)` followed by `abs_paths = [normpath(join(root, p))]`,
+    /// item by item: a non-str item fails in `os.path.join`, and an item that escapes the sandbox
+    /// fails with python's message
+    fn check_git_paths(root: &str, items: &[Value]) -> R<Vec<String>> {
         let sandbox_root = pyos::dirname(root);
-        for p in paths {
+        let mut abs = Vec::with_capacity(items.len());
+        for item in items {
+            let Value::String(p) = item else {
+                return Err(format!("expected str, bytes or os.PathLike object, not {}", py_type_name(item)));
+            };
             let full = pyos::normpath(&pyos::join(root, p));
             if full != sandbox_root && !full.starts_with(&format!("{}/", sandbox_root)) {
                 return Err(format!("path escapes the sandbox: {}", p));
             }
+            abs.push(full);
         }
-        Ok(())
+        Ok(abs)
     }
 
-    fn route_git_repos(&self, q: &Map<String, Value>) -> Value {
+    fn route_git_repos(&self, q: &Map<String, Value>) -> anyhow::Result<Value> {
         let sandbox = sget(q, "sandbox");
         if sandbox.is_empty() {
-            return self.result("no sandbox given", false);
+            return Ok(self.result("no sandbox given", false));
         }
-        let root = match self.full_sandbox(&sandbox) {
+        let root = match self.get_full_sandbox_path(&sandbox) {
             Ok(r) => r,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
         };
+        // python's `os.path.join(None, ".git")` raises uncaught here
+        let Some(root) = root else { anyhow::bail!(FSPATH_NONE) };
         let blacklist = self.blacklist();
         let max_depth = 6usize;
         let max_repos = 50usize;
@@ -1216,7 +1335,7 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
-        json!({"repos": repos})
+        Ok(json!({"repos": repos}))
     }
 
     async fn route_git_status(&self, q: &Map<String, Value>) -> Value {
@@ -1262,28 +1381,19 @@ impl Coder {
         Ok(json!({"is_repo": true, "branch": branch, "log": parse_log(&raw)}))
     }
 
-    fn body_paths(b: &Map<String, Value>) -> Vec<String> {
-        match b.get("paths") {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
-            _ => Vec::new(),
-        }
-    }
-
     async fn route_git_stage(&self, b: &Map<String, Value>, unstage: bool) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget(b, "sandbox");
-        let paths = Self::body_paths(b);
-        if sandbox.is_empty() || !present(b, "paths") {
+        // python tests `not sandbox or not paths` on the raw values
+        let (Some(sandbox), Some(paths)) = (required_field(b, "sandbox"), required_field(b, "paths")) else {
             return self.result("sandbox and paths are both required", false);
-        }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &paths).map(|_| r)) {
+        };
+        let root = match self.value_git_root(sandbox, &sget(b, "subpath")) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs: Vec<String> = paths.iter().map(|p| pyos::normpath(&pyos::join(&root, p))).collect();
+        let abs = match Self::path_items(paths).and_then(|items| Self::check_git_paths(&root, &items)) {
+            Ok(a) => a,
+            Err(e) => return self.result(e, false),
+        };
         let mut args: Vec<&str> = if unstage { vec!["restore", "--staged", "--"] } else { vec!["add", "--"] };
         args.extend(abs.iter().map(|s| s.as_str()));
         let (ok, out) = git(&root, &args).await;
@@ -1454,7 +1564,7 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return Err(self.result("sandbox and path are both required", false));
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return Err(self.result(e, false)),
         };
@@ -1641,7 +1751,7 @@ impl Coder {
         if !matches!(strategy.as_str(), "ours" | "theirs" | "both") {
             return self.result("strategy must be 'ours', 'theirs', or 'both'", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1679,7 +1789,7 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
@@ -1857,7 +1967,26 @@ impl Module for Coder {
     async fn ui_route(&self, path: &str, _method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         // python's write routes check read-only before they read the body, so a bad body still
         // gets the read-only refusal here
-        if matches!(path, "save" | "create" | "move" | "delete" | "duplicate") && self.read_only() {
+        if matches!(
+            path,
+            "save"
+                | "create"
+                | "move"
+                | "delete"
+                | "duplicate"
+                | "git_stage"
+                | "git_unstage"
+                | "git_commit"
+                | "git_branch"
+                | "git_push"
+                | "git_fetch"
+                | "git_pull"
+                | "git_branch_create"
+                | "git_branch_delete"
+                | "git_resolve"
+                | "git_revert_file"
+        ) && self.read_only()
+        {
             return Ok(self.result("coder is in read-only mode", false));
         }
         let b = body_dict(path, body)?;
@@ -1874,7 +2003,7 @@ impl Module for Coder {
             "delete" => self.route_delete(&b),
             "duplicate" => self.route_duplicate(&b),
             "search" => self.route_search(&b)?,
-            "git_repos" => self.route_git_repos(q),
+            "git_repos" => self.route_git_repos(q)?,
             "git_status" => self.route_git_status(q).await,
             "git_recent" => self.route_git_recent(q).await?,
             "git_stage" => self.route_git_stage(&b, false).await,
@@ -1975,6 +2104,92 @@ mod tests {
         assert!(body_dict("save", Some(json!([]))).unwrap().is_empty());
         assert!(body_dict("git_status", Some(json!("abc"))).unwrap().is_empty());
         assert_eq!(body_dict("save", Some(json!({"path": "a"}))).unwrap()["path"], "a");
+    }
+
+    #[test]
+    fn search_truncation_keeps_one_more_hit_per_remaining_file() {
+        // python breaks only the line loop at the cap, so each later file in the directory still
+        // appends its first hit: max_matches=1 with two matching files returns 2 results
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit\n").unwrap();
+        std::fs::write(root.join("b.txt"), "hit\n").unwrap();
+        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &[], 1).unwrap();
+        assert!(truncated);
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_keeps_lines_decoded_before_a_bad_byte() {
+        // python reads 8 KB chunks: the hit in the first chunk is yielded before the invalid byte
+        // in the second chunk fails the decode, and the file's other lines are dropped
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let mut bytes = b"hit\n".to_vec();
+        bytes.extend(std::iter::repeat(b'z').take(9000));
+        bytes.extend(b"\n\xff\nhit late\n");
+        std::fs::write(root.join("bad.txt"), &bytes).unwrap();
+        let (results, truncated) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &[], 200).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["line"], 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn search_raw_request_values_follow_python_truthiness() {
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        // a falsy query is missing, even when it is not a string
+        let out = coder.route_search(json!({"sandbox": "ws", "query": 0}).as_object().unwrap()).unwrap();
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["content"], "sandbox and query are both required");
+        // a non-str regex needle fails inside regex.compile, which python reports as invalid regex
+        let out = coder.route_search(json!({"sandbox": "ws", "query": 5, "regex": true}).as_object().unwrap()).unwrap();
+        assert_eq!(out["content"], "invalid regex: first argument must be string or compiled pattern");
+    }
+
+    #[test]
+    fn body_shape_errors_cover_search_and_git_writes() {
+        assert_eq!(body_dict("search", Some(json!("abc"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        assert_eq!(body_dict("git_stage", Some(json!(7))).unwrap_err().to_string(), "'int' object has no attribute 'get'");
+        assert!(body_dict("git_status", Some(json!("abc"))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn git_paths_iterate_like_python() {
+        // a dict iterates its keys, a str its characters, and numbers/bools are not iterable
+        assert_eq!(Coder::path_items(&json!({"a.txt": 1})).unwrap(), vec![json!("a.txt")]);
+        assert_eq!(Coder::path_items(&json!("ab")).unwrap(), vec![json!("a"), json!("b")]);
+        assert_eq!(Coder::path_items(&json!(5)).unwrap_err(), "'int' object is not iterable");
+        assert_eq!(Coder::path_items(&json!(true)).unwrap_err(), "'bool' object is not iterable");
+        // a non-str item fails in os.path.join rather than being stringified
+        let items = Coder::path_items(&json!([5])).unwrap();
+        assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "expected str, bytes or os.PathLike object, not int");
+        // the escape check still runs item by item
+        let items = Coder::path_items(&json!(["ok.txt", "../../x"])).unwrap();
+        assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "path escapes the sandbox: ../../x");
+    }
+
+    #[test]
+    fn python_int_accepts_underscore_separators() {
+        assert_eq!(parse_py_int("1_000"), Some(1000));
+        assert_eq!(parse_py_int(" -42 "), Some(-42));
+        assert_eq!(parse_py_int("1__0"), None);
+        assert_eq!(parse_py_int("_1"), None);
+        assert_eq!(parse_py_int("1_"), None);
+        assert_eq!(parse_py_int("x"), None);
+    }
+
+    #[test]
+    fn read_text_chunked_stops_at_the_bad_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.txt");
+        std::fs::write(&p, b"one\ntwo\xff\n").unwrap();
+        // a single chunk holds the bad byte, so nothing is yielded
+        let (text, ok) = pyos::read_text_chunked(p.to_str().unwrap()).unwrap();
+        assert!(!ok);
+        assert_eq!(text, "");
     }
 
     #[test]
