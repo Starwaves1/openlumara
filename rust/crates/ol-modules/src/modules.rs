@@ -5,6 +5,7 @@ use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
 use ol_core::pyjson::{py_repr, py_str};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/modules.rs"]
 pub(crate) mod meta;
@@ -15,6 +16,10 @@ pub struct Modules {
 }
 
 impl Modules {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
@@ -93,5 +98,94 @@ impl Module for Modules {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Map;
+
+    use crate::util::CONFIG_TEST_LOCK as CONFIG_LOCK;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    /// installs a config with the `allow_ai_to_toggle` flag, the enabled/disabled module lists
+    /// and the `model.dynamic_tool_loading` flag
+    fn setup(allow_toggle: bool, dynamic_tool_loading: bool) -> Modules {
+        let data = json!({
+            "modules": {
+                "enabled": ["identity", "notes"],
+                "disabled": ["tutorial"],
+                "settings": {"modules": {"allow_ai_to_toggle": allow_toggle}}
+            },
+            "model": {"dynamic_tool_loading": dynamic_tool_loading}
+        });
+        ol_core::config::set_for_tests(data.clone());
+        // set_for_tests() keeps a config file from an earlier test, and every read reloads that file,
+        // so the same data is written to it (JSON is valid YAML)
+        let path = ol_core::config::config_path().expect("test config path");
+        std::fs::write(&path, data.to_string()).expect("write test config");
+        Modules::new(ModuleBase::detached("modules"))
+    }
+
+    fn call(m: &Modules, method: &str, pairs: &[(&str, Value)]) -> Value {
+        let args: Map<String, Value> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        block_on(m.call_tool(method, ToolArgs::new(args))).unwrap()
+    }
+
+    #[test]
+    fn toggle_refused_when_ai_toggling_is_off() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(false, false);
+        // on_ready puts the toggle tool into disabled_tools when the setting is off
+        block_on(m.on_ready()).unwrap();
+        assert_eq!(m.disabled_tools(), vec!["toggle".to_string()]);
+        let out = call(&m, "toggle", &[("name", json!("notes"))]);
+        assert_eq!(
+            out,
+            json!({
+                "status": "success",
+                "content": "Module toggling is disabled for security. Ask user to manually toggle the module via the web ui or `/config` or by editing the config file."
+            })
+        );
+    }
+
+    #[test]
+    fn toggle_of_module_manager_is_refused_with_plain_string() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(true, false);
+        block_on(m.on_ready()).unwrap();
+        assert!(m.disabled_tools().is_empty());
+        let out = call(&m, "toggle", &[("name", json!("modules"))]);
+        assert_eq!(
+            out,
+            json!("module manager can only be manually turned off by using the settings dialog, the `/module` command, or editing the config file. user needs to know what you're doing!")
+        );
+    }
+
+    #[test]
+    fn get_help_unknown_module_is_an_error_result() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(true, false);
+        let out = call(&m, "get_help", &[("module_name", json!("no_such_module_xyz"))]);
+        assert_eq!(out, json!({"status": "error", "content": "That module does not exist"}));
+    }
+
+    #[test]
+    fn system_prompt_lists_enabled_and_disabled_like_python_str_dict() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(false, false);
+        let prompt = block_on(m.on_system_prompt()).unwrap();
+        assert_eq!(prompt.as_deref(), Some("{'enabled': 'identity, notes', 'disabled': 'tutorial'}"));
+    }
+
+    #[test]
+    fn system_prompt_omitted_when_dynamic_tool_loading_is_on() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(false, true);
+        assert_eq!(block_on(m.on_system_prompt()).unwrap(), None);
     }
 }

@@ -326,6 +326,10 @@ pub fn listdir(path: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// the config is process-wide: tests that install one hold this lock while they run
+#[cfg(test)]
+pub(crate) static CONFIG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
