@@ -131,16 +131,24 @@ impl UnsafeShell {
         self.run_argv(&argv).await
     }
 
-    /// `/bin/sh -c <argv...>` with stdout/stderr captured, as subprocess.run(capture_output=True)
+    /// `/bin/sh -c <argv...>` with stdout/stderr captured, as subprocess.run(capture_output=True).
+    /// python's exec() is async in name only: subprocess.run blocks until the command ends, so the
+    /// tool timeout can never interrupt it and the real output is returned. block_in_place runs the
+    /// blocking wait the same way (the tool future does not yield until the command is done).
     async fn run_argv(&self, argv: &[String]) -> anyhow::Result<Value> {
-        let out = tokio::process::Command::new("/bin/sh")
-            .arg("-c")
-            .args(argv)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
+        // popen rejects any argument containing a NUL byte before spawning anything
+        if argv.iter().any(|a| a.contains('\0')) {
+            anyhow::bail!("embedded null byte");
+        }
+        let out = tokio::task::block_in_place(|| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .args(argv)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+        })?;
         let stdout = py_text(&out.stdout)?;
         let stderr = py_text(&out.stderr)?;
         Ok(self.base.result(
@@ -226,21 +234,46 @@ mod tests {
         assert_eq!(py_strip("\x1c  hi \u{3000}\n"), "hi");
     }
 
-    #[tokio::test]
+    // block_in_place needs the multi-thread runtime (the app runs on one), so every test here uses it
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn exec_returns_stdout_stderr_and_exit_code() {
         let m = UnsafeShell::new_for_test();
         let r = m.exec("printf '  hi  '; echo oops >&2; exit 3").await.unwrap();
         assert_eq!(r, json!({"status": "success", "content": {"stdout": "hi", "stderr": "oops", "exit_code": 3}}));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_waits_past_tool_timeout_like_python_subprocess_run() {
+        // python: a 2s command under a 0.5s wait_for still returns its output
+        let m = UnsafeShell::new_for_test();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            m.exec("sleep 0.3; echo done"),
+        )
+        .await
+        .expect("exec must not be interrupted by an outer timeout")
+        .unwrap();
+        assert_eq!(r["content"]["stdout"], json!("done"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_nul_byte_raises_python_message_before_running() {
+        let m = UnsafeShell::new_for_test();
+        let err = m.exec_tool(Some(&json!("echo a\u{0}b"))).await.unwrap_err().to_string();
+        assert_eq!(err, "embedded null byte");
+        let err = m.exec_tool(Some(&json!(["echo", "a\u{0}b"]))).await.unwrap_err().to_string();
+        assert_eq!(err, "embedded null byte");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn exec_reports_signal_as_negative_exit_code() {
         let m = UnsafeShell::new_for_test();
         let r = m.exec("kill -9 $$").await.unwrap();
         assert_eq!(r["content"]["exit_code"], json!(-9));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn shell_command_joins_args_and_renders_output() {
         let m = UnsafeShell::new_for_test();
         let out = m.run_command("shell", vec!["echo".into(), "hello".into()]).await.unwrap();
@@ -249,7 +282,7 @@ mod tests {
         assert_eq!(out.as_deref(), Some("BLANK"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn exec_tool_call_returns_result_dict() {
         let m = UnsafeShell::new_for_test();
         let mut map = serde_json::Map::new();
@@ -258,7 +291,7 @@ mod tests {
         assert_eq!(r["content"]["stdout"], json!("tool"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn exec_tool_list_cmd_runs_as_sh_argv() {
         // python: subprocess.run(["echo $0", "hi"], shell=True) runs `sh -c 'echo $0' hi`
         let m = UnsafeShell::new_for_test();
@@ -266,7 +299,7 @@ mod tests {
         assert_eq!(r["content"]["stdout"], json!("hi"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn exec_tool_non_string_cmd_raises_before_running() {
         let m = UnsafeShell::new_for_test();
         let err = m.exec_tool(Some(&json!(5))).await.unwrap_err().to_string();
