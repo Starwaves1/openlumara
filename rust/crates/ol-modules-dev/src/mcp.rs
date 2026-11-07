@@ -32,8 +32,16 @@ use tokio::task::JoinHandle;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use std::process::Stdio;
 
-/// protocol revision this client asks for (the server may answer with another one)
-const PROTOCOL_VERSION: &str = "2025-06-18";
+/// protocol revision this client asks for (python SDK `LATEST_HANDSHAKE_VERSION`; the server may answer with another one)
+const PROTOCOL_VERSION: &str = "2025-11-25";
+/// python SDK `DEFAULT_CLIENT_INFO` (the version is a literal in the SDK, not the package version)
+const CLIENT_INFO_VERSION: &str = "0.1.0";
+/// python `create_mcp_http_client` default: connect 30s, read 300s (streamable HTTP)
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// python `MCP_DEFAULT_SSE_READ_TIMEOUT` (streamable HTTP and SSE reads)
+const SSE_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// python `sse_client` default `timeout=5.0` (connect)
+const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// revisions the python SDK accepts in an initialize answer (mcp_types HANDSHAKE_PROTOCOL_VERSIONS)
 const HANDSHAKE_PROTOCOL_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const SESSION_HEADER: &str = "Mcp-Session-Id";
@@ -487,6 +495,16 @@ impl SseDecoder {
     }
 }
 
+/// lowercased content type of a response ("" when absent), like python `headers.get("content-type", "").lower()`
+fn content_type_of(resp: &reqwest::Response) -> String {
+    resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase()
+}
+
+/// answer a request with a JSON-RPC error, the way the python SDK resolves a failed POST
+fn reply_error(tx: &mpsc::UnboundedSender<Value>, id: Value, code: i64, message: impl Into<String>) {
+    let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}}));
+}
+
 /// forward every `message` event of an SSE response body to the session
 async fn forward_sse(mut resp: reqwest::Response, tx: mpsc::UnboundedSender<Value>) {
     let mut decoder = SseDecoder::default();
@@ -508,9 +526,18 @@ async fn forward_sse(mut resp: reqwest::Response, tx: mpsc::UnboundedSender<Valu
     }
 }
 
+/// python `sse_client`: the endpoint event is joined onto the connection URL (no trimming), and an
+/// endpoint on another scheme or host:port is refused
 fn resolve_endpoint(base: &str, endpoint: &str) -> Result<String, McpError> {
     let base = url::Url::parse(base).map_err(|e| McpError::other("ValueError", e.to_string()))?;
-    base.join(endpoint.trim()).map(|u| u.to_string()).map_err(|e| McpError::other("ValueError", e.to_string()))
+    let joined = base.join(endpoint).map_err(|e| McpError::other("ValueError", e.to_string()))?;
+    if joined.origin() != base.origin() {
+        return Err(McpError::other(
+            "ValueError",
+            format!("Endpoint origin does not match connection origin: {}", joined),
+        ));
+    }
+    Ok(joined.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -654,16 +681,23 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    fn new(url: &str, tx: mpsc::UnboundedSender<Value>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    fn new(url: &str, tx: mpsc::UnboundedSender<Value>) -> Result<Self, McpError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .read_timeout(SSE_READ_TIMEOUT)
+            .build()
+            .map_err(|e| http_error(&e))?;
+        Ok(Self {
+            client,
             url: url.to_string(),
             state: Arc::new(HttpState::default()),
             tx,
             tasks: Tasks::default(),
-        }
+        })
     }
 
+    /// python `_handle_post_request`: transport failures are raised to the caller; HTTP answers are
+    /// turned into messages for the dispatcher, so a request always gets an answer (or an error)
     async fn post(&self, msg: &Value) -> Result<(), McpError> {
         let req = self
             .state
@@ -671,28 +705,92 @@ impl HttpTransport {
             .header(ACCEPT, "application/json, text/event-stream")
             .json(msg);
         let resp = req.send().await.map_err(|e| http_error(&e))?;
-        if let Some(id) = resp.headers().get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
-            *self.state.session_id.lock() = Some(id.to_string());
+
+        // python: a request is a message with a method and an id; only requests get an answer
+        let request_id = match msg.get("method") {
+            Some(_) => msg.get("id").filter(|v| !v.is_null()).cloned(),
+            None => None,
+        };
+
+        let status = resp.status().as_u16();
+        if status == 202 {
+            if let Some(id) = request_id {
+                reply_error(&self.tx, id, -32600, "server answered a request with 202 Accepted");
+            }
+            return Ok(());
         }
-        if !resp.status().is_success() {
-            return Err(response_status_error(&resp));
+
+        if status >= 400 {
+            if let Some(id) = request_id {
+                // a JSON-RPC error in the body is passed on as the answer to this request
+                let server_error = if content_type_of(&resp).starts_with("application/json") {
+                    match resp.bytes().await {
+                        Ok(body) => serde_json::from_slice::<Value>(&body).ok().and_then(|parsed| {
+                            parsed
+                                .get("error")
+                                .filter(|e| {
+                                    e.get("code").and_then(pyjson::as_i64).is_some()
+                                        && e.get("message").and_then(Value::as_str).is_some()
+                                })
+                                .cloned()
+                        }),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                match server_error {
+                    Some(error) => {
+                        let _ = self.tx.send(json!({"jsonrpc": "2.0", "id": id, "error": error}));
+                    }
+                    None => {
+                        let (code, message) = if status == 404 {
+                            if self.state.session_id.lock().is_none() {
+                                (-32601, "Not Found")
+                            } else {
+                                (-32600, "Session terminated")
+                            }
+                        } else {
+                            (-32603, "Server returned an error response")
+                        };
+                        reply_error(&self.tx, id, code, message);
+                    }
+                }
+            }
+            return Ok(());
         }
-        let content_type = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+
+        if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+            if let Some(id) = resp.headers().get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
+                *self.state.session_id.lock() = Some(id.to_string());
+            }
+        }
+
+        // the server MUST NOT answer notifications
+        let Some(id) = request_id else {
+            return Ok(());
+        };
+        let content_type = content_type_of(&resp);
         if content_type.starts_with("text/event-stream") {
             self.tasks.add(tokio::spawn(forward_sse(resp, self.tx.clone())));
             return Ok(());
         }
         if content_type.starts_with("application/json") {
-            let body: Value = resp.json().await.map_err(|e| http_error(&e))?;
-            let items = match body {
-                Value::Array(items) => items,
-                single => vec![single],
-            };
-            for item in items {
-                let _ = self.tx.send(item);
+            match resp.json::<Value>().await {
+                Ok(Value::Array(items)) => {
+                    for item in items {
+                        let _ = self.tx.send(item);
+                    }
+                }
+                Ok(single) => {
+                    let _ = self.tx.send(single);
+                }
+                Err(e) => reply_error(&self.tx, id, -32700, format!("Failed to parse JSON response: {}", e)),
             }
+            return Ok(());
         }
-        // 202 Accepted (notifications) has no body
+        // python: any other content type fails the request right away
+        reply_error(&self.tx, id, -32600, format!("Unexpected content type: {}", content_type));
         Ok(())
     }
 
@@ -731,7 +829,11 @@ pub struct SseTransport {
 
 impl SseTransport {
     async fn connect(url: &str, tx: mpsc::UnboundedSender<Value>) -> Result<Self, McpError> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(SSE_CONNECT_TIMEOUT)
+            .read_timeout(SSE_READ_TIMEOUT)
+            .build()
+            .map_err(|e| http_error(&e))?;
         let resp = client
             .get(url)
             .header(ACCEPT, "text/event-stream")
@@ -775,7 +877,10 @@ impl SseTransport {
         let endpoint = match endpoint_rx.await {
             Ok(Ok(endpoint)) => endpoint,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(McpError::other("McpError", "SSE stream closed before the endpoint event")),
+            // python: the reader task ends without calling task_status.started(); anyio raises this
+            Err(_) => {
+                return Err(McpError::other("RuntimeError", "Child exited without calling task_status.started()"))
+            }
         };
         Ok(Self { client, endpoint, tasks })
     }
@@ -838,6 +943,20 @@ impl Transport {
 /// called with the method of every server notification
 pub type NotifyFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// JSON-RPC envelope for a request (`id` set) or a notification; `params` is left out when null
+fn envelope(id: Option<i64>, method: &str, params: Value) -> Value {
+    let mut msg = Map::new();
+    msg.insert("jsonrpc".into(), json!("2.0"));
+    if let Some(id) = id {
+        msg.insert("id".into(), json!(id));
+    }
+    msg.insert("method".into(), json!(method));
+    if !params.is_null() {
+        msg.insert("params".into(), params);
+    }
+    Value::Object(msg)
+}
+
 #[derive(Default)]
 struct Pending {
     calls: HashMap<i64, oneshot::Sender<Result<Value, McpError>>>,
@@ -857,7 +976,7 @@ impl Session {
         let (tx, rx) = mpsc::unbounded_channel();
         let transport = match cfg {
             ServerCfg::Stdio { command, args } => Transport::Stdio(StdioTransport::spawn(command, args, tx)?),
-            ServerCfg::Http { url } => Transport::Http(HttpTransport::new(url, tx)),
+            ServerCfg::Http { url } => Transport::Http(HttpTransport::new(url, tx)?),
             ServerCfg::Sse { url } => Transport::Sse(SseTransport::connect(url, tx).await?),
         };
         let transport = Arc::new(transport);
@@ -883,17 +1002,19 @@ impl Session {
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "mcp", "version": env!("CARGO_PKG_VERSION")},
+                    "clientInfo": {"name": "mcp", "version": CLIENT_INFO_VERSION},
                 }),
             )
             .await?;
         let negotiated = negotiated_version(&init)?;
         self.transport.on_negotiated(&negotiated);
-        self.notify("notifications/initialized", json!({})).await?;
+        self.notify("notifications/initialized", Value::Null).await?;
         self.transport.open_server_stream();
         Ok(())
     }
 
+    /// `params` of `Value::Null` means "no params": the key is left out, like the python SDK's
+    /// `model_dump(exclude_none=True)` for requests and notifications without params
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (waiter, answer) = oneshot::channel();
@@ -904,7 +1025,7 @@ impl Session {
             }
             pending.calls.insert(id, waiter);
         }
-        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let msg = envelope(Some(id), method, params);
         if let Err(e) = self.transport.send(&msg).await {
             self.pending.lock().calls.remove(&id);
             return Err(e);
@@ -916,7 +1037,7 @@ impl Session {
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
-        self.transport.send(&json!({"jsonrpc": "2.0", "method": method, "params": params})).await
+        self.transport.send(&envelope(None, method, params)).await
     }
 
     /// fail every waiting request, then tear the transport down
@@ -1174,7 +1295,7 @@ async fn resync_tools(inner: &Inner, name: &str) {
     let Some(srv) = inner.server(name) else { return };
     let session = srv.session.lock().clone();
     let Some(session) = session else { return };
-    let listing = match session.request("tools/list", json!({})).await {
+    let listing = match session.request("tools/list", Value::Null).await {
         Ok(listing) => listing,
         Err(e) => {
             inner.log(&format!("could not list tools for '{}': {}", name, flatten_error(&e)));
@@ -1617,5 +1738,89 @@ mod tests {
             flatten_error(&err),
             "FileNotFoundError: [Errno 2] No such file or directory: '/nonexistent/ol-mcp-test-binary'"
         );
+    }
+
+    #[test]
+    fn params_are_left_out_when_absent() {
+        assert_eq!(envelope(Some(3), "tools/list", Value::Null), json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}));
+        assert_eq!(
+            envelope(None, "notifications/initialized", Value::Null),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        );
+        assert_eq!(
+            envelope(Some(4), "tools/call", json!({"name": "echo"})),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "echo"}})
+        );
+    }
+
+    #[test]
+    fn sse_endpoint_must_share_the_connection_origin() {
+        assert_eq!(resolve_endpoint("http://h.test:9/sse", "/messages?s=1").unwrap(), "http://h.test:9/messages?s=1");
+        let err = resolve_endpoint("http://h.test:9/sse", "http://evil.test/messages").unwrap_err();
+        assert_eq!(
+            flatten_error(&err),
+            "ValueError: Endpoint origin does not match connection origin: http://evil.test/messages"
+        );
+    }
+
+    /// a local HTTP server that answers every request with `response` (after reading the whole request)
+    async fn serve_fixed(response: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let n = match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{}/mcp", addr)
+    }
+
+    async fn http_connect_error(response: &'static str) -> String {
+        let url = serve_fixed(response).await;
+        let err = Session::connect(&ServerCfg::Http { url }, no_notify()).await.err().expect("handshake must fail");
+        flatten_error(&err)
+    }
+
+    #[tokio::test]
+    async fn http_answer_with_unexpected_content_type_fails_the_request() {
+        let text = http_connect_error("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi").await;
+        assert_eq!(text, "MCPError [-32600] Unexpected content type: text/plain");
+    }
+
+    #[tokio::test]
+    async fn http_202_for_a_request_fails_it_fast() {
+        let text = http_connect_error("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        assert_eq!(text, "MCPError [-32600] server answered a request with 202 Accepted");
+    }
+
+    #[tokio::test]
+    async fn http_404_without_a_session_is_method_not_found() {
+        let text = http_connect_error("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        assert_eq!(text, "MCPError [-32601] Not Found");
     }
 }
