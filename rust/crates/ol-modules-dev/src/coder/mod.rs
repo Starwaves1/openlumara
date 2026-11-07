@@ -70,6 +70,16 @@ fn present(m: &Map<String, Value>, key: &str) -> bool {
     m.get(key).map(truthy).unwrap_or(false)
 }
 
+/// python `(body or {}).get(key, "").strip()`: an absent key is "", a str is stripped, and any
+/// other value (null, 0, false included) has no `.strip` and raises AttributeError
+fn body_str_strip(m: &Map<String, Value>, key: &str) -> anyhow::Result<String> {
+    match m.get(key) {
+        None => Ok(String::new()),
+        Some(Value::String(s)) => Ok(pyos::strip(s).to_string()),
+        Some(other) => Err(anyhow!("'{}' object has no attribute 'strip'", py_type_name(other))),
+    }
+}
+
 /// python's type name for a JSON value, as it appears in TypeError/AttributeError text
 fn py_type_name(v: &Value) -> &'static str {
     match v {
@@ -1572,45 +1582,44 @@ impl Coder {
         self.result(if unstage { "unstaged" } else { "staged" }, true)
     }
 
-    async fn route_git_commit(&self, b: &Map<String, Value>) -> Value {
+    async fn route_git_commit(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let message = sget(b, "message").trim().to_string();
-        if sandbox.is_empty() || message.is_empty() {
-            return self.result("sandbox and message are both required", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
-            Ok(r) => r,
-            Err(e) => return self.result(e, false),
+        let message = body_str_strip(b, "message")?;
+        let Some(sandbox) = required_field(b, "sandbox").filter(|_| !message.is_empty()) else {
+            return Ok(self.result("sandbox and message are both required", false));
         };
-        let (ok, out) = git(&root, &["commit", "-m", &message]).await;
-        self.result(out, ok)
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let cwd = match self.python_git_root(sandbox, &subpath_of(b)) {
+            Ok(r) => r,
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        let (ok, out) = git_in(cwd.as_deref(), &["commit", "-m", &message]).await;
+        Ok(self.result(out, ok))
     }
 
-    async fn route_git_branch(&self, b: &Map<String, Value>) -> Value {
+    async fn route_git_branch(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let name = sget(b, "name").trim().to_string();
-        if sandbox.is_empty() || name.is_empty() {
-            return self.result("sandbox and name are both required", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
-            Ok(r) => r,
-            Err(e) => return self.result(e, false),
+        let name = body_str_strip(b, "name")?;
+        let Some(sandbox) = required_field(b, "sandbox").filter(|_| !name.is_empty()) else {
+            return Ok(self.result("sandbox and name are both required", false));
         };
-        let (ok, out) = git(&root, &["switch", &name]).await;
+        let cwd = match self.python_git_root(sandbox, &subpath_of(b)) {
+            Ok(r) => r,
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        let (ok, out) = git_in(cwd.as_deref(), &["switch", &name]).await;
         if !ok {
-            return self.result(out, false);
+            return Ok(self.result(out, false));
         }
-        self.result(if out.is_empty() { format!("switched to {}", name) } else { out }, true)
+        Ok(self.result(if out.is_empty() { format!("switched to {}", name) } else { out }, true))
     }
 
-    async fn pick_remote(root: &str) -> Option<String> {
-        let (ok, out) = git(root, &["remote"]).await;
+    async fn pick_remote(cwd: Option<&str>) -> Option<String> {
+        let (ok, out) = git_in(cwd, &["remote"]).await;
         let remotes: Vec<String> = if ok { out.split_whitespace().map(String::from).collect() } else { Vec::new() };
         if remotes.is_empty() {
             return None;
@@ -1623,27 +1632,29 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")) {
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(&Value::String(sandbox), &Value::String(sget(q, "subpath"))) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let cwd = root.as_deref();
+        let (ok, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
         if branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(cwd).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git_in(cwd, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let has_upstream = upstream.contains('/');
         let (target, (rc, raw)) = if has_upstream {
-            (upstream.clone(), run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
+            (upstream.clone(), run_git_bytes_in(cwd, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
         } else {
-            (format!("{}/{}", remote, branch), run_git_bytes(&root, &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
+            (format!("{}/{}", remote, branch), run_git_bytes_in(cwd, &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
         };
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
@@ -1652,13 +1663,13 @@ impl Coder {
         let ahead = parse_log(&raw);
         let mut behind = 0i64;
         if has_upstream {
-            let (ok, out) = git(&root, &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
+            let (ok, out) = git_in(cwd, &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
             let o = out.trim();
             if ok && !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()) {
                 behind = o.parse().unwrap_or(0);
             }
         }
-        let (_, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1"]), 15).await;
+        let (_, raw) = run_git_bytes_in(cwd, &s(&["status", "--porcelain=v1"]), 15).await;
         let dirty = !String::from_utf8_lossy(&raw).trim().is_empty();
         json!({
             "branch": branch,
@@ -1676,29 +1687,30 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        if sandbox.is_empty() {
+        let Some(sandbox) = required_field(b, "sandbox") else {
             return self.result("no sandbox given", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
+        };
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(sandbox, &subpath_of(b)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let cwd = root.as_deref();
+        let (ok, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(cwd).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git_in(cwd, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let args: Vec<String> = if let Some((up_remote, up_branch)) = upstream.split_once('/') {
             vec!["push".into(), up_remote.into(), format!("{}:{}", branch, up_branch)]
         } else {
             vec!["push".into(), "-u".into(), remote, branch]
         };
-        let (rc, raw) = run_git_bytes(&root, &args, 180).await;
+        let (rc, raw) = run_git_bytes_in(cwd, &args, 180).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git push failed".into() } else { out }, false);
@@ -1712,11 +1724,12 @@ impl Coder {
         if sandbox.is_empty() {
             return Ok(self.result("no sandbox given", false));
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")) {
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(&Value::String(sandbox), &Value::String(sget(q, "subpath"))) {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (rc, raw) = run_git_bytes_in(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
             return Ok(self.result(if t.is_empty() { "git log failed".into() } else { t }, false));
@@ -1790,7 +1803,7 @@ impl Coder {
         if !ok {
             return self.result(branch, false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(Some(&root)).await else {
             return self.result("this repo has no remotes", false);
         };
         let (rc, raw) = run_git_bytes(&root, &[String::from("fetch"), remote, "--prune".into()], 120).await;
@@ -2177,8 +2190,8 @@ impl Module for Coder {
             "git_recent" => self.route_git_recent(q).await?,
             "git_stage" => self.route_git_stage(&b, false).await,
             "git_unstage" => self.route_git_stage(&b, true).await,
-            "git_commit" => self.route_git_commit(&b).await,
-            "git_branch" => self.route_git_branch(&b).await,
+            "git_commit" => self.route_git_commit(&b).await?,
+            "git_branch" => self.route_git_branch(&b).await?,
             "git_ahead" => self.route_git_ahead(q).await,
             "git_push" => self.route_git_push(&b).await,
             "git_log" => self.route_git_log(q).await?,
@@ -2462,5 +2475,49 @@ mod tests {
             coder.python_git_root(&json!("ws"), &json!(5)).unwrap_err(),
             "'NoneType' object has no attribute 'replace'"
         );
+    }
+
+    #[tokio::test]
+    async fn commit_raises_on_non_string_message_like_python_strip() {
+        // python calls `.strip()` on the raw message before the sandbox check, so even a falsy
+        // non-str value raises AttributeError (outside the route's try block)
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let body = json!({"sandbox": "ws", "message": 123});
+        let err = coder.route_git_commit(body.as_object().unwrap()).await.unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'strip'");
+        let body = json!({"sandbox": "ws", "message": null});
+        let err = coder.route_git_commit(body.as_object().unwrap()).await.unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'strip'");
+    }
+
+    #[tokio::test]
+    async fn commit_treats_falsy_non_string_sandbox_as_missing_like_python() {
+        // python `if not sandbox`: 0 / false / [] / {} are missing, so the reply is the
+        // "both required" error rather than "That sandbox does not exist"
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        for sandbox in [json!(0), json!(false), json!([]), json!({})] {
+            let body = json!({"sandbox": sandbox, "message": "msg"});
+            let out = coder.route_git_commit(body.as_object().unwrap()).await.unwrap();
+            assert_eq!(out, json!({"status": "error", "content": "sandbox and message are both required"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_treats_falsy_non_string_sandbox_as_missing_like_python() {
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let body = json!({"sandbox": 0, "name": "main"});
+        let out = coder.route_git_branch(body.as_object().unwrap()).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "sandbox and name are both required"}));
+    }
+
+    #[tokio::test]
+    async fn log_without_sandbox_paths_runs_git_in_server_cwd_like_python() {
+        // no sandbox_paths and no subpath: python runs `git log` with cwd=None, so the reply is the
+        // log of the process's own repo (the cargo test cwd is inside this checkout), not a refusal
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let q = json!({"sandbox": "ws"});
+        let out = coder.route_git_log(q.as_object().unwrap()).await.unwrap();
+        assert!(out["log"].is_array(), "{out}");
+        assert!(out.get("status").is_none(), "{out}");
     }
 }
