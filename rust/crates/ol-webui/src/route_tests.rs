@@ -1073,6 +1073,21 @@ async fn chat_delete_removes_the_chat_and_answers_the_empty_envelope() {
 }
 
 #[tokio::test]
+async fn chat_delete_keeps_the_chat_when_its_history_file_cannot_be_removed() {
+    let h = harness(false).await;
+    let stuck = chat_at(&h, "general", "stuck", "2026-11-01T10:00:00", &[]).await;
+    // a directory where the history file should be fails remove_file with an error other than not-found
+    let path = ol_core::paths::get_data_path(Some(&format!("chats/webui/history/{stuck}.json"))).unwrap();
+    let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    // python: ChatStore.delete raises before it pops the index, so the route is an unhandled 500
+    let resp = h.send(request(Method::POST, &format!("/api/chat/delete/{stuck}"), None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let ids: Vec<String> = h.ch.chat.data().iter().map(|c| py_str(&c["id"])).collect();
+    assert!(ids.contains(&stuck));
+}
+
+#[tokio::test]
 async fn chat_set_category_moves_the_chat_and_reports_each_failure() {
     let h = harness(false).await;
     let id = chat_at(&h, "work", "w", "2026-11-01T10:00:00", &[]).await;

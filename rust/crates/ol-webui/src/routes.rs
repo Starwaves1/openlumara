@@ -11,10 +11,10 @@ use crate::listing::{
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
-    export_chat_text, get_strip, json_decode_error, or_strip, py_contains, py_int, py_int_str, py_iter, py_slice,
+    export_chat_text, get_strip, or_strip, parse_body, py_contains, py_int, py_int_str, py_iter, py_slice,
     py_sorted_unique, py_strip, py_type_name,
 };
-use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
+use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::response::{IntoResponse, Response};
@@ -611,9 +611,9 @@ async fn chat_new(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
 
 async fn chat_rename(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let data = match serde_json::from_slice::<Value>(&body) {
+    let data = match parse_body(&body) {
         Ok(v) => v,
-        Err(_) => return reply(json!(json_decode_error(&body)), false),
+        Err(message) => return reply(json!(message), false),
     };
     let Some(obj) = data.as_object() else {
         return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);
@@ -634,15 +634,18 @@ async fn chat_rename(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>
 
 async fn chat_delete_by_id(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    op_chat_delete(&app, &ch, &chat_id).await;
+    // python: a failure inside op_chat_delete is an unhandled exception, i.e. a plain 500
+    if op_chat_delete(&app, &ch, &chat_id).await.is_err() {
+        return internal_error();
+    }
     reply(Value::Null, true)
 }
 
 async fn chat_set_category(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let data = match serde_json::from_slice::<Value>(&body) {
+    let data = match parse_body(&body) {
         Ok(v) => v,
-        Err(_) => return reply(json!(json_decode_error(&body)), false),
+        Err(message) => return reply(json!(message), false),
     };
     let Some(obj) = data.as_object() else {
         return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);
@@ -657,7 +660,8 @@ async fn chat_set_category(State(app): State<Arc<Shared>>, Path(chat_id): Path<S
     let Some(index) = ch.chat.find_index(&chat_id) else {
         return reply(json!("Chat not found"), false);
     };
-    match ch.chat.set("category", json!(category), Some(index)) {
+    let set = ensure_chat_set_target(&ch, index).and_then(|()| ch.chat.set("category", json!(category), Some(index)));
+    match set {
         Ok(_) => {
             ch.chat.save_index();
             reply(Value::Null, true)

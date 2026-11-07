@@ -253,8 +253,7 @@ async fn handle_command(app: &Arc<Shared>, ch: &Arc<Channel>, text: &str) -> Flo
             if !truthy(&chat_id) {
                 Ok(Flow::Close)
             } else {
-                op_chat_delete(app, ch, &py_str(&chat_id)).await;
-                Ok(Flow::Continue)
+                op_chat_delete(app, ch, &py_str(&chat_id)).await.map(|()| Flow::Continue)
             }
         }
         Some("user_message") => cmd_user_message(app, ch, obj).await,
@@ -515,10 +514,40 @@ pub async fn op_chat_new(app: &Arc<Shared>, ch: &Arc<Channel>, category: &str) -
     new_id
 }
 
-/// python `op_chat_delete`: deletes a chat and points all clients at whatever is loaded now
-pub async fn op_chat_delete(app: &Arc<Shared>, ch: &Arc<Channel>, chat_id: &str) {
+/// python `ChatStore.delete` removes the history file before it pops the index entry, and only a
+/// missing file is ignored. any other failure (e.g. permissions) stops the delete with the index intact.
+/// the ol-core delete that follows removes the same file again, where a missing file is ignored.
+fn remove_chat_history_file(ch: &Channel, chat_id: &str) -> anyhow::Result<()> {
+    if ch.chat.find_index(chat_id).is_none() {
+        return Ok(());
+    }
+    let path = ol_core::paths::get_data_path(Some(&format!("chats/{}/history/{}.json", ch.name, chat_id)))?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// python `ChatStore.set`: `if self.current is None and not index` raises, so an index of 0 counts as
+/// no index. with no chat loaded, setting a field of the chat at index 0 fails in python.
+pub fn ensure_chat_set_target(ch: &Channel, index: usize) -> anyhow::Result<()> {
+    if index == 0 && ch.chat.get("id").is_none() {
+        return Err(anyhow!("No chat is currently loaded!"));
+    }
+    Ok(())
+}
+
+/// python `op_chat_delete`: deletes a chat and points all clients at whatever is loaded now. python
+/// reads `chat.get("id")` after the delete, which raises when no chat is loaded; the delete has already happened.
+pub async fn op_chat_delete(app: &Arc<Shared>, ch: &Arc<Channel>, chat_id: &str) -> anyhow::Result<()> {
+    remove_chat_history_file(ch, chat_id)?;
     ch.chat.delete(chat_id).await;
-    app.ws.broadcast(json!({"type": "chat_switched", "id": ch.chat.get("id").unwrap_or(Value::Null)}));
+    let Some(id) = ch.chat.get("id") else {
+        return Err(anyhow!("No chat is currently loaded!"));
+    };
+    app.ws.broadcast(json!({"type": "chat_switched", "id": id}));
+    Ok(())
 }
 
 /// python `op_chat_rename`: renames a chat (the loaded one when no id is given), saves, notifies
@@ -526,6 +555,7 @@ pub async fn op_chat_rename(app: &Arc<Shared>, ch: &Arc<Channel>, title: Value, 
     let tags = match chat_id {
         Some(id) => {
             let Some(index) = ch.chat.find_index(id) else { return Ok(false) };
+            ensure_chat_set_target(ch, index)?;
             ch.chat.set("title", title.clone(), Some(index))?;
             ch.chat.data().get(index).and_then(|c| c.get("tags")).cloned()
         }

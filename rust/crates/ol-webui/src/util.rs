@@ -8,22 +8,259 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
-/// the text python's `json.loads` puts in the error of a body that does not parse (starlette's
-/// `request.json()`, whose `str(e)` the webui sends to the client). an empty or whitespace-only body is
-/// python's `Expecting value` at the end of the input; other syntax errors keep serde_json's wording.
-pub fn json_decode_error(body: &[u8]) -> String {
-    if body.iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
-        let pos = body.len();
-        let lineno = body.iter().filter(|&&b| b == b'\n').count() + 1;
-        let colno = match body.iter().rposition(|&b| b == b'\n') {
-            Some(newline) => pos - newline,
-            None => pos + 1,
-        };
-        return format!("Expecting value: line {lineno} column {colno} (char {pos})");
+/// why a request body is not a value python's `json.loads` would hand the handler
+#[derive(Debug, PartialEq)]
+pub enum BodyJsonError {
+    /// python's `JSONDecodeError` text, e.g. `Expecting value: line 1 column 1 (char 0)`
+    Decode(String),
+    /// python parses the body (NaN, Infinity, an over-range number, very deep nesting) but
+    /// `serde_json::Value` cannot hold it
+    Unrepresentable,
+}
+
+/// python's json decoder recurses; serde_json stops at 128 levels, so deeper bodies are left to serde
+const MAX_JSON_DEPTH: usize = 128;
+
+/// python `json.loads` on a request body (starlette's `request.json()`): the same accepted documents,
+/// the same error positions (in characters) and the same messages as python's C scanner
+pub fn py_json_loads(body: &[u8]) -> Result<Value, BodyJsonError> {
+    // json.loads on bytes decodes with utf-8-sig, which drops a leading byte order mark
+    let Ok(text) = std::str::from_utf8(body) else { return Err(BodyJsonError::Unrepresentable) };
+    let doc: Vec<char> = text.strip_prefix('\u{feff}').unwrap_or(text).chars().collect();
+    let scanner = JsonScanner { doc: &doc };
+    let start = scanner.ws(0);
+    let (value, end) = scanner.value(start, 0)?;
+    let end = scanner.ws(end);
+    if end != doc.len() {
+        return Err(decode_error(&doc, "Extra data", end));
     }
-    match serde_json::from_slice::<Value>(body) {
-        Err(e) => e.to_string(),
-        Ok(_) => String::new(),
+    Ok(value)
+}
+
+/// the value python's `json.loads` gives a request body, or the text python's `str(e)` gives when it
+/// raises. for the rare bodies python accepts but `Value` cannot hold, the text is serde_json's
+/// (a known deviation: python would go on to fail later in the handler with its own message)
+pub fn parse_body(body: &[u8]) -> Result<Value, String> {
+    match py_json_loads(body) {
+        Ok(value) => Ok(value),
+        Err(BodyJsonError::Decode(message)) => Err(message),
+        Err(BodyJsonError::Unrepresentable) => {
+            Err(serde_json::from_slice::<Value>(body).err().map(|e| e.to_string()).unwrap_or_default())
+        }
+    }
+}
+
+/// python `JSONDecodeError(msg, doc, pos)` rendered through `str()`
+fn decode_error(doc: &[char], msg: &str, pos: usize) -> BodyJsonError {
+    let lineno = doc[..pos].iter().filter(|&&c| c == '\n').count() + 1;
+    let colno = match doc[..pos].iter().rposition(|&c| c == '\n') {
+        Some(newline) => pos - newline,
+        None => pos + 1,
+    };
+    BodyJsonError::Decode(format!("{msg}: line {lineno} column {colno} (char {pos})"))
+}
+
+/// recursive-descent mirror of CPython's `_json` scanner. every method takes the index of the
+/// first character it may consume and returns the index just past what it consumed
+struct JsonScanner<'a> {
+    doc: &'a [char],
+}
+
+impl JsonScanner<'_> {
+    fn ws(&self, mut i: usize) -> usize {
+        while matches!(self.doc.get(i), Some(' ' | '\t' | '\n' | '\r')) {
+            i += 1;
+        }
+        i
+    }
+
+    fn word(&self, i: usize, word: &str) -> bool {
+        word.chars().enumerate().all(|(k, c)| self.doc.get(i + k) == Some(&c))
+    }
+
+    fn value(&self, i: usize, depth: usize) -> Result<(Value, usize), BodyJsonError> {
+        match self.doc.get(i) {
+            Some('"') => {
+                let (text, end) = self.string(i + 1)?;
+                Ok((Value::String(text), end))
+            }
+            Some('{') => self.object(i + 1, depth + 1),
+            Some('[') => self.array(i + 1, depth + 1),
+            Some('n') if self.word(i, "null") => Ok((Value::Null, i + 4)),
+            Some('t') if self.word(i, "true") => Ok((Value::Bool(true), i + 4)),
+            Some('f') if self.word(i, "false") => Ok((Value::Bool(false), i + 5)),
+            Some('N') if self.word(i, "NaN") => Err(BodyJsonError::Unrepresentable),
+            Some('I') if self.word(i, "Infinity") => Err(BodyJsonError::Unrepresentable),
+            Some('-') if self.word(i, "-Infinity") => Err(BodyJsonError::Unrepresentable),
+            _ => self.number(i),
+        }
+    }
+
+    fn number(&self, start: usize) -> Result<(Value, usize), BodyJsonError> {
+        let d = self.doc;
+        let digits = |mut j: usize| {
+            while matches!(d.get(j), Some(c) if c.is_ascii_digit()) {
+                j += 1;
+            }
+            j
+        };
+        let mut j = start;
+        if d.get(j) == Some(&'-') {
+            j += 1;
+        }
+        match d.get(j) {
+            Some('0') => j += 1,
+            Some(c) if c.is_ascii_digit() => j = digits(j),
+            _ => return Err(decode_error(d, "Expecting value", start)),
+        }
+        let mut is_float = false;
+        if d.get(j) == Some(&'.') && matches!(d.get(j + 1), Some(c) if c.is_ascii_digit()) {
+            j = digits(j + 1);
+            is_float = true;
+        }
+        if matches!(d.get(j), Some('e' | 'E')) {
+            let mut k = j + 1;
+            if matches!(d.get(k), Some('+' | '-')) {
+                k += 1;
+            }
+            if matches!(d.get(k), Some(c) if c.is_ascii_digit()) {
+                j = digits(k);
+                is_float = true;
+            }
+        }
+        let text: String = d[start..j].iter().collect();
+        if is_float {
+            return match text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Some(n) => Ok((Value::Number(n), j)),
+                None => Err(BodyJsonError::Unrepresentable),
+            };
+        }
+        match text.parse::<i64>().map(Value::from).or_else(|_| text.parse::<u64>().map(Value::from)) {
+            Ok(v) => Ok((v, j)),
+            Err(_) => Err(BodyJsonError::Unrepresentable),
+        }
+    }
+
+    /// `start` is the index just past the opening quote
+    fn string(&self, start: usize) -> Result<(String, usize), BodyJsonError> {
+        let d = self.doc;
+        let begin = start - 1;
+        let mut out = String::new();
+        let mut i = start;
+        loop {
+            let mut j = i;
+            while let Some(&c) = d.get(j) {
+                if c == '"' || c == '\\' || (c as u32) < 0x20 {
+                    break;
+                }
+                j += 1;
+            }
+            out.extend(&d[i..j]);
+            match d.get(j) {
+                None => return Err(decode_error(d, "Unterminated string starting at", begin)),
+                Some('"') => return Ok((out, j + 1)),
+                Some('\\') => {}
+                Some(_) => return Err(decode_error(d, "Invalid control character at", j)),
+            }
+            // j is the backslash
+            let Some(&esc) = d.get(j + 1) else {
+                return Err(decode_error(d, "Unterminated string starting at", begin));
+            };
+            let plain = match esc {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => {
+                    let (unit, next) = self.hex4(j + 1)?;
+                    i = next;
+                    let mut code = unit;
+                    // a high surrogate followed by an escaped low surrogate is one character
+                    if (0xD800..0xDC00).contains(&unit) && d.get(next) == Some(&'\\') && d.get(next + 1) == Some(&'u') {
+                        let (low, after) = self.hex4(next + 1)?;
+                        if (0xDC00..0xE000).contains(&low) {
+                            code = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                            i = after;
+                        }
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                    continue;
+                }
+                _ => return Err(decode_error(d, "Invalid \\escape", j)),
+            };
+            out.push(plain);
+            i = j + 2;
+        }
+    }
+
+    /// the four hex digits of a `\u` escape whose `u` is at `u_at`; returns the code unit and the
+    /// index just past the digits
+    fn hex4(&self, u_at: usize) -> Result<(u32, usize), BodyJsonError> {
+        let unit = (1..=4).try_fold(0u32, |acc, k| {
+            self.doc.get(u_at + k).and_then(|c| c.to_digit(16)).map(|v| acc * 16 + v)
+        });
+        match unit {
+            Some(unit) => Ok((unit, u_at + 5)),
+            None => Err(decode_error(self.doc, "Invalid \\uXXXX escape", u_at)),
+        }
+    }
+
+    /// `start` is the index just past the `{`
+    fn object(&self, start: usize, depth: usize) -> Result<(Value, usize), BodyJsonError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(BodyJsonError::Unrepresentable);
+        }
+        let d = self.doc;
+        let mut map = Map::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&'}') {
+            return Ok((Value::Object(map), i + 1));
+        }
+        loop {
+            if d.get(i) != Some(&'"') {
+                return Err(decode_error(d, "Expecting property name enclosed in double quotes", i));
+            }
+            let (key, after_key) = self.string(i + 1)?;
+            let colon = self.ws(after_key);
+            if d.get(colon) != Some(&':') {
+                return Err(decode_error(d, "Expecting ':' delimiter", colon));
+            }
+            let (value, after_value) = self.value(self.ws(colon + 1), depth)?;
+            map.insert(key, value);
+            let next = self.ws(after_value);
+            match d.get(next) {
+                Some('}') => return Ok((Value::Object(map), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
+    }
+
+    /// `start` is the index just past the `[`
+    fn array(&self, start: usize, depth: usize) -> Result<(Value, usize), BodyJsonError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(BodyJsonError::Unrepresentable);
+        }
+        let d = self.doc;
+        let mut items = Vec::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&']') {
+            return Ok((Value::Array(items), i + 1));
+        }
+        loop {
+            let (item, after_item) = self.value(i, depth)?;
+            items.push(item);
+            let next = self.ws(after_item);
+            match d.get(next) {
+                Some(']') => return Ok((Value::Array(items), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
     }
 }
 
@@ -652,9 +889,37 @@ mod tests {
 
     #[test]
     fn empty_bodies_get_pythons_expecting_value_position() {
-        assert_eq!(json_decode_error(b""), "Expecting value: line 1 column 1 (char 0)");
-        assert_eq!(json_decode_error(b"  "), "Expecting value: line 1 column 3 (char 2)");
-        assert_eq!(json_decode_error(b"\n\n"), "Expecting value: line 3 column 1 (char 2)");
-        assert!(json_decode_error(b" \n a").contains("line 2 column"));
+        assert_eq!(parse_body(b"").unwrap_err(), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(parse_body(b"  ").unwrap_err(), "Expecting value: line 1 column 3 (char 2)");
+        assert_eq!(parse_body(b"\n\n").unwrap_err(), "Expecting value: line 3 column 1 (char 2)");
+        assert!(parse_body(b" \n a").unwrap_err().starts_with("Expecting value: line 2 column 2 (char 3)"));
+    }
+
+    #[test]
+    fn malformed_bodies_get_the_python_json_decoder_messages() {
+        let cases = [
+            (&b"{a:1}"[..], "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"),
+            (&b"{\"a\" 1}"[..], "Expecting ':' delimiter: line 1 column 6 (char 5)"),
+            (&b"[1 2]"[..], "Expecting ',' delimiter: line 1 column 4 (char 3)"),
+            (&b"[1,]"[..], "Expecting value: line 1 column 4 (char 3)"),
+            (&b"{\"a\":1,}"[..], "Expecting property name enclosed in double quotes: line 1 column 8 (char 7)"),
+            (&b"1 2"[..], "Extra data: line 1 column 3 (char 2)"),
+            (&b"\"\\x\""[..], "Invalid \\escape: line 1 column 2 (char 1)"),
+            (&b"\"abc"[..], "Unterminated string starting at: line 1 column 1 (char 0)"),
+            (&b"\"a\nb\""[..], "Invalid control character at: line 1 column 3 (char 2)"),
+            (&b"\"\\u12\""[..], "Invalid \\uXXXX escape: line 1 column 3 (char 2)"),
+        ];
+        for (body, message) in cases {
+            assert_eq!(parse_body(body).unwrap_err(), message, "body {:?}", String::from_utf8_lossy(body));
+        }
+    }
+
+    #[test]
+    fn valid_bodies_parse_like_python_json_loads() {
+        assert_eq!(parse_body(b" {\"a\": [1, 2.5, true, null]} \n").unwrap(), json!({"a": [1, 2.5, true, null]}));
+        assert_eq!(parse_body(b"\"\\u00e9\\ud83d\\ude00\"").unwrap(), json!("\u{e9}\u{1f600}"));
+        assert_eq!(parse_body(b"-0").unwrap(), json!(0));
+        // python accepts NaN; a value cannot hold it, so the text is serde's and the body is rejected
+        assert!(parse_body(b"[NaN]").is_err());
     }
 }
