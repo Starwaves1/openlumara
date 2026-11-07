@@ -215,6 +215,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn socks_proxies_build_a_client() {
+        // python ddgs proxies: socks5:// and socks5h:// (the "tb" alias) must not fail client construction
+        for proxy in ["socks5h://127.0.0.1:9150", "socks5://127.0.0.1:9050"] {
+            let net = Net { proxy: Some(proxy.to_string()), timeout: Duration::from_secs(5) };
+            assert!(Session::new(&net, &[]).is_ok(), "client with {proxy} must build");
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5h_proxy_is_spoken_to_with_a_socks5_greeting() {
+        // a fake socks5 proxy records the greeting; without the "socks" feature no greeting ever arrives
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else { return };
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut greeting = [0u8; 3];
+            if conn.read_exact(&mut greeting).is_ok() {
+                let _ = conn.write_all(&[5, 0]);
+                let _ = tx.send(greeting);
+            }
+        });
+        let net = Net { proxy: Some(format!("socks5h://127.0.0.1:{port}")), timeout: Duration::from_secs(5) };
+        let session = Session::new(&net, &[]).unwrap();
+        let _ = session.client.get("http://example.invalid/").send().await;
+        let greeting = rx.recv_timeout(Duration::from_secs(5)).expect("socks5 greeting from the proxy");
+        assert_eq!(greeting, [5, 1, 0]);
+    }
+
+    #[test]
     fn empty_200_body_is_no_response_like_base_engine_search() {
         let reply = |status, body: &str| Reply { status, body: body.as_bytes().to_vec() };
         assert_eq!(reply(200, "").ok_text(), None);
