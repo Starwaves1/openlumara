@@ -248,6 +248,7 @@ impl Module for WebSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ol_core::module::validate_tool_args;
 
     fn detached() -> WebSearch {
         WebSearch::new(ModuleBase::detached("web_search"))
@@ -326,5 +327,23 @@ mod tests {
         let images = ws.search_args(Category::Images, &args);
         assert_eq!(images.region, "uk-en");
         assert_eq!(images.extra("size"), "Large");
+    }
+
+    #[test]
+    fn binding_errors_match_python_typeerror_text() {
+        // python raises these at call binding; the dispatcher validates against the tool spec
+        let spec = |method: &str| meta::tools().into_iter().find(|s| s.method == method).unwrap();
+        let books_args = json!({"query": "dune", "region": "uk-en"});
+        assert_eq!(
+            validate_tool_args("WebSearch", &spec("books"), books_args.as_object().unwrap()).unwrap_err(),
+            "WebSearch.books() got an unexpected keyword argument 'region'"
+        );
+        assert_eq!(
+            validate_tool_args("WebSearch", &spec("text"), &Map::new()).unwrap_err(),
+            "WebSearch.text() missing 1 required positional argument: 'query'"
+        );
+        // an explicit null query is bound fine and reaches the python-style error result
+        let null_query = json!({"query": null});
+        assert!(validate_tool_args("WebSearch", &spec("text"), null_query.as_object().unwrap()).is_ok());
     }
 }
