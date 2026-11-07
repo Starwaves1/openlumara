@@ -64,6 +64,40 @@ fn exit_code(status: ExitStatus) -> i64 {
     }
 }
 
+/// python type name of a json value, as it appears in TypeError messages
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// argv that python's `subprocess.run(cmd, shell=True)` builds as `['/bin/sh', '-c', *cmd]`.
+/// a str is one script; a list (or a dict, iterated by its keys) supplies the script and $0..;
+/// any other value raises the TypeError python raises before anything runs.
+fn shell_argv(cmd: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    match cmd {
+        None => anyhow::bail!("UnsafeShell.exec() missing 1 required positional argument: 'cmd'"),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(items)) => items.iter().map(argv_item).collect(),
+        Some(Value::Object(map)) => Ok(map.keys().cloned().collect()),
+        Some(other) => anyhow::bail!("'{}' object is not iterable", py_type_name(other)),
+    }
+}
+
+/// one element of a list cmd; popen only accepts str arguments
+fn argv_item(v: &Value) -> anyhow::Result<String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        other => anyhow::bail!("expected str, bytes or os.PathLike object, not {}", py_type_name(other)),
+    }
+}
+
 /// python cmd_exec's output assembly: stdout, then "\n" + stderr, else "BLANK"
 pub fn render_output(stdout: &str, stderr: &str) -> String {
     let mut output = String::new();
@@ -88,9 +122,20 @@ impl UnsafeShell {
 
     /// python exec(): runs the command and returns `self.result({stdout, stderr, exit_code})`
     pub async fn exec(&self, cmd: &str) -> anyhow::Result<Value> {
+        self.run_argv(&[cmd.to_string()]).await
+    }
+
+    /// the tool-call path: `exec(cmd=<json value>)` with python's subprocess argument rules
+    async fn exec_tool(&self, cmd: Option<&Value>) -> anyhow::Result<Value> {
+        let argv = shell_argv(cmd)?;
+        self.run_argv(&argv).await
+    }
+
+    /// `/bin/sh -c <argv...>` with stdout/stderr captured, as subprocess.run(capture_output=True)
+    async fn run_argv(&self, argv: &[String]) -> anyhow::Result<Value> {
         let out = tokio::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(cmd)
+            .args(argv)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -134,7 +179,7 @@ impl Module for UnsafeShell {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "exec" => self.exec(&args.str_or("cmd", "")).await,
+            "exec" => self.exec_tool(args.0.get("cmd")).await,
             _ => anyhow::bail!("'UnsafeShell' object has no attribute '{}'", method),
         }
     }
@@ -211,6 +256,27 @@ mod tests {
         map.insert("cmd".into(), json!("echo tool"));
         let r = m.call_tool("exec", ToolArgs::new(map)).await.unwrap();
         assert_eq!(r["content"]["stdout"], json!("tool"));
+    }
+
+    #[tokio::test]
+    async fn exec_tool_list_cmd_runs_as_sh_argv() {
+        // python: subprocess.run(["echo $0", "hi"], shell=True) runs `sh -c 'echo $0' hi`
+        let m = UnsafeShell::new_for_test();
+        let r = m.exec_tool(Some(&json!(["echo $0", "hi"]))).await.unwrap();
+        assert_eq!(r["content"]["stdout"], json!("hi"));
+    }
+
+    #[tokio::test]
+    async fn exec_tool_non_string_cmd_raises_before_running() {
+        let m = UnsafeShell::new_for_test();
+        let err = m.exec_tool(Some(&json!(5))).await.unwrap_err().to_string();
+        assert_eq!(err, "'int' object is not iterable");
+        let err = m.exec_tool(Some(&Value::Null)).await.unwrap_err().to_string();
+        assert_eq!(err, "'NoneType' object is not iterable");
+        let err = m.exec_tool(Some(&json!(["echo", 3]))).await.unwrap_err().to_string();
+        assert_eq!(err, "expected str, bytes or os.PathLike object, not int");
+        let err = m.exec_tool(None).await.unwrap_err().to_string();
+        assert_eq!(err, "UnsafeShell.exec() missing 1 required positional argument: 'cmd'");
     }
 
     impl UnsafeShell {
