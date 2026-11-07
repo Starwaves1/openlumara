@@ -477,12 +477,12 @@ async fn create_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
         _ => String::new(),
     };
     // python checks the format first; then `(chat.get("category") or "general").lower()` over every chat
-    // raises AttributeError for a truthy non-string category, which reaches starlette as the plain 500
+    // raises AttributeError for a non-dict entry or a truthy non-string category, which reaches starlette as the plain 500
     if let Err(error) = validate_category_format(&name) {
         return reply(json!(error), false);
     }
     let chats = ch.chat.data();
-    if chats.iter().any(|c| matches!(c.get("category"), Some(v) if truthy(v) && !v.is_string())) {
+    if chats.iter().any(|c| !c.is_object() || matches!(c.get("category"), Some(v) if truthy(v) && !v.is_string())) {
         return internal_error();
     }
     let category = match validate_category_name(&name, &chats) {
@@ -500,22 +500,28 @@ async fn delete_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
     if name.is_empty() || name == "general" {
         return reply(json!("'general' cannot be deleted"), false);
     }
-    let target = Value::String(name.clone());
-    let general = json!("general");
-    let moved = ch.chat.with_data_mut(|chats| {
-        let mut moved = 0usize;
-        for chat in chats.iter_mut() {
-            if chat.get("category") == Some(&target) {
-                chat["category"] = general.clone();
-                moved += 1;
-            }
-        }
-        moved
-    });
+    // python raises AttributeError on a non-dict index entry: starlette's plain 500, and nothing is saved
+    let Ok(moved) = ch.chat.with_data_mut(|chats| move_category_chats(chats, &name)) else { return internal_error() };
     if moved > 0 {
         ch.chat.save_index();
     }
     reply(json!({"moved": moved}), true)
+}
+
+/// python `delete_chat_category` loop: every chat whose category equals `name` moves to 'general'.
+/// A non-dict index entry raises on `chat.get`; the moves made before it stay in memory (python does not roll back)
+fn move_category_chats(chats: &mut [Value], name: &str) -> Result<usize, String> {
+    let mut moved = 0usize;
+    for chat in chats.iter_mut() {
+        if !chat.is_object() {
+            return Err(format!("'{}' object has no attribute 'get'", py_type_name(chat)));
+        }
+        if chat.get("category").and_then(Value::as_str) == Some(name) {
+            chat["category"] = json!("general");
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 // ------------------
@@ -1024,6 +1030,25 @@ mod tests {
         // a non-dict index entry is python's AttributeError on chat.get
         assert!(category_counts(&[json!({"category": "work"}), json!("work")]).is_err());
         assert!(category_counts(&[json!(null)]).is_err());
+    }
+
+    #[test]
+    fn delete_category_moves_matching_chats_to_general() {
+        let mut chats = vec![json!({"category": "work"}), json!({"category": "home"}), json!({"category": "work"}), json!({})];
+        assert_eq!(move_category_chats(&mut chats, "work").unwrap(), 2);
+        assert_eq!(chats[0]["category"], json!("general"));
+        assert_eq!(chats[1]["category"], json!("home"));
+        assert_eq!(chats[2]["category"], json!("general"));
+        assert_eq!(move_category_chats(&mut chats, "missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_category_stops_at_a_non_dict_entry_keeping_earlier_moves() {
+        // python: AttributeError on chat.get at the list entry; the route returns the plain 500 and does not save
+        let mut chats = vec![json!({"category": "work"}), json!("work"), json!({"category": "work"})];
+        assert!(move_category_chats(&mut chats, "work").is_err());
+        assert_eq!(chats[0]["category"], json!("general"));
+        assert_eq!(chats[2]["category"], json!("work"));
     }
 
     #[test]

@@ -820,6 +820,13 @@ pub fn load(file_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// replace the live config without saving it (command line overrides)
+pub fn replace_in_memory(data: Map<String, Value>) {
+    if let Some(c) = CONFIG.lock().as_mut() {
+        c.data = data;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,12 +883,5 @@ mod tests {
         assert_eq!(m.docstring, "Does foo\n\nmore text");
         assert!(m.unsafe_);
         assert_eq!(m.category, "tools");
-    }
-}
-
-/// replace the live config without saving it (command line overrides)
-pub fn replace_in_memory(data: Map<String, Value>) {
-    if let Some(c) = CONFIG.lock().as_mut() {
-        c.data = data;
     }
 }
