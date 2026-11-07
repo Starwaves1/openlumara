@@ -69,10 +69,12 @@ pub fn naive_isoformat(dt: &chrono::NaiveDateTime) -> String {
     }
 }
 
-/// python `datetime.fromisoformat()` for the formats openlumara writes (naive or with offset)
+/// python `datetime.fromisoformat()` for the formats openlumara writes (naive or with offset).
+/// An offset is not converted: python keeps the string's wall-clock fields, so
+/// `2026-01-02T03:04:05+02:00` yields 03:04:05 (strftime prints those fields).
 pub fn parse_isoformat(s: &str) -> Option<chrono::NaiveDateTime> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(dt.naive_utc());
+        return Some(dt.naive_local());
     }
     for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
@@ -90,4 +92,27 @@ pub fn new_ulid() -> String {
 /// unix timestamp in seconds (int(time.time()))
 pub fn unix_time() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_isoformat_keeps_wall_clock_of_offset_strings() {
+        // python: datetime.fromisoformat("2026-01-02T03:04:05+02:00").strftime("%H:%M:%S") == "03:04:05"
+        let dt = parse_isoformat("2026-01-02T03:04:05+02:00").unwrap();
+        assert_eq!(dt.format("%m/%d/%y %H:%M:%S").to_string(), "01/02/26 03:04:05");
+        assert_eq!(dt, chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap().and_hms_opt(3, 4, 5).unwrap());
+        // a negative offset keeps its wall clock too
+        assert_eq!(parse_isoformat("2026-01-02T03:04:05-05:30").unwrap().format("%H:%M:%S").to_string(), "03:04:05");
+        // Z is UTC, so its wall clock is unchanged as well
+        assert_eq!(parse_isoformat("2026-01-02T03:04:05Z").unwrap().format("%H:%M:%S").to_string(), "03:04:05");
+    }
+
+    #[test]
+    fn parse_isoformat_naive_forms() {
+        assert_eq!(parse_isoformat("2026-01-02T03:04:05").unwrap().format("%H:%M:%S").to_string(), "03:04:05");
+        assert!(parse_isoformat("nope").is_none());
+    }
 }

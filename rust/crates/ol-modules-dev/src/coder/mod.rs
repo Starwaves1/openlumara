@@ -2126,7 +2126,8 @@ impl Module for Coder {
                 let current = self.read_only();
                 self.base.config.set("read-only", json!(!current));
                 if let Some(m) = self.base.manager() {
-                    m.reload_module(&self.base.name).await;
+                    // python modules/coder/module.py: `await self.manager.reload_module(self.name)` has no try, so a failure reaches the command handler
+                    m.reload_module(&self.base.name).await?;
                 }
                 Ok(Some(if current { "read-only mode disabled" } else { "read-only mode enabled" }.into()))
             }

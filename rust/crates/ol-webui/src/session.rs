@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(verify_credentials("admin", "bad", Some("admin"), Some("pw")), Ok(false));
         // username mismatch still compares the password first, which can raise
         assert_eq!(verify_credentials("bob", "pässword", Some("admin"), Some("pw")), Err(NON_ASCII_COMPARE.to_string()));
-        assert_eq!(verify_credentials("admin", "pw", None, Some("pw")).is_err(), true);
+        assert!(verify_credentials("admin", "pw", None, Some("pw")).is_err());
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::COOKIE, "a=1; session=abc.def; b=2".parse().unwrap());
         assert_eq!(cookie_value(&h, "session").as_deref(), Some("abc.def"));

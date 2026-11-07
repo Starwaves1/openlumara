@@ -404,16 +404,23 @@ pub fn section_folder(section: &str) -> std::path::PathBuf {
 /// names available in a config section: compiled-in registry entries plus anything
 /// discovered on disk (so settings of unported/python-only items are preserved)
 pub fn available_names(section: &str) -> Vec<String> {
+    // discovered folders keep their folder order; registry-only names follow, sorted
     let mut names: Vec<String> = discover_folder_names(&section_folder(section));
     let reg = crate::registry::get();
-    match section {
-        "modules" => names.extend(reg.modules.keys().cloned()),
-        "channels" => names.extend(reg.channels.keys().cloned()),
-        _ => {}
-    }
-    names.sort();
-    names.dedup();
-    names
+    let mut registry_only: Vec<String> = match section {
+        "modules" => reg.modules.keys().cloned().collect(),
+        "channels" => reg.channels.keys().cloned().collect(),
+        _ => Vec::new(),
+    };
+    registry_only.sort();
+    names.extend(registry_only);
+    ordered_unique(names)
+}
+
+/// python dict-key merge: each name once, at the position of its first insertion
+pub fn ordered_unique(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names.into_iter().filter(|n| seen.insert(n.clone())).collect()
 }
 
 /// whether a section item can actually be loaded by the Rust port
@@ -813,9 +820,26 @@ pub fn load(file_path: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// replace the live config without saving it (command line overrides)
+pub fn replace_in_memory(data: Map<String, Value>) {
+    if let Some(c) = CONFIG.lock().as_mut() {
+        c.data = data;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_unique_keeps_first_insertion_order() {
+        // python: dict keys from channels, then user_channels; repeats keep their first slot
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        assert_eq!(ordered_unique(s(&["zeta", "alpha", "zeta", "mid"])), s(&["zeta", "alpha", "mid"]));
+        let merged = ordered_unique(s(&["webui", "discord"]).into_iter().chain(s(&["custom", "discord"])));
+        assert_eq!(merged, s(&["webui", "discord", "custom"]));
+        assert!(ordered_unique(Vec::<String>::new()).is_empty());
+    }
 
     #[test]
     fn flatten_defaults() {
@@ -859,12 +883,5 @@ mod tests {
         assert_eq!(m.docstring, "Does foo\n\nmore text");
         assert!(m.unsafe_);
         assert_eq!(m.category, "tools");
-    }
-}
-
-/// replace the live config without saving it (command line overrides)
-pub fn replace_in_memory(data: Map<String, Value>) {
-    if let Some(c) = CONFIG.lock().as_mut() {
-        c.data = data;
     }
 }

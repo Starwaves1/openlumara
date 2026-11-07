@@ -161,7 +161,7 @@ pub fn validate_path_string(path: &str) -> anyhow::Result<String> {
     for _ in 0..3 {
         decoded = unquote(&decoded);
     }
-    decoded = decoded.replace('\\', &sep).replace('/', &sep);
+    decoded = decoded.replace(['\\', '/'], &sep);
     let decoded = strip_sep(&decoded).to_string();
     if decoded.contains("..") || decoded.contains('\0') {
         anyhow::bail!("Path traversal is not allowed ({})", path);
@@ -176,8 +176,8 @@ pub fn sandbox_path(base_path: &str, requested_path: Option<&str>) -> anyhow::Re
         _ => return Ok(base_path.to_string()),
     };
     let sep = std::path::MAIN_SEPARATOR.to_string();
-    let base_path = base_path.replace('\\', &sep).replace('/', &sep);
-    let mut path = requested.replace('\\', &sep).replace('/', &sep);
+    let base_path = base_path.replace(['\\', '/'], &sep);
+    let mut path = requested.replace(['\\', '/'], &sep);
     path = strip_sep(&path).to_string();
 
     let prefix = format!("{}{}", base_path, sep);

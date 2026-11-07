@@ -487,11 +487,13 @@ impl Manager {
         self.toggle_in_sections(["channels", "user_channels"], name)
     }
 
-    /// reload a module: unregister tools, on_shutdown, on_ready, re-register tools
-    pub async fn reload_module(&self, module_name: &str) -> bool {
+    /// reload a module: unregister tools, on_shutdown, on_ready, re-register tools.
+    /// `Ok(false)` where python's `reload_module` returns False (not loaded, or on_ready failed and was logged);
+    /// `Err` where python's would raise out to its caller, which is the case the callers log or report
+    pub async fn reload_module(&self, module_name: &str) -> anyhow::Result<bool> {
         let Some(module) = self.module(module_name) else {
             self.log("core", &format!("Module {} not loaded, cannot reload", module_name));
-            return false;
+            return Ok(false);
         };
         self.log("core", &format!("Reloading module: {}", module_name));
         let prefix = format!("{}_", module_name);
@@ -506,7 +508,7 @@ impl Manager {
         }
         if let Err(e) = module.on_ready().await {
             self.log("core", &format!("Error running on_ready for {}: {}", module_name, crate::detail_error(&e)));
-            return false;
+            return Ok(false);
         }
         self.register_module_tools(&module);
         for (name, ch) in self.channels() {
@@ -518,7 +520,7 @@ impl Manager {
         for ch in self.channels().values() {
             ch.tool_loader.load_default_tools();
         }
-        true
+        Ok(true)
     }
 
     /// settings of each loaded module (get_settings_structure)
@@ -552,5 +554,17 @@ impl Manager {
             ch.tool_loader.unregister_module(module_name);
             ch.tool_loader.refresh_meta_tool_descriptions();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reload_of_a_module_that_is_not_loaded_returns_false_like_python() {
+        // python reload_module: logs "Module X not loaded, cannot reload" and returns False; it does not raise
+        let mgr = Manager::new(Args::default());
+        assert!(!mgr.reload_module("no_such_module").await.unwrap());
     }
 }

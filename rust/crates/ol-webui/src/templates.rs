@@ -3,8 +3,8 @@
 //! PrefixLoader exposing each enabled module's `webui/templates` as `<module>/..`,
 //! and the `extension_slot` / `extension_modals` / `extension_sidebars` globals).
 
-use minijinja::value::{Kwargs, Value as JValue};
-use minijinja::{AutoEscape, Environment, Error, ErrorKind, State};
+use minijinja::value::{Kwargs, Value as JValue, ValueKind};
+use minijinja::{AutoEscape, Environment, Error, ErrorKind, Output, State};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +53,21 @@ fn sorted_html_files(dir: &Path) -> Vec<String> {
 
 fn err_str(e: &Error) -> String {
     ol_core::detail_error(e)
+}
+
+/// python jinja2 autoescape (starlette `Jinja2Templates`): `markupsafe.escape` only replaces
+/// `& < > " '` (minijinja's default html formatter also escapes `/`). Values marked safe pass
+/// through, `None` prints as python's `None`, and bools print as `True`/`False`.
+fn markupsafe_formatter(out: &mut Output, state: &State, value: &JValue) -> Result<(), Error> {
+    if value.is_safe() || state.auto_escape() == AutoEscape::None {
+        return write!(out, "{value}").map_err(Error::from);
+    }
+    match value.kind() {
+        ValueKind::None => out.write_str("None").map_err(Error::from),
+        ValueKind::Bool => out.write_str(if value.is_true() { "True" } else { "False" }).map_err(Error::from),
+        ValueKind::Undefined | ValueKind::Number => write!(out, "{value}").map_err(Error::from),
+        _ => out.write_str(&crate::util::markup_escape(&value.to_string())).map_err(Error::from),
+    }
 }
 
 /// module templates mirroring `relative_path` that compile, sorted by module name
@@ -119,6 +134,7 @@ pub fn build_env(template_path: PathBuf, dirs: BTreeMap<String, PathBuf>, host: 
     let mut env = Environment::new();
     // starlette's Jinja2Templates enables autoescape for every template
     env.set_auto_escape_callback(|_| AutoEscape::Html);
+    env.set_formatter(markupsafe_formatter);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
 
     let loader_core = template_path.clone();
@@ -610,5 +626,22 @@ mod tests {
         let store = TemplateStore::new(core, dirs, Arc::new(NullConfigHost));
         // python `_ext_template_vars` / modal config: `{}` rather than null
         assert_eq!(store.render("page.html", minijinja::context! {}).unwrap(), "t0|0");
+    }
+
+    #[test]
+    fn autoescape_matches_markupsafe() {
+        // python: markupsafe.escape("/ext-assets/a/b.css") == "/ext-assets/a/b.css"
+        // python: markupsafe.escape("<a href='x'>&") == "&lt;a href=&#39;x&#39;&gt;&amp;"
+        // python: markupsafe.escape(None) == "None"
+        let env = build_env(PathBuf::from("/nonexistent"), BTreeMap::new(), Arc::new(NullConfigHost));
+        let render = |src: &str, ctx: minijinja::Value| env.render_str(src, ctx).unwrap();
+        assert_eq!(render("{{ a }}", minijinja::context! { a => "/ext-assets/a/b.css" }), "/ext-assets/a/b.css");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => "<a href='x'>&" }), "&lt;a href=&#39;x&#39;&gt;&amp;");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => "say \"hi\"" }), "say &#34;hi&#34;");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => JValue::from_safe_string("<b>/</b>".to_string()) }), "<b>/</b>");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => JValue::from(()) }), "None");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => true }), "True");
+        assert_eq!(render("{{ a }}", minijinja::context! { a => 42 }), "42");
+        assert_eq!(render("{{ missing }}", minijinja::context! {}), "");
     }
 }

@@ -163,7 +163,7 @@ pub async fn process_input(ch: &Arc<Channel>, content: &str, authorized: bool) -
     if !content.starts_with(&prefix) {
         return Ok(None);
     }
-    let result = dispatch(ch, &cmd.to_lowercase().trim().to_string(), args).await;
+    let result = dispatch(ch, cmd.to_lowercase().trim(), args).await;
     let shown = result.clone().unwrap_or_else(|| "None".into());
     ch.chat.messages_add(&json!({"role": "assistant", "content": shown}), true, use_temporary).await;
     Ok(result)
@@ -379,7 +379,7 @@ fn fmt_thousands(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -750,7 +750,10 @@ async fn set_config_value(ch: &Arc<Channel>, path: &[String], value: &str) -> St
     let shown = format!("Config updated: {} = {}", path.join(" -> "), py_str(&typed));
     if path.len() >= 3 && path[0] == "modules" {
         let module_name = &path[2];
-        ch.manager().reload_module(module_name).await;
+        // python: `await manager.reload_module(module_name)` inside a try whose except appends this warning
+        if let Err(e) = ch.manager().reload_module(module_name).await {
+            return format!("{shown}\nWarning: Failed to reload module '{module_name}': {e}");
+        }
     }
     shown
 }

@@ -430,12 +430,18 @@ pub fn validate_category_name(name: &str, chats: &[Value]) -> Result<String, Str
     let name = validate_category_format(name)?;
     let existing: Vec<String> = chats
         .iter()
-        .map(|chat| match chat.get("category") {
-            Some(v) if truthy(v) => match v {
-                Value::String(s) => Ok(s.to_lowercase()),
-                other => Err(format!("'{}' object has no attribute 'lower'", py_type_name(other))),
-            },
-            _ => Ok("general".to_string()),
+        .map(|chat| {
+            // python `chat.get` on a non-dict index entry raises AttributeError
+            let Some(obj) = chat.as_object() else {
+                return Err(format!("'{}' object has no attribute 'get'", py_type_name(chat)));
+            };
+            match obj.get("category") {
+                Some(v) if truthy(v) => match v {
+                    Value::String(s) => Ok(s.to_lowercase()),
+                    other => Err(format!("'{}' object has no attribute 'lower'", py_type_name(other))),
+                },
+                _ => Ok("general".to_string()),
+            }
         })
         .collect::<Result<_, _>>()?;
     if existing.contains(&name) {
@@ -624,5 +630,10 @@ mod tests {
         // a chat without a category counts as 'general'
         let no_cat = vec![json!({"id": "d"})];
         assert_eq!(validate_category_name("General", &no_cat).unwrap_err(), "'general' already exists");
+        // python raises AttributeError on chat.get for a non-dict index entry, before any duplicate check
+        assert_eq!(
+            validate_category_name("misc", &[json!({"category": "work"}), json!("work")]).unwrap_err(),
+            "'str' object has no attribute 'get'"
+        );
     }
 }

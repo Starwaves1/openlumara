@@ -307,7 +307,7 @@ impl Context {
         let ch = self.ch();
         let result = async {
             ch.chat.invalidate_system_prompt();
-            let prev_summary = self.get_latest_summary().filter(|v| truthy(v));
+            let prev_summary = self.get_latest_summary().filter(truthy);
             let mut prompt = COMPRESS_PROMPT.to_string();
             if let Some(prev) = prev_summary {
                 prompt.push_str(&format!(

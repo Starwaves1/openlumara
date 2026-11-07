@@ -181,9 +181,13 @@ fn reply(data: Value) -> Response {
     Json(api_result(data, true)).into_response()
 }
 
-/// `api_result(message, success=False)` as a json response
-fn failure(message: String) -> Response {
-    Json(api_result(json!(message), false)).into_response()
+/// python `get_context_size`'s except branch: `api_result(core.detail_error(e), success=False)`
+fn context_size_failure_body(e: &anyhow::Error) -> Value {
+    api_result(json!(ol_core::detail_error(e)), false)
+}
+
+fn context_size_failure(e: &anyhow::Error) -> Response {
+    Json(context_size_failure_body(e)).into_response()
 }
 
 /// python `get_data`: `{"max_context": core.config.get("api", "max_context")}`
@@ -202,9 +206,9 @@ async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let max_raw = ol_core::config::get(&["api", "max_context"]).unwrap_or(Value::Null);
     let max_context = match py_int(&max_raw) {
-        Ok(n) if n.is_zero() => return failure("division by zero".into()),
+        Ok(n) if n.is_zero() => return context_size_failure(&anyhow::anyhow!("division by zero")),
         Ok(n) => n,
-        Err(message) => return failure(message),
+        Err(message) => return context_size_failure(&anyhow::anyhow!(message)),
     };
     let mut size = ch.context.get_size().await;
     let total = size["total_tokens"].as_i64().unwrap_or(0);
@@ -267,6 +271,16 @@ mod tests {
         assert_eq!(py_round0(12.6), 13);
         assert_eq!(py_round0(0.0), 0);
         assert_eq!(py_round0(100.0), 100);
+    }
+
+    #[test]
+    fn context_size_failure_body_is_python_detail_error_text() {
+        // python: api_result(core.detail_error(e), success=False), with debug off that is str(e)
+        let body = super::context_size_failure_body(&anyhow::anyhow!("division by zero"));
+        assert_eq!(body, json!({"data": "division by zero", "success": false}));
+        let parse = py_int(&json!("1__0")).unwrap_err();
+        let body = super::context_size_failure_body(&anyhow::anyhow!(parse));
+        assert_eq!(body, json!({"data": "invalid literal for int() with base 10: '1__0'", "success": false}));
     }
 
     #[test]

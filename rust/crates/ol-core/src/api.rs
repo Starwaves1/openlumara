@@ -680,8 +680,7 @@ impl ApiClient {
                 };
                 buf.extend_from_slice(&chunk);
                 // split complete SSE events
-                loop {
-                    let Some((pos, sep_len)) = find_event_end(&buf) else { break };
+                while let Some((pos, sep_len)) = find_event_end(&buf) {
                     let event = String::from_utf8_lossy(&buf[..pos]).replace("\r\n", "\n");
                     buf.drain(..pos + sep_len);
 

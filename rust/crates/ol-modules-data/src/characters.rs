@@ -327,6 +327,32 @@ fn canonical_name(found: Option<String>, ch: &Value) -> anyhow::Result<Value> {
     }
 }
 
+/// python `char.get("first_message", "")` on a stored card: a truthy non-dict card raises the `.get` AttributeError
+fn card_first_message(ch: &Value) -> anyhow::Result<Value> {
+    match ch {
+        Value::Object(o) => Ok(o.get("first_message").cloned().unwrap_or(json!(""))),
+        other => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+    }
+}
+
+/// python route_edit rename loop: every chat whose character is `key` is re-stamped to `new_name`.
+/// python `chat.get("metadata") or {}`: a falsy metadata is an empty dict, a truthy non-dict raises the
+/// `.get` AttributeError and stops the loop
+fn restamp_chat_characters(chats: &mut [Value], key: &str, new_name: &str) -> anyhow::Result<()> {
+    for chat in chats.iter_mut() {
+        match chat.get_mut("metadata") {
+            Some(Value::Object(meta)) => {
+                if meta.get("character") == Some(&json!(key)) {
+                    meta.insert("character".into(), json!(new_name));
+                }
+            }
+            Some(other) if truthy(other) => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// python `_route_current`: `chat.get("metadata").get("character") or None`. a missing or non-dict
 /// metadata raises the `.get` AttributeError
 fn current_route_value(metadata: Option<Value>) -> anyhow::Result<Value> {
@@ -399,7 +425,7 @@ impl Characters {
     /// searches for a character, case insensitive. python callers all test the result for truthiness
     /// (`if not char`), so the first match is a miss when its stored value is falsy (e.g. an empty dict)
     fn find_character(&self, name: &str) -> Option<Value> {
-        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v).filter(|v| truthy(v))
+        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v).filter(truthy)
     }
 
     /// searches for a character and returns the stored key with correct case
@@ -625,7 +651,8 @@ impl Characters {
         let char_name = canonical_name(self.find_char_name(name), &ch)?;
         self.set_current_character(char_name.clone())?;
         let char_name = py_str(&char_name);
-        let first = ch.get("first_message").cloned().unwrap_or(json!(""));
+        // python `char.get("first_message", "")` runs after the metadata is set, so a non-dict card raises here
+        let first = card_first_message(&ch)?;
         if truthy(&first) && self.base.config.get_bool("use_first_messages") {
             let first = self.replace(&char_name, str_for_lower(&first)?)?;
             return Ok(self.base.result(
@@ -909,15 +936,7 @@ impl Characters {
             // chats reference characters by their stored key, so re-stamp any chat that
             // used the old one (best effort: in memory, persisted on the next index save)
             if let Some(ch) = self.base.channel() {
-                ch.chat.with_data_mut(|chats| {
-                    for chat in chats.iter_mut() {
-                        if let Some(meta) = chat.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-                            if meta.get("character") == Some(&json!(key)) {
-                                meta.insert("character".into(), json!(new_name));
-                            }
-                        }
-                    }
-                });
+                ch.chat.with_data_mut(|chats| restamp_chat_characters(chats, &key, &new_name))?;
                 // the current chat's metadata is read through the same index entry
             }
         }
@@ -1588,5 +1607,33 @@ mod tests {
         assert_eq!(counts, json!({"1.0": 2, "Ann": 2}));
         // an unhashable character raises like python's dict key TypeError
         assert_eq!(chats_count_from(vec![json!(["x"])]).unwrap_err().to_string(), "unhashable type: 'list'");
+    }
+
+    #[test]
+    fn switch_first_message_needs_a_dict_card() {
+        // python switch(): `char.get("first_message", "")` raises for a truthy non-dict stored character
+        assert_eq!(card_first_message(&json!({"first_message": "hi"})).unwrap(), json!("hi"));
+        assert_eq!(card_first_message(&json!({})).unwrap(), json!(""));
+        assert_eq!(card_first_message(&json!("card")).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        assert_eq!(card_first_message(&json!(["card"])).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+    }
+
+    #[test]
+    fn rename_restamps_chats_and_raises_on_truthy_non_dict_metadata() {
+        let mut chats = vec![
+            json!({"metadata": {"character": "Ann"}}),
+            json!({"metadata": null}),
+            json!({"metadata": {"character": "Bob"}}),
+        ];
+        restamp_chat_characters(&mut chats, "Ann", "Anna").unwrap();
+        assert_eq!(chats[0]["metadata"]["character"], "Anna");
+        assert_eq!(chats[2]["metadata"]["character"], "Bob");
+        // a falsy metadata is an empty dict in python, so it is skipped
+        let mut falsy = vec![json!({"metadata": ""}), json!({})];
+        restamp_chat_characters(&mut falsy, "Ann", "Anna").unwrap();
+        let mut bad = vec![json!({"metadata": "Ann"})];
+        assert_eq!(restamp_chat_characters(&mut bad, "Ann", "Anna").unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        let mut bad_list = vec![json!({"metadata": ["Ann"]})];
+        assert_eq!(restamp_chat_characters(&mut bad_list, "Ann", "Anna").unwrap_err().to_string(), "'list' object has no attribute 'get'");
     }
 }

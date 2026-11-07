@@ -177,7 +177,7 @@ fn group_counts(chats: &[Value], tz: i64) -> Result<IndexMap<String, (i64, Strin
 /// None where python's `get_total_tokens` raises: its `int(chat_data.get(key, 0))` on a stored value python
 /// cannot int() (null, list, dict, a non-numeric string) fails before anything else is read
 async fn chat_with_details(ch: &Channel) -> Option<Value> {
-    if !["token_usage", "token_usage_mark"].iter().all(|key| ch.chat.get(key).map_or(true, |v| py_int(&v).is_some())) {
+    if !["token_usage", "token_usage_mark"].iter().all(|key| ch.chat.get(key).is_none_or(|v| py_int(&v).is_some())) {
         return None;
     }
     let mut chat = ch.chat.get_chat();
@@ -477,12 +477,12 @@ async fn create_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
         _ => String::new(),
     };
     // python checks the format first; then `(chat.get("category") or "general").lower()` over every chat
-    // raises AttributeError for a truthy non-string category, which reaches starlette as the plain 500
+    // raises AttributeError for a non-dict entry or a truthy non-string category, which reaches starlette as the plain 500
     if let Err(error) = validate_category_format(&name) {
         return reply(json!(error), false);
     }
     let chats = ch.chat.data();
-    if chats.iter().any(|c| matches!(c.get("category"), Some(v) if truthy(v) && !v.is_string())) {
+    if chats.iter().any(|c| !c.is_object() || matches!(c.get("category"), Some(v) if truthy(v) && !v.is_string())) {
         return internal_error();
     }
     let category = match validate_category_name(&name, &chats) {
@@ -500,22 +500,28 @@ async fn delete_chat_category(State(app): State<Arc<Shared>>, body: Bytes) -> Re
     if name.is_empty() || name == "general" {
         return reply(json!("'general' cannot be deleted"), false);
     }
-    let target = Value::String(name.clone());
-    let general = json!("general");
-    let moved = ch.chat.with_data_mut(|chats| {
-        let mut moved = 0usize;
-        for chat in chats.iter_mut() {
-            if chat.get("category") == Some(&target) {
-                chat["category"] = general.clone();
-                moved += 1;
-            }
-        }
-        moved
-    });
+    // python raises AttributeError on a non-dict index entry: starlette's plain 500, and nothing is saved
+    let Ok(moved) = ch.chat.with_data_mut(|chats| move_category_chats(chats, &name)) else { return internal_error() };
     if moved > 0 {
         ch.chat.save_index();
     }
     reply(json!({"moved": moved}), true)
+}
+
+/// python `delete_chat_category` loop: every chat whose category equals `name` moves to 'general'.
+/// A non-dict index entry raises on `chat.get`; the moves made before it stay in memory (python does not roll back)
+fn move_category_chats(chats: &mut [Value], name: &str) -> Result<usize, String> {
+    let mut moved = 0usize;
+    for chat in chats.iter_mut() {
+        if !chat.is_object() {
+            return Err(format!("'{}' object has no attribute 'get'", py_type_name(chat)));
+        }
+        if chat.get("category").and_then(Value::as_str) == Some(name) {
+            chat["category"] = json!("general");
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 // ------------------
@@ -597,7 +603,7 @@ async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     // python: updated-descending unless sort=relevance (the BM25 order is kept then)
     let sort = obj.get("sort").filter(|v| truthy(v)).cloned().unwrap_or(json!("updated"));
     if sort != json!("relevance") {
-        results.sort_by(|a, b| updated_of(b).cmp(&updated_of(a)));
+        results.sort_by_key(|a| std::cmp::Reverse(updated_of(a)));
     }
 
     let mut projected = Vec::new();
@@ -814,6 +820,11 @@ fn changed_modules_of(obj: &Map<String, Value>) -> Option<Vec<Value>> {
     }
 }
 
+/// python settings_save's except branch: `channel.log(channel.name, f"Error reloading module {module_name}: {core.detail_error(e)}")`
+fn reload_error_line(module_name: &str, e: &anyhow::Error) -> String {
+    format!("Error reloading module {}: {}", module_name, ol_core::detail_error(e))
+}
+
 /// the body of settings/save: `(changed_modules, categories)`. python's `await request.json()` takes
 /// NaN and Infinity, which the lenient reader reads as null (a plain 500 where python raises on them)
 fn settings_save_request(body: &[u8]) -> Option<(Vec<Value>, Map<String, Value>)> {
@@ -842,9 +853,10 @@ async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response 
     let manager = ch.manager();
     for item in &changed_modules {
         match item {
-            // python: reload_module(name) logs a failed reload itself and carries on with the next module
             Value::String(name) => {
-                manager.reload_module(name).await;
+                if let Err(e) = manager.reload_module(name).await {
+                    ch.log(&ch.name, &reload_error_line(name, &e));
+                }
             }
             // python's `name not in self.modules` raises for an unhashable list or dict, which settings_save
             // logs as its reload error and carries on past
@@ -1027,6 +1039,25 @@ mod tests {
     }
 
     #[test]
+    fn delete_category_moves_matching_chats_to_general() {
+        let mut chats = vec![json!({"category": "work"}), json!({"category": "home"}), json!({"category": "work"}), json!({})];
+        assert_eq!(move_category_chats(&mut chats, "work").unwrap(), 2);
+        assert_eq!(chats[0]["category"], json!("general"));
+        assert_eq!(chats[1]["category"], json!("home"));
+        assert_eq!(chats[2]["category"], json!("general"));
+        assert_eq!(move_category_chats(&mut chats, "missing").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_category_stops_at_a_non_dict_entry_keeping_earlier_moves() {
+        // python: AttributeError on chat.get at the list entry; the route returns the plain 500 and does not save
+        let mut chats = vec![json!({"category": "work"}), json!("work"), json!({"category": "work"})];
+        assert!(move_category_chats(&mut chats, "work").is_err());
+        assert_eq!(chats[0]["category"], json!("general"));
+        assert_eq!(chats[2]["category"], json!("work"));
+    }
+
+    #[test]
     fn export_filename_replaces_unsafe_characters() {
         assert_eq!(export_filename("a/b:c*?\"<>|d"), "a_b_c______d.txt");
         assert_eq!(export_filename("   "), "chat-export.txt");
@@ -1206,5 +1237,12 @@ mod tests {
         let (page, more) = page_of(&chats, 4, 10);
         assert_eq!(page, vec![json!(4)]);
         assert!(!more);
+    }
+
+    #[test]
+    fn reload_error_line_matches_python_settings_save_log() {
+        // python: f"Error reloading module {module_name}: {core.detail_error(e)}" with debug off (str(e))
+        let e = anyhow::anyhow!("on_ready blew up");
+        assert_eq!(reload_error_line("coder", &e), "Error reloading module coder: on_ready blew up");
     }
 }

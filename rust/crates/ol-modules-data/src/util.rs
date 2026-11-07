@@ -112,15 +112,21 @@ pub fn py_int(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f.trunc() as i64)),
         Value::Bool(b) => Some(*b as i64),
-        Value::String(s) => {
-            let t = s.trim().replace('_', "");
-            if t.is_empty() {
-                return None;
-            }
-            t.parse::<i64>().ok()
-        }
+        Value::String(s) => parse_py_int_text(s),
         _ => None,
     }
+}
+
+/// python `int(s)` for a str: surrounding whitespace and one optional sign are allowed, and an
+/// underscore is accepted only singly between two digits (`1_0` yes; `1__0`, `_1`, `1_` no)
+fn parse_py_int_text(s: &str) -> Option<i64> {
+    let t = py_strip(s);
+    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let valid = !digits.is_empty() && digits.split('_').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+    if !valid {
+        return None;
+    }
+    t.replace('_', "").parse::<i64>().ok()
 }
 
 /// python `int(s)` for str
@@ -237,7 +243,7 @@ pub fn py_utf8_decode(bytes: &[u8]) -> Result<String, String> {
             let (end, reason) = match e.error_len() {
                 Some(n) => {
                     // a lead byte that is valid on its own fails on the continuation byte after it
-                    let lead_ok = matches!(bytes[start], 0xC2..=0xDF | 0xE0..=0xEF | 0xF0..=0xF4);
+                    let lead_ok = matches!(bytes[start], 0xC2..=0xF4);
                     (start + n, if lead_ok { "invalid continuation byte" } else { "invalid start byte" })
                 }
                 None => (bytes.len(), "unexpected end of data"),
@@ -543,6 +549,20 @@ mod tests {
         assert_eq!(query_int(&q, "y", 100), 7);
         assert_eq!(round2(0.125), 0.12);
         assert_eq!(round2(1.0 / 3.0), 0.33);
+    }
+
+    #[test]
+    fn py_int_underscores_like_python() {
+        assert_eq!(py_int(&json!("1_0")), Some(10));
+        assert_eq!(py_int(&json!(" -1_000 ")), Some(-1000));
+        assert_eq!(py_int(&json!("+7")), Some(7));
+        // python int() rejects a doubled, leading or trailing underscore
+        assert_eq!(py_int(&json!("1__0")), None);
+        assert_eq!(py_int(&json!("_1")), None);
+        assert_eq!(py_int(&json!("1_")), None);
+        assert_eq!(py_int(&json!("-_1")), None);
+        assert_eq!(py_int(&json!("")), None);
+        assert_eq!(py_int(&json!("1.5")), None);
     }
 
     #[test]
