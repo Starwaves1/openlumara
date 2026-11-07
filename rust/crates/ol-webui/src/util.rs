@@ -1171,6 +1171,109 @@ pub fn deps_still_needed(logs: &mut Vec<(String, String)>) -> std::collections::
     needed
 }
 
+/// python `ModuleManager.KNOWN_SUBFOLDERS`: the folders a library repo is scanned for installables in
+const LIBRARY_SUBFOLDERS: [&str; 4] = ["modules", "user_modules", "channels", "user_channels"];
+
+/// python `core/module_manager.py` `_extract_module_docstring` for a batch of files. It runs in the
+/// interpreter itself (ast.walk, ast.get_docstring): the first class anywhere in the file that has a
+/// docstring gives the first line; a file that does not parse gives "".
+const MODULE_DOC_SCRIPT: &str = r#"import ast, json, sys
+def first_doc_line(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+    except Exception:
+        return ""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            doc = ast.get_docstring(node)
+            if doc:
+                return doc.strip().split("\n")[0]
+    return ""
+for path in sys.argv[1:]:
+    print(json.dumps(first_doc_line(path)))
+"#;
+
+/// one docstring per path, in order. A python that cannot be run leaves every doc empty.
+fn python_module_docs(paths: &[std::path::PathBuf]) -> Vec<String> {
+    let mut docs = vec![String::new(); paths.len()];
+    if paths.is_empty() {
+        return docs;
+    }
+    let out = std::process::Command::new(python_interpreter())
+        .arg("-I")
+        .arg("-c")
+        .arg(MODULE_DOC_SCRIPT)
+        .args(paths)
+        .output();
+    if let Ok(out) = out {
+        for (slot, line) in docs.iter_mut().zip(String::from_utf8_lossy(&out.stdout).lines()) {
+            if let Ok(doc) = serde_json::from_str::<String>(line) {
+                *slot = doc;
+            }
+        }
+    }
+    docs
+}
+
+/// python `_scan_dir`: the module/channel folders directly inside `root`, as (library, name, type, entry file)
+fn scan_library_dir(root: &std::path::Path, library: &str, found: &mut Vec<(String, String, &'static str, std::path::PathBuf)>) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let dir = e.path();
+        if !dir.is_dir() || name.starts_with('_') || name.starts_with('.') {
+            continue;
+        }
+        for (file, kind) in [("module.py", "module"), ("channel.py", "channel")] {
+            let entry = dir.join(file);
+            if entry.is_file() {
+                found.push((library.to_string(), name.clone(), kind, entry));
+                break;
+            }
+        }
+    }
+}
+
+/// python `ModuleManager.list_available()` over the cloned `libraries` ({name: path}). `doc` comes from
+/// python's own docstring rule (see MODULE_DOC_SCRIPT), not from the ol-core scanner.
+pub fn scan_library_modules(libraries: &std::collections::BTreeMap<String, std::path::PathBuf>) -> Vec<Value> {
+    let mut installed: Vec<String> = Vec::new();
+    for sub in LIBRARY_SUBFOLDERS {
+        installed.extend(ol_core::config::discover_folder_names(&ol_core::config::section_folder(sub)));
+    }
+    let mut found = Vec::new();
+    for (lib_name, lib_path) in libraries {
+        scan_library_dir(lib_path, lib_name, &mut found);
+        for sub in LIBRARY_SUBFOLDERS {
+            let sub_path = lib_path.join(sub);
+            if sub_path.is_dir() {
+                scan_library_dir(&sub_path, lib_name, &mut found);
+            }
+        }
+    }
+    let paths: Vec<std::path::PathBuf> = found.iter().map(|f| f.3.clone()).collect();
+    let docs = python_module_docs(&paths);
+    found
+        .into_iter()
+        .zip(docs)
+        .map(|((library, name, kind, _), doc)| {
+            json!({"library": library, "name": name, "type": kind, "doc": doc, "installed": installed.contains(&name)})
+        })
+        .collect()
+}
+
+/// the folder python's libraries_install/libraries_update hand to install_module_deps:
+/// `kind = "user_channels" if isfile(message/channel.py) else "user_modules"`, then the module is looked up
+/// under `__import__(kind)`. A copy that holds both module.py and channel.py is looked up under user_channels,
+/// where it is not, so python installs nothing; this returns that same folder.
+pub fn module_deps_folder(installed: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let kind = if installed.join("channel.py").is_file() { "user_channels" } else { "user_modules" };
+    ol_core::config::section_folder(kind).join(name)
+}
+
 /// core.get_path("requirements.txt"): the lines openlumara always needs
 fn base_requirements() -> Vec<String> {
     std::fs::read_to_string(ol_core::paths::project_root().join("requirements.txt"))
@@ -1498,5 +1601,51 @@ mod tests {
         );
         assert_eq!(py_json_loads_python_only_true(b"NaN").unwrap(), json!(true));
         assert!(py_json_loads_python_only_true(b"{\"a\": NaN,}").is_err());
+    }
+
+    #[test]
+    fn library_doc_is_the_first_docstring_line_of_the_first_class_that_has_one() {
+        // python: ast.walk, first ClassDef with a docstring; a header with a trailing comment still counts;
+        // a single-quoted docstring counts; a file that does not parse gives ""
+        let root = tempfile::tempdir().unwrap();
+        let lib = root.path().join("lib");
+        let write = |name: &str, src: &str| {
+            std::fs::create_dir_all(lib.join(name)).unwrap();
+            std::fs::write(lib.join(name).join("module.py"), src).unwrap();
+        };
+        write("ol_test_doc_helper", "class Helper:\n    pass\n\nclass Hello(Module):  # note\n    \"\"\"Says hi\n\n    more\"\"\"\n");
+        write("ol_test_doc_quote", "class Q(Module):\n    'single quoted'\n");
+        write("ol_test_doc_broken", "class Broken(Module:\n");
+        let libraries = std::collections::BTreeMap::from([("lib".to_string(), lib.clone())]);
+        assert_eq!(
+            scan_library_modules(&libraries),
+            vec![
+                json!({"library": "lib", "name": "ol_test_doc_broken", "type": "module", "doc": "", "installed": false}),
+                json!({"library": "lib", "name": "ol_test_doc_helper", "type": "module", "doc": "Says hi", "installed": false}),
+                json!({"library": "lib", "name": "ol_test_doc_quote", "type": "module", "doc": "single quoted", "installed": false}),
+            ]
+        );
+    }
+
+    #[test]
+    fn libraries_deps_folder_is_user_channels_only_for_a_channel_py_copy() {
+        // python: kind = "user_channels" if isfile(message/channel.py) else "user_modules"
+        let root = tempfile::tempdir().unwrap();
+        let both = root.path().join("both");
+        std::fs::create_dir_all(&both).unwrap();
+        std::fs::write(both.join("module.py"), "class A(Module):\n    dependencies = [\"ol_test_never_installed_pkg\"]\n").unwrap();
+        std::fs::write(both.join("channel.py"), "class A(Channel):\n    pass\n").unwrap();
+        let folder = module_deps_folder(&both, "ol_test_both_files");
+        assert!(folder.ends_with(std::path::Path::new("user_channels").join("ol_test_both_files")));
+        // python looks the module up in user_channels, where the copy is not, so no dependencies are installed
+        let mut logs = Vec::new();
+        assert_eq!(install_module_deps(&folder, "ol_test_both_files", &mut logs), Ok(false));
+        assert!(logs.is_empty());
+
+        let module_only = root.path().join("module_only");
+        std::fs::create_dir_all(&module_only).unwrap();
+        std::fs::write(module_only.join("module.py"), "class A(Module):\n    pass\n").unwrap();
+        assert!(module_deps_folder(&module_only, "ol_test_module_only")
+            .ends_with(std::path::Path::new("user_modules").join("ol_test_module_only")));
     }
 }

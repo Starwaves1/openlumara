@@ -872,12 +872,19 @@ async fn reconnect(State(app): State<Arc<Shared>>) -> Response {
 // module libraries
 // ------------------
 
+/// python `ModuleManager.list_available()`, run off the async runtime (its docstrings come from python)
+async fn library_modules(libraries: std::collections::BTreeMap<String, std::path::PathBuf>) -> Vec<Value> {
+    tokio::task::spawn_blocking(move || crate::util::scan_library_modules(&libraries)).await.unwrap_or_default()
+}
+
 async fn libraries_status(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let manager = ch.manager();
     let mm = manager.module_manager();
-    let libraries: Vec<String> = mm.list_libraries().keys().cloned().collect();
-    reply(json!({"repos": mm.list_repos(), "libraries": libraries, "modules": mm.list_available()}), true)
+    let libraries = mm.list_libraries();
+    let names: Vec<String> = libraries.keys().cloned().collect();
+    let modules = library_modules(libraries).await;
+    reply(json!({"repos": mm.list_repos(), "libraries": names, "modules": modules}), true)
 }
 
 async fn libraries_sync(State(app): State<Arc<Shared>>) -> Response {
@@ -888,7 +895,8 @@ async fn libraries_sync(State(app): State<Arc<Shared>>) -> Response {
         return reply(json!("No module libraries configured. Add github repo urls under Core settings first."), false);
     }
     let synced = mm.load().await;
-    reply(json!({"synced": synced, "modules": mm.list_available()}), true)
+    let modules = library_modules(mm.list_libraries()).await;
+    reply(json!({"synced": synced, "modules": modules}), true)
 }
 
 async fn libraries_install(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
@@ -900,8 +908,8 @@ async fn libraries_install(State(app): State<Arc<Shared>>, body: Bytes) -> Respo
     let manager = ch.manager();
     match manager.module_manager().install(&library, &name) {
         Ok(message) => {
-            // python: install_module_deps on the copied folder; a failure is logged, the response still succeeds
-            let dir = std::path::PathBuf::from(&message);
+            // python: install_module_deps on the package folder picked by the copy's files; a failure is logged, the response still succeeds
+            let dir = crate::util::module_deps_folder(std::path::Path::new(&message), &name);
             let dep_name = name.clone();
             let outcome = run_module_deps(manager.clone(), move |logs| {
                 crate::util::install_module_deps(&dir, &dep_name, logs)
@@ -944,8 +952,8 @@ async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Respon
     let manager = ch.manager();
     match manager.module_manager().update(&library, &name).await {
         Ok(message) => {
-            // python: install_module_deps on the updated folder; a failure is logged, the response still succeeds
-            let dir = std::path::PathBuf::from(&message);
+            // python: install_module_deps on the package folder picked by the copy's files; a failure is logged, the response still succeeds
+            let dir = crate::util::module_deps_folder(std::path::Path::new(&message), &name);
             let dep_name = name.clone();
             let outcome = run_module_deps(manager.clone(), move |logs| {
                 crate::util::install_module_deps(&dir, &dep_name, logs)
