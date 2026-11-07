@@ -14,7 +14,46 @@ use tendril::TendrilSink;
 pub fn parse(text: &str) -> Html {
     let mut opts = ParseOpts::default();
     opts.tree_builder.scripting_enabled = false;
-    driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(text)
+    let mut doc = driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(text);
+    remove_blank_text(&mut doc);
+    doc
+}
+
+/// elements whose whitespace-only text children survive lxml's `remove_blank_text` (ddgs `base.py`
+/// `LHTMLParser(remove_blank_text=True)`). Probed against lxml 6.1.3: `<X> <b>q</b></X>` keeps the blank
+/// for X in this list and drops it otherwise (`ol`, `ul`, `table`, `tr`, `dl`, `option`, `map`, `menu` drop it).
+const KEEPS_BLANK_TEXT: &[&str] = &[
+    "a", "abbr", "acronym", "address", "applet", "b", "bdo", "big", "blockquote", "body", "button", "caption",
+    "center", "cite", "code", "dd", "del", "dfn", "div", "dt", "em", "font", "form", "h1", "h2", "h3", "h4", "h5",
+    "h6", "i", "ins", "kbd", "label", "legend", "li", "noscript", "object", "p", "pre", "q", "s", "samp", "small",
+    "span", "strike", "strong", "td", "th", "tt", "u", "var",
+];
+
+/// lxml's `remove_blank_text`: libxml2 drops a whitespace-only text node when a tag (or the end of input)
+/// follows it and the element before it, or its parent when it is the first child, is not in `KEEPS_BLANK_TEXT`.
+/// Comments and processing instructions are not counted as siblings (lxml removes them while parsing).
+fn remove_blank_text(doc: &mut Html) {
+    let mut dropped = Vec::new();
+    for node in doc.tree.nodes() {
+        let Some(text) = node.value().as_text() else { continue };
+        let blank = !text.text.is_empty() && text.text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+        if !blank || node.next_sibling().is_some_and(|n| n.value().is_text()) {
+            continue;
+        }
+        let prev = node.prev_siblings().find(|p| p.value().is_element() || p.value().is_text());
+        let owner = match prev {
+            Some(p) => ElementRef::wrap(p),
+            None => node.parent().and_then(ElementRef::wrap),
+        };
+        if owner.is_some_and(|el| !KEEPS_BLANK_TEXT.contains(&el.value().name())) {
+            dropped.push(node.id());
+        }
+    }
+    for id in dropped {
+        if let Some(mut node) = doc.tree.get_mut(id) {
+            node.detach();
+        }
+    }
 }
 
 /// `//*` of the document (root included), document order
@@ -182,6 +221,17 @@ mod tests {
         let empty = parse("<span><b>x</b></span>");
         let span = desc_named(all_elements(&empty)[0], "span")[0];
         assert_eq!(first_text(span), None);
+    }
+
+    #[test]
+    fn blank_text_is_dropped_where_lxml_remove_blank_text_drops_it() {
+        // blank after an inline element (span is kept by lxml) and before a comment: kept
+        assert_eq!(text_of(&all_elements(&parse("<div><span>a</span> <ul><li>x</li></ul></div>"))), "a x");
+        assert_eq!(text_of(&all_elements(&parse("<div><span>a</span><!--c--> <b>x</b></div>"))), "a x");
+        // blank after <img> (not kept by lxml), and blank as the first child of <dl> (not kept): dropped
+        assert_eq!(text_of(&all_elements(&parse("<p><img src=x> <b>q</b></p>"))), "q");
+        assert_eq!(text_of(&all_elements(&parse("<dl> <dt>a</dt></dl>"))), "a");
+        assert_eq!(text_of(&all_elements(&parse("<div><img><!--c--> <b>x</b></div>"))), "x");
     }
 
     #[test]
