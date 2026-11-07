@@ -9,10 +9,11 @@
 use crate::server::Shared;
 use crate::util::py_type_name;
 use anyhow::anyhow;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
 use futures::{SinkExt, StreamExt};
 use indexmap::IndexMap;
 use ol_core::channel::{Channel, Files, SendArgs, TokenStream};
@@ -132,14 +133,40 @@ impl WsManager {
     }
 }
 
-/// the `/ws` route. python refuses an unauthenticated client before accepting, which uvicorn
-/// answers with an HTTP 403 (the handshake never completes)
-pub async fn ws_route(State(app): State<Arc<Shared>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+/// the `/ws` route, root only (python defines `@app.websocket("/ws")`; a prefixed path has no route).
+/// python refuses an unauthenticated client before accepting, which uvicorn answers with an HTTP 403
+/// (the handshake never completes). A request that is not a websocket handshake is a plain http request
+/// in python: the http middlewares answer first, then the router has no http route for `/ws`
+pub async fn ws_route(
+    State(app): State<Arc<Shared>>,
+    headers: HeaderMap,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
     let Some(ch) = app.ch() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
-    if ch.config.get_bool("require_login", false) && !crate::session::ws_authorized(&headers, &app.signer) {
-        return StatusCode::FORBIDDEN.into_response();
+    let login_required = ch.config.get_bool("require_login", false);
+    let authorized = crate::session::ws_authorized(&headers, &app.signer);
+    match upgrade {
+        Ok(upgrade) => {
+            if login_required && !authorized {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            upgrade.on_upgrade(move |socket| serve_connection(app, socket)).into_response()
+        }
+        Err(_) => plain_http_reply(login_required && !authorized),
     }
-    upgrade.on_upgrade(move |socket| serve_connection(app, socket)).into_response()
+}
+
+/// the answer to a plain http request on `/ws`: python's `auth_middleware` redirects an unauthenticated
+/// client to `/login` (303, no cross-origin headers as the redirect skips `coi_middleware`); otherwise the
+/// router's 404 comes back through `coi_middleware` with its cross-origin headers
+fn plain_http_reply(redirect_to_login: bool) -> Response {
+    if redirect_to_login {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response();
+    }
+    let mut response = (StatusCode::NOT_FOUND, Json(json!({"detail": "Not Found"}))).into_response();
+    response.headers_mut().insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
+    response.headers_mut().insert("cross-origin-embedder-policy", HeaderValue::from_static("credentialless"));
+    response
 }
 
 /// how the read loop ends after a command: python's `return` / `break` close the endpoint

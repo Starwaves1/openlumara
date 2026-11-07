@@ -2992,3 +2992,30 @@ async fn git_split_diff_checks_its_fields_method_and_read_only_is_no_bar() {
         json!({"data": {"rows": []}, "success": true})
     );
 }
+
+#[tokio::test]
+async fn plain_get_on_ws_is_python_404_without_login() {
+    let h = harness(false).await;
+    let resp = h.get("/ws").await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(resp.json(), json!({"detail": "Not Found"}));
+    assert_eq!(resp.headers.get("cross-origin-opener-policy").unwrap(), "same-origin");
+    assert_eq!(resp.headers.get("cross-origin-embedder-policy").unwrap(), "credentialless");
+}
+
+#[tokio::test]
+async fn plain_get_on_ws_redirects_to_login_when_login_is_required() {
+    let h = harness(true).await;
+    let resp = h.get("/ws").await;
+    assert_eq!(resp.status, StatusCode::SEE_OTHER);
+    assert_eq!(resp.headers.get(header::LOCATION).unwrap(), "/login");
+}
+
+#[tokio::test]
+async fn ws_is_served_only_at_the_root_like_python() {
+    // the frontend builds `<pathname>/ws`; python defines `/ws` alone, so a prefixed path is a 404 there too
+    let h = harness(false).await;
+    let resp = h.get("/webui/ws").await;
+    assert_eq!(resp.status, StatusCode::NOT_FOUND);
+    assert_eq!(resp.json(), json!({"detail": "Not Found"}));
+}
