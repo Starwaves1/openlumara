@@ -1314,6 +1314,20 @@ async fn libraries_uninstall_reports_a_module_that_is_not_installed() {
 }
 
 #[tokio::test]
+async fn library_bodies_read_python_json_loads_nan_like_python() {
+    // python's json.loads takes NaN in a key the handler never reads; the name is read with `or ""` and `.strip()`
+    let h = harness(false).await;
+    let resp = h.send(post_json("/api/libraries/uninstall", r#"{"name": "ol_test_not_installed_zz", "junk": NaN}"#)).await;
+    assert_eq!(
+        resp.json(),
+        json!({"data": "'ol_test_not_installed_zz' is not installed as a user module/channel", "success": false})
+    );
+    // a NaN name is a truthy non-string, so `.strip()` raises: a plain 500
+    let resp = h.send(post_json("/api/libraries/uninstall", r#"{"name": NaN}"#)).await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
 async fn library_post_routes_answer_get_with_405_allow_post() {
     let h = harness(false).await;
     for uri in ["/api/libraries/sync", "/api/libraries/install", "/api/libraries/update", "/api/libraries/uninstall"] {

@@ -755,73 +755,320 @@ for dep in sys.argv[1:]:
         print(dep)
 "#;
 
-/// python `_extract_deps_from_file`: the string items of a `dependencies = [...]` assignment.
-/// python reads only class bodies through ast; this takes the first indented assignment, and
-/// skips comments and non-string items.
-pub fn extract_module_deps(source: &str) -> Vec<String> {
-    static DEPS_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^[ \t]+dependencies[ \t]*=[ \t]*\[").unwrap());
-    let Some(m) = DEPS_START.find(source) else { return Vec::new() };
-    let mut deps = Vec::new();
-    let mut chars = source[m.end()..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            ']' => break,
-            '#' => {
-                for c2 in chars.by_ref() {
-                    if c2 == '\n' {
-                        break;
+/// `(byte offset, text)` of every line of `source`, with a trailing `\r` removed from the text
+fn source_lines(source: &str) -> Vec<(usize, &str)> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in source.split('\n') {
+        lines.push((offset, line.strip_suffix('\r').unwrap_or(line)));
+        offset += line.len() + 1;
+    }
+    lines
+}
+
+/// width of the leading indentation of a line
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start_matches([' ', '\t']).len()
+}
+
+/// the quote state at the end of `line`, given the state at its start: `Some(delimiter)` while a
+/// triple-quoted string is still open. Single-line strings are not tracked.
+fn triple_quote_state(line: &str, mut open: Option<&'static str>) -> Option<&'static str> {
+    let mut rest = line;
+    loop {
+        match open {
+            Some(delim) => match rest.find(delim) {
+                Some(i) => {
+                    open = None;
+                    rest = &rest[i + 3..];
+                }
+                None => return Some(delim),
+            },
+            None => {
+                let next = [("\"\"\"", rest.find("\"\"\"")), ("'''", rest.find("'''"))]
+                    .into_iter()
+                    .filter_map(|(delim, i)| i.map(|i| (i, delim)))
+                    .min();
+                match next {
+                    Some((i, delim)) => {
+                        open = Some(delim);
+                        rest = &rest[i + 3..];
                     }
+                    None => return None,
                 }
             }
-            '\'' | '"' => {
-                let mut item = String::new();
-                let mut escaped = false;
-                for c2 in chars.by_ref() {
-                    if escaped {
-                        item.push(c2);
-                        escaped = false;
-                    } else if c2 == '\\' {
-                        escaped = true;
-                    } else if c2 == c {
-                        break;
-                    } else {
-                        item.push(c2);
-                    }
-                }
-                deps.push(item);
-            }
-            _ => {}
         }
     }
-    deps
+}
+
+/// the byte offset of the `[` when a statement is `dependencies = [`
+fn dependencies_list_start(line: &str) -> Option<usize> {
+    let code = line.trim_start();
+    let after = code.strip_prefix("dependencies")?.trim_start().strip_prefix('=')?;
+    if after.starts_with('=') {
+        return None;
+    }
+    let value = after.trim_start();
+    value.starts_with('[').then(|| line.len() - value.len())
+}
+
+/// one element of a list literal: python keeps it only when it is a constant string, which is one
+/// or more adjacent string literals with nothing else in the element
+#[derive(Default)]
+struct ListItem {
+    text: String,
+    strings: usize,
+    other: bool,
+}
+
+impl ListItem {
+    fn finish(self) -> Option<String> {
+        (self.strings > 0 && !self.other).then_some(self.text)
+    }
+}
+
+/// the string literal whose opening quote is at `src[i]`: its value and the offset after it.
+/// None when the literal is not closed (a python syntax error).
+fn string_literal(src: &[u8], i: usize, raw: bool) -> Option<(String, usize)> {
+    let q = *src.get(i)?;
+    let triple = src.get(i..i + 3) == Some(&[q, q, q][..]);
+    let delim = if triple { 3 } else { 1 };
+    let mut out = Vec::new();
+    let mut j = i + delim;
+    loop {
+        let c = *src.get(j)?;
+        if c == q && (!triple || src.get(j..j + 3) == Some(&[q, q, q][..])) {
+            return Some((String::from_utf8_lossy(&out).into_owned(), j + delim));
+        }
+        if c == b'\n' && !triple {
+            return None;
+        }
+        if c == b'\\' {
+            let n = *src.get(j + 1)?;
+            if raw {
+                out.extend([c, n]);
+            } else {
+                match n {
+                    b'\n' => {}
+                    b'\\' | b'\'' | b'"' => out.push(n),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    _ => out.extend([c, n]),
+                }
+            }
+            j += 2;
+            continue;
+        }
+        out.push(c);
+        j += 1;
+    }
+}
+
+/// python `ast.parse` of a list literal: `src[start]` is its `[`. Returns the constant string items
+/// and the offset after the closing `]`; None where the literal does not close.
+fn list_literal_items(src: &str, start: usize) -> Option<(Vec<String>, usize)> {
+    let b = src.as_bytes();
+    let mut items = Vec::new();
+    let mut item = ListItem::default();
+    let mut depth = 0usize;
+    let mut i = start + 1;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' | b'\x0c' => i += 1,
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'[' | b'(' | b'{' => {
+                depth += 1;
+                item.other = true;
+                i += 1;
+            }
+            b']' | b')' | b'}' if depth > 0 => {
+                depth -= 1;
+                i += 1;
+            }
+            b']' => {
+                items.extend(item.finish());
+                return Some((items, i + 1));
+            }
+            b',' if depth == 0 => {
+                items.extend(std::mem::take(&mut item).finish());
+                i += 1;
+            }
+            b',' => i += 1,
+            b'"' | b'\'' => {
+                let (text, next) = string_literal(b, i, false)?;
+                if depth == 0 {
+                    item.text.push_str(&text);
+                    item.strings += 1;
+                } else {
+                    item.other = true;
+                }
+                i = next;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let mut end = i;
+                while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                    end += 1;
+                }
+                let quoted = matches!(b.get(end), Some(b'"') | Some(b'\''));
+                if quoted {
+                    // a prefixed literal: r and u keep a plain str, f and b are not constants
+                    let prefix = src[i..end].to_ascii_lowercase();
+                    let (text, next) = string_literal(b, end, prefix == "r")?;
+                    if depth == 0 && (prefix == "r" || prefix == "u") {
+                        item.text.push_str(&text);
+                        item.strings += 1;
+                    } else {
+                        item.other = true;
+                    }
+                    i = next;
+                } else {
+                    item.other = true;
+                    i = end;
+                }
+            }
+            _ => {
+                item.other = true;
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// python `_extract_deps_from_file`: the constant string items of the first `dependencies = [...]`
+/// that is a statement directly in a class body. Classes are visited shallowest first, as python's
+/// `ast.walk` visits them. Assignments anywhere else (functions, blocks, module level, docstrings)
+/// are ignored. A source that python cannot parse gives no dependencies.
+pub fn extract_module_deps(source: &str) -> Vec<String> {
+    let lines = source_lines(source);
+    let mut classes: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, line))| line.trim_start().starts_with("class "))
+        .map(|(i, (_, line))| (indent_of(line), i))
+        .collect();
+    classes.sort();
+    for (_, header) in classes {
+        if let Some(deps) = class_body_deps(source, &lines, header) {
+            return deps;
+        }
+    }
+    Vec::new()
+}
+
+/// the dependencies of the first list-valued `dependencies` statement in the body of the class whose
+/// header is `lines[header]`. None when the body has no such statement.
+fn class_body_deps(source: &str, lines: &[(usize, &str)], header: usize) -> Option<Vec<String>> {
+    let header_indent = indent_of(lines[header].1);
+    let mut body_indent: Option<usize> = None;
+    let mut quote: Option<&'static str> = None;
+    for &(offset, line) in &lines[header + 1..] {
+        if quote.is_some() {
+            quote = triple_quote_state(line, quote);
+            continue;
+        }
+        let code = line.trim_start();
+        if code.is_empty() || code.starts_with('#') {
+            continue;
+        }
+        let indent = indent_of(line);
+        let body = match body_indent {
+            Some(b) => b,
+            None if indent > header_indent => {
+                body_indent = Some(indent);
+                indent
+            }
+            None => return None,
+        };
+        if indent < body {
+            return None;
+        }
+        if indent == body {
+            if let Some(list) = dependencies_list_start(line) {
+                // a list that does not close is a syntax error, which python reports as no dependencies
+                return Some(list_literal_items(source, offset + list).map(|(items, _)| items).unwrap_or_default());
+            }
+        }
+        quote = triple_quote_state(line, None);
+    }
+    None
 }
 
 /// python `_get_module_file_path` for one folder: module.py, else channel.py. A folder with an
-/// __init__.py is not a module folder.
-pub fn module_entry_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if !dir.is_dir() || dir.join("__init__.py").exists() {
+/// __init__.py is not a module folder; python logs that once per process, and so does this.
+pub fn module_entry_file(dir: &std::path::Path, logs: &mut Vec<(String, String)>) -> Option<std::path::PathBuf> {
+    if !dir.is_dir() {
+        return None;
+    }
+    if dir.join("__init__.py").exists() {
+        let package = dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let key = format!("{}.{}", package.unwrap_or_default(), dir.file_name().unwrap_or_default().to_string_lossy());
+        let mut reported = REPORTED_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if !reported.contains(&key) {
+            logs.push((
+                "core".to_string(),
+                format!("skipping {key}: __init__.py is not allowed in module/channel folders, please remove it"),
+            ));
+            reported.push(key);
+        }
         return None;
     }
     ["module.py", "channel.py"].iter().map(|f| dir.join(f)).find(|p| p.is_file())
 }
 
+/// the `package.name` keys python has already reported for a folder with an __init__.py
+static REPORTED_INIT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// the declared dependencies of the module/channel folder `dir` (empty when there is no entry file)
-pub fn module_deps_of_folder(dir: &std::path::Path) -> Vec<String> {
-    match module_entry_file(dir) {
+pub fn module_deps_of_folder(dir: &std::path::Path, logs: &mut Vec<(String, String)>) -> Vec<String> {
+    match module_entry_file(dir, logs) {
         Some(entry) => std::fs::read_to_string(entry).map(|s| extract_module_deps(&s)).unwrap_or_default(),
         None => Vec::new(),
     }
 }
 
+/// python `sys.executable` for the dependency steps. run.sh starts openlumara from `venv/`, so that
+/// interpreter is used when it exists; otherwise the `python3` on PATH, as an absolute path.
+pub fn python_interpreter() -> std::path::PathBuf {
+    let root = ol_core::paths::project_root();
+    let venv = if cfg!(windows) { root.join("venv/Scripts/python.exe") } else { root.join("venv/bin/python") };
+    if venv.is_file() {
+        return venv;
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).map(|d| d.join("python3")).find(|p| p.is_file()))
+        .unwrap_or_else(|| std::path::PathBuf::from("python3"))
+}
+
+/// python's `str()` of the OSError raised when `exe` cannot be started, e.g.
+/// `[Errno 2] No such file or directory: '/usr/bin/python3'`
+fn py_spawn_error(e: &std::io::Error, exe: &std::path::Path) -> String {
+    match e.raw_os_error() {
+        Some(code) => {
+            let full = e.to_string();
+            let strerror = full.rsplit_once(" (os error").map_or(full.as_str(), |(text, _)| text);
+            format!("[Errno {code}] {strerror}: '{}'", exe.display())
+        }
+        None => e.to_string(),
+    }
+}
+
 /// python `_check_missing_deps`: the declared dependencies that are not installed, asked of the
-/// `python3` interpreter. Err when the interpreter cannot be run.
+/// interpreter. Err when the interpreter cannot be run.
 pub fn missing_module_deps(deps: &[String]) -> Result<Vec<String>, String> {
-    let out = std::process::Command::new("python3")
+    let python = python_interpreter();
+    let out = std::process::Command::new(&python)
         .arg("-c")
         .arg(MISSING_DEPS_SCRIPT)
         .args(deps)
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| py_spawn_error(&e, &python))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -847,15 +1094,16 @@ fn run_pip(op: PipOp, module_name: &str, packages: &[String], logs: &mut Vec<(St
         PipOp::Uninstall => ("uninstalling", "uninstall", &["-y", "--quiet"], "uninstall failed"),
     };
     logs.push(("core".to_string(), format!("{gerund} dependencies for {module_name}: {}", packages.join(", "))));
-    let mut argv: Vec<String> = ["python3", "-m", "pip", verb].iter().map(|s| s.to_string()).collect();
+    let python = python_interpreter();
+    let mut argv: Vec<String> = vec![python.display().to_string(), "-m".into(), "pip".into(), verb.into()];
     argv.extend(flags.iter().map(|s| s.to_string()));
     argv.extend(packages.iter().cloned());
-    let status = std::process::Command::new(&argv[0])
+    let status = std::process::Command::new(&python)
         .args(&argv[1..])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| py_spawn_error(&e, &python))?;
     if !status.success() {
         let repr: Vec<String> = argv.iter().map(|a| format!("'{a}'")).collect();
         logs.push((
@@ -873,7 +1121,7 @@ fn run_pip(op: PipOp, module_name: &str, packages: &[String], logs: &mut Vec<(St
 /// python `install_module_deps` for the folder `dir`: installs the declared dependencies that are
 /// missing. Ok(true) when a pip install was run.
 pub fn install_module_deps(dir: &std::path::Path, name: &str, logs: &mut Vec<(String, String)>) -> Result<bool, String> {
-    let deps = module_deps_of_folder(dir);
+    let deps = module_deps_of_folder(dir, logs);
     if deps.is_empty() {
         return Ok(false);
     }
@@ -894,7 +1142,7 @@ pub fn uninstall_module_deps(
     still_needed: &std::collections::HashSet<String>,
     logs: &mut Vec<(String, String)>,
 ) -> Result<bool, String> {
-    let deps = module_deps_of_folder(dir);
+    let deps = module_deps_of_folder(dir, logs);
     if deps.is_empty() {
         return Ok(false);
     }
@@ -912,12 +1160,12 @@ pub fn uninstall_module_deps(
 }
 
 /// python `uninstall_module_deps` exclusion: the dependencies of every enabled module and channel
-pub fn deps_still_needed() -> std::collections::HashSet<String> {
+pub fn deps_still_needed(logs: &mut Vec<(String, String)>) -> std::collections::HashSet<String> {
     let mut needed = std::collections::HashSet::new();
     let root = ol_core::paths::project_root();
     for section in ["modules", "user_modules", "channels", "user_channels"] {
         for name in ol_core::config::get_str_list(&[section, "enabled"]) {
-            needed.extend(module_deps_of_folder(&root.join(section).join(name)));
+            needed.extend(module_deps_of_folder(&root.join(section).join(name), logs));
         }
     }
     needed
@@ -945,15 +1193,63 @@ mod tests {
     }
 
     #[test]
+    fn module_deps_ignore_assignments_outside_the_class_body_like_python() {
+        let src = concat!(
+            "def helper():\n",
+            "    dependencies = [\"not_a_class_dep\"]\n",
+            "    return dependencies\n",
+            "\n",
+            "if True:\n",
+            "    dependencies = [\"not_here_either\"]\n",
+            "\n",
+            "class Hello(Module):\n",
+            "    \"\"\"A docstring with a line:\n",
+            "    dependencies = [\"in_docstring\"]\n",
+            "    \"\"\"\n",
+            "    dependencies = [\n",
+            "        \"requests>=2.0\",  # http client\n",
+            "        \"ab\" \"cd\",\n",
+            "        f\"{x}\",\n",
+            "        PINNED,\n",
+            "        'python-telegram-bot[ext]',\n",
+            "    ]\n",
+        );
+        assert_eq!(extract_module_deps(src), vec!["requests>=2.0", "abcd", "python-telegram-bot[ext]"]);
+        // a class whose only `dependencies` is not a list gives nothing, and python's ast stops at a parse error
+        assert!(extract_module_deps("class A(Module):\n    dependencies = other()\n").is_empty());
+        assert!(extract_module_deps("class A(Module):\n    dependencies = [\"unclosed\"\n").is_empty());
+    }
+
+    #[test]
     fn module_folder_entry_rejects_init_and_prefers_module_py() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("m");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("channel.py"), "").unwrap();
         std::fs::write(folder.join("module.py"), "").unwrap();
-        assert_eq!(module_entry_file(&folder), Some(folder.join("module.py")));
+        let mut logs = Vec::new();
+        assert_eq!(module_entry_file(&folder, &mut logs), Some(folder.join("module.py")));
+        assert!(logs.is_empty());
         std::fs::write(folder.join("__init__.py"), "").unwrap();
-        assert_eq!(module_entry_file(&folder), None);
+        assert_eq!(module_entry_file(&folder, &mut logs), None);
+        // python logs the __init__.py skip under core, naming the package folder and the module
+        let key = format!("{}.m", tmp.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            logs,
+            vec![(
+                "core".to_string(),
+                format!("skipping {key}: __init__.py is not allowed in module/channel folders, please remove it")
+            )]
+        );
+    }
+
+    #[test]
+    fn spawn_errors_read_like_pythons_oserror() {
+        let e = std::io::Error::from_raw_os_error(2);
+        assert_eq!(
+            py_spawn_error(&e, std::path::Path::new("/opt/venv/bin/python")),
+            "[Errno 2] No such file or directory: '/opt/venv/bin/python'"
+        );
     }
 
     #[test]

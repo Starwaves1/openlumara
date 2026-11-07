@@ -115,6 +115,12 @@ fn json_object(body: &[u8]) -> Option<Map<String, Value>> {
     serde_json::from_slice::<Value>(body).ok()?.as_object().cloned()
 }
 
+/// `await request.json()` for the library routes, which read string keys with `(data.get(k) or "").strip()`.
+/// python's json.loads takes NaN and Infinity; `py_json_loads_python_only_true` keeps those bodies.
+fn library_body(body: &[u8]) -> Option<Map<String, Value>> {
+    py_json_loads_python_only_true(body).ok()?.as_object().cloned()
+}
+
 /// `int(data.get(key) or 0)`; None where python raises
 fn tz_offset_of(v: Option<&Value>) -> Option<i64> {
     match v {
@@ -887,7 +893,7 @@ async fn libraries_sync(State(app): State<Arc<Shared>>) -> Response {
 
 async fn libraries_install(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Some(obj) = library_body(&body) else { return internal_error() };
     let (Ok(library), Ok(name)) = (or_strip(obj.get("library"), ""), or_strip(obj.get("name"), "")) else {
         return internal_error();
     };
@@ -931,7 +937,7 @@ where
 
 async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Some(obj) = library_body(&body) else { return internal_error() };
     let (Ok(library), Ok(name)) = (or_strip(obj.get("library"), ""), or_strip(obj.get("name"), "")) else {
         return internal_error();
     };
@@ -956,7 +962,7 @@ async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Respon
 
 async fn libraries_uninstall(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let Some(obj) = json_object(&body) else { return internal_error() };
+    let Some(obj) = library_body(&body) else { return internal_error() };
     let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
     let manager = ch.manager();
     // python: dependency cleanup for user_modules then user_channels runs before the folder is removed,
@@ -965,7 +971,7 @@ async fn libraries_uninstall(State(app): State<Arc<Shared>>, body: Bytes) -> Res
         let dir = ol_core::paths::project_root().join(sub).join(&name);
         let dep_name = name.clone();
         let outcome = run_module_deps(manager.clone(), move |logs| {
-            let still_needed = crate::util::deps_still_needed();
+            let still_needed = crate::util::deps_still_needed(logs);
             crate::util::uninstall_module_deps(&dir, &dep_name, &still_needed, logs)
         })
         .await;
