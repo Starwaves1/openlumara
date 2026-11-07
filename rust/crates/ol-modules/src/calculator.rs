@@ -285,4 +285,52 @@ mod tests {
         assert_eq!(run("await x"), (false, "Sorry, Await is not available in this evaluator".into()));
         assert_eq!(run("(x := 1)"), (false, "Sorry, NamedExpr is not available in this evaluator".into()));
     }
+
+    #[test]
+    fn unpacked_arguments_are_evaluated_before_the_call_like_simpleeval() {
+        // the `**` operand is evaluated (so an undefined name is reported), then python refuses the None key
+        assert_eq!(run("int(**x)"), (false, "'x' is not defined for expression 'int(**x)'".into()));
+        assert_eq!(run("int(**1)"), (false, "keywords must be strings".into()));
+        assert_eq!(run("randint(1, 2, **1)"), (false, "keywords must be strings".into()));
+        assert_eq!(run("int(**x, 1)"), (false, "positional argument follows keyword argument unpacking (<unknown>, line 1)".into()));
+        assert_eq!(run("int(**x, *y)"), (false, "iterable argument unpacking follows keyword argument unpacking (<unknown>, line 1)".into()));
+        // a `*` operand is refused without being evaluated
+        assert_eq!(run("int(*x)"), (false, "Sorry, Starred is not available in this evaluator".into()));
+        assert_eq!(run("*a"), (false, "Sorry, Starred is not available in this evaluator".into()));
+        assert_eq!(run("x = *a"), (false, "Sorry, Starred is not available in this evaluator".into()));
+        // a starred target is valid, and simpleeval evaluates only the value
+        assert_eq!(run("*a = 1"), (true, "1".into()));
+        assert_eq!(run("*a, b = 1"), (true, "1".into()));
+        assert_eq!(run("*a += 1"), (false, "'starred' is an illegal expression for augmented assignment (<unknown>, line 1)".into()));
+    }
+
+    #[test]
+    fn type_objects_and_builtin_binding_match_cpython() {
+        assert_eq!(run("int[0]"), (false, "type 'int' is not subscriptable".into()));
+        assert_eq!(run("str[0]"), (false, "type 'str' is not subscriptable".into()));
+        assert_eq!(run("float[1:2]"), (false, "type 'float' is not subscriptable".into()));
+        assert_eq!(run("rand[0]"), (false, "'builtin_function_or_method' object is not subscriptable".into()));
+        // without keywords int reports its positional-only count
+        assert_eq!(run("int(1,2,3)"), (false, "int expected at most 2 arguments, got 3".into()));
+        assert_eq!(run("int('1',2,3)"), (false, "int expected at most 2 arguments, got 3".into()));
+        // randint: keywords are bound before the positional count is checked; a repeated top= keeps the last
+        assert_eq!(run("randint(1, top=3)"), (false, "random_int() got multiple values for argument 'top'".into()));
+        assert_eq!(run("randint(1, 2)"), (false, "random_int() takes 1 positional argument but 2 were given".into()));
+        assert_eq!(run("randint(top=2, top=0)"), (true, "0".into()));
+        // str: keywords bind the same parameters as positions, and a missing object gives ''
+        assert_eq!(run("str(1, encoding=1)"), (false, "str() argument 'encoding' must be str, not int".into()));
+        assert_eq!(run("str(1, encoding=None)"), (false, "str() argument 'encoding' must be str, not None".into()));
+        assert_eq!(run("str(encoding='x')"), (true, "\"\"".into()));
+        assert_eq!(run("str(errors='x')"), (true, "\"\"".into()));
+        assert_eq!(run("str(1, object=2)"), (false, "argument for str() given by name ('object') and position (1)".into()));
+        assert_eq!(run("str(None, 'x')"), (false, "decoding to str: need a bytes-like object, NoneType found".into()));
+        assert_eq!(run("str(1,'x','y',errors='z')"), (false, "str() takes at most 3 arguments (4 given)".into()));
+    }
+
+    #[test]
+    fn assignment_hint_only_applies_to_the_first_target() {
+        assert_eq!(run("1 = 2"), (false, "cannot assign to literal here. Maybe you meant '==' instead of '='? (<unknown>, line 1)".into()));
+        assert_eq!(run("x = 2 = 3"), (false, "cannot assign to literal (<unknown>, line 1)".into()));
+        assert_eq!(run("x = 1 = 2"), (false, "cannot assign to literal (<unknown>, line 1)".into()));
+    }
 }

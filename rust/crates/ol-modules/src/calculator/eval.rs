@@ -37,6 +37,8 @@ const OPS3: &[&str] = &["**=", "//=", ">>=", "<<=", "..."];
 const OPS2: &[&str] = &["**", "//", "<<", ">>", "<=", ">=", "==", "!=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", ":=", "->"];
 const OPS1: &[&str] = &["+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "=", ".", ",", ":", "@", "(", ")", "[", "]", "{", "}", ";"];
 const AUG_OPS: &[&str] = &["+=", "-=", "*=", "/=", "//=", "%=", "**=", "<<=", ">>=", "&=", "|=", "^=", "@="];
+/// the keyword name given to a `**mapping` unpacking inside a call (not an identifier, so it cannot clash)
+const DOUBLE_STAR: &str = "**";
 
 /// an exception raised while evaluating; the message is python's `str(e)`
 #[derive(Debug, Clone, PartialEq)]
@@ -360,6 +362,9 @@ enum Expr {
     /// a tuple display or bare `a, b`. simpleeval refuses it when evaluated, but its elements decide
     /// whether it is a valid assignment target
     Tuple(Vec<Expr>),
+    /// `*x` in a statement's expression list. simpleeval refuses the node without evaluating its operand;
+    /// as an assignment target it is valid, and only the value is evaluated
+    Starred(Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     And(Vec<Expr>),
@@ -861,14 +866,16 @@ fn assign_kind(e: &Expr) -> (&'static str, bool) {
         // cpython only adds the '==' hint to targets that parse as a bitwise_or, which excludes these
         Expr::And(_) | Expr::Or(_) | Expr::Unary(UnOp::Not, _) => ("expression", false),
         Expr::Tuple(_) => ("tuple", false),
+        Expr::Starred(_) => ("starred", false),
         _ => ("expression", true),
     }
 }
 
-/// cpython's message for an assignment to something that is not a name, attribute or subscript
-fn assign_error(e: &Expr, line: usize) -> PyErr {
+/// cpython's message for an assignment to something that is not a name, attribute or subscript. The
+/// '==' hint is only given for the first target: cpython's hint rule does not apply after a chained '='.
+fn assign_error(e: &Expr, line: usize, first_target: bool) -> PyErr {
     let (kind, hint) = assign_kind(e);
-    if hint {
+    if hint && first_target {
         syntax_error(&format!("cannot assign to {kind} here. Maybe you meant '==' instead of '='?"), line)
     } else {
         syntax_error(&format!("cannot assign to {kind}"), line)
@@ -876,13 +883,14 @@ fn assign_error(e: &Expr, line: usize) -> PyErr {
 }
 
 /// the compile error cpython gives for an assignment target, or None when the target is valid. A tuple
-/// target is valid when all its elements are (cpython reports a bad element with the same message as a
-/// bad plain target); simpleeval then evaluates only the value.
-fn target_error(e: &Expr, line: usize) -> Option<PyErr> {
+/// or starred target is valid when its elements are (cpython reports a bad element with the same message
+/// as a bad plain target); simpleeval then evaluates only the value.
+fn target_error(e: &Expr, line: usize, first_target: bool) -> Option<PyErr> {
     match e {
         Expr::Name(_) | Expr::Attr(..) | Expr::Subscript(..) => None,
-        Expr::Tuple(items) => items.iter().find_map(|item| target_error(item, line)),
-        _ => Some(assign_error(e, line)),
+        Expr::Tuple(items) => items.iter().find_map(|item| target_error(item, line, first_target)),
+        Expr::Starred(inner) => target_error(inner, line, first_target),
+        _ => Some(assign_error(e, line, first_target)),
     }
 }
 
@@ -1085,7 +1093,7 @@ impl Parser {
                 exprs.push(self.test_list()?);
             }
             let value = exprs.pop().unwrap_or(Expr::Const(Val::None));
-            if let Some(err) = exprs.iter().find_map(|t| target_error(t, self.line())) {
+            if let Some(err) = exprs.iter().enumerate().find_map(|(i, t)| target_error(t, self.line(), i == 0)) {
                 return Err(err);
             }
             return Ok(Stmt::Assign(value));
@@ -1103,7 +1111,7 @@ impl Parser {
 
     /// `a, b` at statement level is a tuple, which simpleeval refuses to evaluate
     fn test_list(&mut self) -> Res<Expr> {
-        let first = self.test()?;
+        let first = self.star_or_test()?;
         if !self.is_op(",") {
             return Ok(first);
         }
@@ -1112,9 +1120,18 @@ impl Parser {
             if matches!(self.tok(), Tok::Newline | Tok::Eof | Tok::Op("=" | ";")) || matches!(self.tok(), Tok::Op(op) if AUG_OPS.contains(op)) {
                 break;
             }
-            items.push(self.test()?);
+            items.push(self.star_or_test()?);
         }
         Ok(Expr::Tuple(items))
+    }
+
+    /// a `test`, or a starred `*expr` (its operand is a bitwise_or, as in cpython's star_expression)
+    fn star_or_test(&mut self) -> Res<Expr> {
+        if self.eat_op("*") {
+            let operand = self.bitor()?;
+            return Ok(Expr::Starred(Box::new(operand)));
+        }
+        self.test()
     }
 
     fn test(&mut self) -> Res<Expr> {
@@ -1334,11 +1351,21 @@ impl Parser {
     fn call_args(&mut self) -> Res<(Vec<Expr>, Vec<(String, Expr)>)> {
         let mut args = Vec::new();
         let mut kwargs: Vec<(String, Expr)> = Vec::new();
+        // a `**` unpacking is kept among the keywords under a name no identifier can have
+        let mut double_star = false;
         while !self.is_op(")") {
-            if self.is_op("*") || self.is_op("**") {
+            if self.is_op("*") {
+                if double_star {
+                    return Err(syntax_error("iterable argument unpacking follows keyword argument unpacking", self.line()));
+                }
                 self.bump();
                 self.test()?;
                 args.push(Expr::Fail(not_available("Starred")));
+            } else if self.is_op("**") {
+                self.bump();
+                let value = self.test()?;
+                kwargs.push((DOUBLE_STAR.to_string(), value));
+                double_star = true;
             } else if matches!(self.tok(), Tok::Name(n) if !is_keyword(n)) && matches!(self.peek_tok(1), Some(Tok::Op("="))) {
                 let Tok::Name(name) = self.bump() else { return self.invalid() };
                 self.bump();
@@ -1350,6 +1377,9 @@ impl Parser {
                     // f(x for x in y): a GeneratorExp argument, closed by the call's ')'
                     args.push(self.comprehension("GeneratorExp", ")")?);
                     return Ok((args, kwargs));
+                }
+                if double_star {
+                    return Err(syntax_error("positional argument follows keyword argument unpacking", self.line()));
                 }
                 if !kwargs.is_empty() {
                     return Err(syntax_error("positional argument follows keyword argument", self.line()));
@@ -1972,6 +2002,22 @@ fn index_value(container: &Val, key: &Val) -> Res<Val> {
             }
             Ok(Val::Str(chars[idx as usize].to_string()))
         }
+        other => not_subscriptable(other),
+    }
+}
+
+/// python's error for `container[key]` when the container cannot be subscripted. The type objects
+/// int, float and str name themselves as types rather than as objects of type 'type'.
+fn not_subscriptable<T>(container: &Val) -> Res<T> {
+    match container {
+        Val::Func(f @ (Func::Int | Func::Float | Func::Str)) => {
+            let name = match f {
+                Func::Int => "int",
+                Func::Float => "float",
+                _ => "str",
+            };
+            fail(format!("type '{name}' is not subscriptable"))
+        }
         other => fail(format!("'{}' object is not subscriptable", type_name(other))),
     }
 }
@@ -2029,7 +2075,7 @@ fn slice_bound(v: &Option<Val>) -> Res<Option<i64>> {
 
 fn slice_value(container: &Val, lo: Option<Val>, hi: Option<Val>, step: Option<Val>) -> Res<Val> {
     let Val::Str(s) = container else {
-        return fail(format!("'{}' object is not subscriptable", type_name(container)));
+        return not_subscriptable(container);
     };
     let lo = slice_bound(&lo)?;
     let hi = slice_bound(&hi)?;
@@ -2070,14 +2116,22 @@ fn call_function(f: Func, args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val
 
 /// simpleeval's `random_int(top)`: `int(random() * top)`
 fn random_int(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
-    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "top") {
-        return fail(format!("random_int() got an unexpected keyword argument '{k}'"));
+    // cpython binds the keywords before it counts the positional arguments: a `top` after a positional
+    // argument is a repeat, any other name is unexpected, and a repeated `top=` keeps the last value
+    let mut kw_top = None;
+    for (k, v) in kwargs {
+        if k != "top" {
+            return fail(format!("random_int() got an unexpected keyword argument '{k}'"));
+        }
+        if !args.is_empty() {
+            return fail("random_int() got multiple values for argument 'top'");
+        }
+        kw_top = Some(v);
     }
-    let total = args.len() + kwargs.len();
-    if total > 1 {
-        return fail(format!("random_int() takes 1 positional argument but {total} were given"));
+    if args.len() > 1 {
+        return fail(format!("random_int() takes 1 positional argument but {} were given", args.len()));
     }
-    let Some(top) = first_arg(args, kwargs) else {
+    let Some(top) = args.into_iter().next().or(kw_top) else {
         return fail("random_int() missing 1 required positional argument: 'top'");
     };
     let r: f64 = rand::random();
@@ -2096,6 +2150,10 @@ fn int_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
     // cpython counts keyword arguments with the positional ones before it looks at their names
     let total = args.len() + kwargs.len();
     if total > 2 {
+        // without keywords cpython uses its positional-only message
+        if kwargs.is_empty() {
+            return fail(format!("int expected at most 2 arguments, got {total}"));
+        }
         return fail(format!("int() takes at most 2 arguments ({total} given)"));
     }
     // int's `x` is positional-only; `base` is the only keyword
@@ -2229,25 +2287,50 @@ fn float_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
     }
 }
 
+/// python's `str(object='', encoding, errors)`: the three parameters take positional arguments in order
+/// and then keywords. Without an object the result is '' (whatever the encoding and errors are).
 fn str_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
-    if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "object") {
-        return fail(format!("str() got an unexpected keyword argument '{k}'"));
-    }
-    if args.len() + kwargs.len() > 1 {
-        // cpython checks the type of the encoding argument before it looks at the object
-        if let Some(enc) = args.get(1).filter(|enc| !matches!(enc, Val::Str(_))) {
-            return fail(format!("str() argument 'encoding' must be str, not {}", type_name(enc)));
+    const NAMES: [&str; 3] = ["object", "encoding", "errors"];
+    let total = args.len() + kwargs.len();
+    if total > NAMES.len() {
+        if kwargs.is_empty() {
+            return fail(format!("str expected at most 3 arguments, got {total}"));
         }
-        return match args.first() {
-            Some(Val::Str(_)) => fail("decoding str is not supported"),
-            Some(other) => fail(format!("decoding to str: need a bytes-like object, {} found", type_name(other))),
-            None => fail("decoding str is not supported"),
+        return fail(format!("str() takes at most 3 arguments ({total} given)"));
+    }
+    let positional = args.len();
+    let mut slots: [Option<Val>; 3] = [None, None, None];
+    for (slot, v) in slots.iter_mut().zip(args) {
+        *slot = Some(v);
+    }
+    for (k, v) in kwargs {
+        let Some(i) = NAMES.iter().position(|n| *n == k) else {
+            return fail(format!("str() got an unexpected keyword argument '{k}'"));
+        };
+        if i < positional {
+            return fail(format!("argument for str() given by name ('{k}') and position ({})", i + 1));
+        }
+        // a repeated keyword is not an error in python: the last value wins
+        slots[i] = Some(v);
+    }
+    let [object, encoding, errors] = slots;
+    // cpython checks the type of encoding and errors before it looks at the object
+    for (name, value) in [("encoding", &encoding), ("errors", &errors)] {
+        if let Some(v) = value.as_ref().filter(|v| !matches!(v, Val::Str(_))) {
+            let shown = if matches!(v, Val::None) { "None" } else { type_name(v) };
+            return fail(format!("str() argument '{name}' must be str, not {shown}"));
+        }
+    }
+    let Some(object) = object else {
+        return Ok(Val::Str(String::new()));
+    };
+    if encoding.is_some() || errors.is_some() {
+        return match object {
+            Val::Str(_) => fail("decoding str is not supported"),
+            other => fail(format!("decoding to str: need a bytes-like object, {} found", type_name(&other))),
         };
     }
-    match first_arg(args, kwargs) {
-        Some(v) => Ok(Val::Str(py_str(&v)?)),
-        None => Ok(Val::Str(String::new())),
-    }
+    Ok(Val::Str(py_str(&object)?))
 }
 
 // ---------------------------------------------------------------- evaluator
@@ -2295,6 +2378,7 @@ impl Evaluator<'_> {
             },
             Expr::Fail(msg) => fail(msg.clone()),
             Expr::Tuple(_) => fail(not_available("Tuple")),
+            Expr::Starred(_) => fail(not_available("Starred")),
             Expr::Unary(op, x) => {
                 let v = self.eval(x)?;
                 unary(*op, &v)
@@ -2369,9 +2453,21 @@ impl Evaluator<'_> {
         for a in args {
             pos.push(self.eval(a)?);
         }
+        // simpleeval builds the keywords with dict() after the positional arguments, so every keyword
+        // value (including a `**` operand) is evaluated before the call
         let mut kw = Vec::with_capacity(kwargs.len());
+        let mut unpacked = false;
         for (k, v) in kwargs {
-            kw.push((k.clone(), self.eval(v)?));
+            let value = self.eval(v)?;
+            if k == DOUBLE_STAR {
+                unpacked = true;
+            } else {
+                kw.push((k.clone(), value));
+            }
+        }
+        // the `**` mapping gets a None key, which python refuses before the callee runs
+        if unpacked {
+            return fail("keywords must be strings");
         }
         call_function(callee, pos, kw)
     }
