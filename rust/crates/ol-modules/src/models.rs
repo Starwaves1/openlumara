@@ -11,11 +11,32 @@ use std::sync::Arc;
 #[path = "../../../generated/modules/models.rs"]
 pub mod meta;
 
+/// python's `self.models` once it has been stored. python's list_models() returns the model ids when
+/// connected, but when disconnected it returns connect()'s result instead: True on success or an
+/// APIError on failure. Both are truthy, so `if not self.models` never reloads them and each later use
+/// fails on the non-list value.
+#[derive(Clone)]
+enum Cache {
+    List(Vec<String>),
+    /// python type name of the non-list value ("bool" or "APIError")
+    NotAList(&'static str),
+}
+
+impl Cache {
+    /// python `for model in self.models` over the stored value
+    fn ids(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Cache::List(v) => Ok(v.clone()),
+            Cache::NotAList(t) => anyhow::bail!("'{}' object is not iterable", t),
+        }
+    }
+}
+
 pub struct Models {
     base: ModuleBase,
     disabled: Mutex<Vec<String>>,
     /// python: self.models (None until loaded; an empty list counts as not loaded)
-    models: Mutex<Option<Vec<String>>>,
+    models: Mutex<Option<Cache>>,
     /// python sets `self.header = "current model"` from on_system_prompt
     header: Mutex<Option<String>>,
 }
@@ -37,40 +58,44 @@ impl Models {
         Ok(self.manager()?.api().get_model())
     }
 
-    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        self.manager()?.api().list_models().await.map_err(|e| anyhow::anyhow!("{}", e))
+    /// python list_models(): the sorted ids when connected; when disconnected, connect()'s result
+    async fn list_models(&self) -> anyhow::Result<Cache> {
+        let api = self.manager()?.api();
+        if api.connected() {
+            let ids = api.list_models().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+            return Ok(Cache::List(ids));
+        }
+        // ol-core's list_models() would turn connect() into an empty list, so connect here like python does
+        Ok(match api.attempt_connect().await {
+            Ok(()) => Cache::NotAList("bool"),
+            Err(_) => Cache::NotAList("APIError"),
+        })
     }
 
-    fn loaded(&self) -> Option<Vec<String>> {
-        self.models.lock().clone().filter(|m| !m.is_empty())
+    /// python `if self.models`: the stored value, or None when python would reload
+    fn cached(&self) -> Option<Cache> {
+        self.models.lock().clone().filter(|c| !matches!(c, Cache::List(v) if v.is_empty()))
     }
 
-    /// python _load_models(): returns the model list (None if it couldn't be loaded)
-    async fn load_models(&self) -> anyhow::Result<Option<Vec<String>>> {
-        if let Some(m) = self.loaded() {
-            return Ok(Some(m));
+    /// python _load_models(): returns the stored value (None if it couldn't be loaded)
+    async fn load_models(&self) -> anyhow::Result<Option<Cache>> {
+        if let Some(c) = self.cached() {
+            return Ok(Some(c));
         }
-        let models = self.list_models().await?;
-        if models.is_empty() {
-            return Ok(self.models.lock().clone());
+        let fetched = self.list_models().await?;
+        if matches!(&fetched, Cache::List(v) if v.is_empty()) {
+            return Ok(None);
         }
-        *self.models.lock() = Some(models.clone());
-        Ok(Some(models))
+        *self.models.lock() = Some(fetched.clone());
+        Ok(Some(fetched))
     }
 
     /// python switch(name): `name` is whatever the caller passed (a JSON value for the tool, a str for the command)
     async fn switch(&self, name: &Value) -> anyhow::Result<Value> {
-        let models = match self.loaded() {
-            Some(m) => m,
-            None => {
-                let models = self.list_models().await?;
-                if models.is_empty() {
-                    return Ok(Value::Null);
-                }
-                *self.models.lock() = Some(models.clone());
-                models
-            }
+        let Some(cache) = self.load_models().await? else {
+            return Ok(Value::Null);
         };
+        let models = cache.ids()?;
         // python calls name.strip() inside the loop, so a non-str name fails once there is a model to compare against
         let wanted = match name {
             Value::String(s) => util::py_strip(s).to_lowercase(),
@@ -130,16 +155,12 @@ impl Module for Models {
         }
         let current_model = self.current_model()?;
         if self.base.config.get_bool("insert_available_models_into_system_prompt") {
-            let models = match self.loaded() {
-                Some(m) => m,
-                None => {
-                    let models = self.list_models().await?;
-                    if models.is_empty() {
-                        return Ok(if output.is_empty() { None } else { Some(output) });
-                    }
-                    *self.models.lock() = Some(models.clone());
-                    models
-                }
+            let Some(cache) = self.load_models().await? else {
+                return Ok(if output.is_empty() { None } else { Some(output) });
+            };
+            let models = match cache {
+                Cache::List(v) => v,
+                Cache::NotAList(t) => anyhow::bail!("object of type '{}' has no len()", t),
             };
             if models.len() > 1 {
                 output.push_str("\n\nModels you can switch to using the models_switch() toolcall: ");
@@ -155,8 +176,8 @@ impl Module for Models {
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
             "get_available" => {
-                let Some(models) = self.load_models().await? else { anyhow::bail!("'NoneType' object is not iterable") };
-                Ok(self.base.result(json!(models), true))
+                let Some(cache) = self.load_models().await? else { anyhow::bail!("'NoneType' object is not iterable") };
+                Ok(self.base.result(json!(cache.ids()?), true))
             }
             "switch" => {
                 // python passes the raw argument through; a JSON null arrives as None
@@ -180,7 +201,10 @@ impl Module for Models {
                 })
             }
             "models" => {
-                let Some(models) = self.load_models().await? else { anyhow::bail!("can only join an iterable") };
+                let models = match self.load_models().await? {
+                    Some(Cache::List(v)) => v,
+                    _ => anyhow::bail!("can only join an iterable"),
+                };
                 Ok(Some(format!("{}\n\nUse `/model <name>` to switch to your model of choice", models.join("\n"))))
             }
             _ => anyhow::bail!("unknown command {}", name),
@@ -208,13 +232,21 @@ mod tests {
     /// installs a config with the current model and the two prompt flags, then builds the module
     /// with a live manager. `preloaded` fills the python `self.models` cache so no HTTP call is made.
     fn setup(current: &str, insert_available: bool, preloaded: Option<Vec<&str>>) -> (Arc<Manager>, Models) {
-        let data = json!({
+        setup_with_api(current, insert_available, preloaded, None)
+    }
+
+    /// like setup(), with an optional api url in the config (the api is disconnected either way)
+    fn setup_with_api(current: &str, insert_available: bool, preloaded: Option<Vec<&str>>, api_url: Option<&str>) -> (Arc<Manager>, Models) {
+        let mut data = json!({
             "model": {"name": current},
             "modules": {"settings": {"models": {
                 "insert_current_model_into_system_prompt": true,
                 "insert_available_models_into_system_prompt": insert_available,
             }}},
         });
+        if let Some(url) = api_url {
+            data["api"] = json!({"url": url});
+        }
         ol_core::config::set_for_tests(data.clone());
         // set_for_tests() keeps a config file from an earlier test and every read reloads it,
         // so the same data is written to it (JSON is valid YAML)
@@ -222,7 +254,7 @@ mod tests {
         std::fs::write(&path, data.to_string()).expect("write test config");
         let mgr = Manager::new(Args::default());
         let models = Models::new(ModuleBase::new("models", false, Arc::downgrade(&mgr)));
-        *models.models.lock() = preloaded.map(|v| v.into_iter().map(String::from).collect());
+        *models.models.lock() = preloaded.map(|v| Cache::List(v.into_iter().map(String::from).collect()));
         (mgr, models)
     }
 
@@ -325,5 +357,65 @@ mod tests {
             Some("Current model: llama-3\n\nModels you can switch to using the models_switch() toolcall: Qwen3.5-9B, llama-3")
         );
         assert_eq!(m.header(), None);
+    }
+
+    /// a local stand-in for the api: every request gets a one-model list, so connect() succeeds
+    fn spawn_models_server() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"data":[{"id":"m1"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{}/v1", addr)
+    }
+
+    #[test]
+    fn disconnected_load_failure_caches_python_apierror_and_fails_each_use() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // the placeholder url makes connect() fail without any network traffic
+        let (_mgr, m) = setup_with_api("llama-3", false, None, Some("http://API_URL_HERE/v1"));
+        let err = block_on(m.call_tool("get_available", ToolArgs::new(Map::new()))).unwrap_err();
+        assert_eq!(err.to_string(), "'APIError' object is not iterable");
+        // python stored the APIError (truthy), so the list is never retried
+        let err = block_on(m.run_command("models", vec![])).unwrap_err();
+        assert_eq!(err.to_string(), "can only join an iterable");
+        let err = block_on(m.run_command("model", vec!["qwen".into()])).unwrap_err();
+        assert_eq!(err.to_string(), "'APIError' object is not iterable");
+    }
+
+    #[test]
+    fn system_prompt_with_cached_apierror_raises_python_len_error() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_mgr, m) = setup_with_api("llama-3", true, None, Some("http://API_URL_HERE/v1"));
+        let err = block_on(m.on_system_prompt()).unwrap_err();
+        assert_eq!(err.to_string(), "object of type 'APIError' has no len()");
+    }
+
+    #[test]
+    fn first_connect_caches_python_true_and_later_calls_still_fail_on_bool() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let url = spawn_models_server();
+        let (_mgr, m) = setup_with_api("llama-3", false, None, Some(&url));
+        // python's first list_models() connects and returns True, which is cached as self.models
+        let err = block_on(m.call_tool("get_available", ToolArgs::new(Map::new()))).unwrap_err();
+        assert_eq!(err.to_string(), "'bool' object is not iterable");
+        // the connection is now up, but the cached True is never replaced
+        let err = block_on(m.call_tool("get_available", ToolArgs::new(Map::new()))).unwrap_err();
+        assert_eq!(err.to_string(), "'bool' object is not iterable");
+        let args = ToolArgs::new(json!({"name": "m1"}).as_object().unwrap().clone());
+        let err = block_on(m.call_tool("switch", args)).unwrap_err();
+        assert_eq!(err.to_string(), "'bool' object is not iterable");
     }
 }
