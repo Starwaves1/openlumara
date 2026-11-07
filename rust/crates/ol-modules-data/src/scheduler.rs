@@ -28,9 +28,13 @@ use std::sync::Arc;
 /// but without going through config::get_module_structure() (which evaluates this
 /// module's own settings -> infinite recursion).
 pub fn available_channels() -> Vec<String> {
-    let mut out = ol_core::config::available_names("channels");
-    out.extend(ol_core::config::available_names("user_channels"));
-    out
+    merge_channel_sections(ol_core::config::available_names("channels"), ol_core::config::available_names("user_channels"))
+}
+
+/// python builds one dict keyed by name from the channels section, then user_channels: a name in
+/// both appears once, at its channels position
+fn merge_channel_sections(channels: Vec<String>, user_channels: Vec<String>) -> Vec<String> {
+    ol_core::config::ordered_unique(channels.into_iter().chain(user_channels))
 }
 
 /// channel select options: `{name: f"Send notifications via {name}"}`
@@ -1099,6 +1103,14 @@ impl Module for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_sections_merge_in_python_dict_order() {
+        // python: get_available_channels() walks the structure dict, channels section first
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let merged = merge_channel_sections(s(&["webui", "discord", "email"]), s(&["zeta", "discord", "alpha"]));
+        assert_eq!(merged, s(&["webui", "discord", "email", "zeta", "alpha"]));
+    }
 
     #[test]
     fn list_sorts_on_stored_trigger_time_with_falsy_last() {
