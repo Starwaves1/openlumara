@@ -133,6 +133,11 @@ fn body_dict(path: &str, body: Option<Value>) -> anyhow::Result<Map<String, Valu
     }
 }
 
+/// python `os.devnull`: 'nul' on Windows, '/dev/null' elsewhere
+fn os_devnull() -> &'static str {
+    if cfg!(windows) { "nul" } else { "/dev/null" }
+}
+
 /// python's `os.path.join` / `os.fspath` / `os.walk` text for a None path (no sandbox_paths)
 const FSPATH_NONE: &str = "expected str, bytes or os.PathLike object, not NoneType";
 
@@ -1554,14 +1559,17 @@ impl Coder {
     }
 
     /// python `_check_git_paths(root, paths)` followed by `abs_paths = [normpath(join(root, p))]`,
-    /// item by item: a non-str item fails in `os.path.join`, and an item that escapes the sandbox
-    /// fails with python's message
+    /// item by item: a non-str item fails in `os.path.join` (CPython 3.14 wording), and an item
+    /// that escapes the sandbox fails with python's message
     fn check_git_paths(root: &str, items: &[Value]) -> R<Vec<String>> {
         let sandbox_root = pyos::dirname(root);
         let mut abs = Vec::with_capacity(items.len());
         for item in items {
             let Value::String(p) = item else {
-                return Err(format!("expected str, bytes or os.PathLike object, not {}", py_type_name(item)));
+                return Err(format!(
+                    "join() argument must be str, bytes, or os.PathLike object, not '{}'",
+                    py_type_name(item)
+                ));
             };
             let full = pyos::normpath(&pyos::join(root, p));
             if full != sandbox_root && !full.starts_with(&format!("{}/", sandbox_root)) {
@@ -1860,7 +1868,7 @@ impl Coder {
         };
         let abs = pyos::normpath(&pyos::join(&root, &rel_path));
         let (rc, raw) = if untracked {
-            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
+            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), os_devnull().into(), abs], 15).await
         } else if staged {
             run_git_bytes(&root, &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
         } else {
@@ -2517,8 +2525,15 @@ mod tests {
         assert_eq!(Coder::path_items(&json!(true)).unwrap_err(), "'bool' object is not iterable");
         // a non-str item fails in os.path.join rather than being stringified
         let items = Coder::path_items(&json!([5])).unwrap();
-        assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "expected str, bytes or os.PathLike object, not int");
-        // the escape check still runs item by item
+        assert_eq!(
+            Coder::check_git_paths("/ws/repo", &items).unwrap_err(),
+            "join() argument must be str, bytes, or os.PathLike object, not 'int'"
+        );
+        let items = Coder::path_items(&json!([true])).unwrap();
+        assert_eq!(
+            Coder::check_git_paths("/ws/repo", &items).unwrap_err(),
+            "join() argument must be str, bytes, or os.PathLike object, not 'bool'"
+        );        // the escape check still runs item by item
         let items = Coder::path_items(&json!(["ok.txt", "../../x"])).unwrap();
         assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "path escapes the sandbox: ../../x");
     }
