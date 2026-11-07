@@ -8,6 +8,7 @@ mod patterns;
 pub mod pytext;
 pub mod sanitize;
 mod util;
+pub mod unsafe_shell;
 pub mod web_reader;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
@@ -41,5 +42,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: web_reader::meta::UNSAFE,
         category: web_reader::meta::CATEGORY,
         factory: web_reader::WebReader::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "unsafe_shell",
+        class_name: unsafe_shell::meta::CLASS_NAME,
+        doc: unsafe_shell::meta::DOC,
+        settings: unsafe_shell::meta::settings,
+        unsafe_: unsafe_shell::meta::UNSAFE,
+        category: unsafe_shell::meta::CATEGORY,
+        factory: unsafe_shell::UnsafeShell::factory,
     });
 }
