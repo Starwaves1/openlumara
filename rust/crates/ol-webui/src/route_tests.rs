@@ -19,7 +19,7 @@ use ol_modules_data::calendar::Calendar;
 use once_cell::sync::Lazy;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use tower::ServiceExt;
@@ -1943,6 +1943,7 @@ async fn characters_import_rejects_an_unhashable_name_on_an_empty_store_like_pyt
 // ---------------- /api/ext/memory (tags, list, list_pinned, search, pin, unpin) ----------------
 
 use ol_modules_data::memory::Memory;
+use ol_modules_dev::coder::Coder;
 
 /// the memory module loaded the way the manager loads it at startup. the typed handle is returned so a test
 /// can seed memories through the module's own create method
@@ -2179,4 +2180,292 @@ async fn memory_delete_removes_the_memory_and_answers_with_python_messages() {
         json!({"data": "no memory id given", "success": false})
     );
     assert_eq!(ids(&h.get("/api/ext/memory/list").await.json()["data"]), vec![keep]);
+}
+
+// ---------------- /api/ext/coder git routes (git_commit, git_branch, git_ahead, git_push, git_log, git_diff) ----------------
+
+/// the coder module loaded the way the manager loads it at startup, with `sandbox` as its only sandbox
+async fn harness_with_coder(sandbox: &Path) -> Harness {
+    let h = harness(false).await;
+    let base = ModuleBase::new("coder", false, Arc::downgrade(&h.manager));
+    base.config.view().set("sandbox_paths", json!([sandbox.to_string_lossy()]));
+    h.manager.insert_module(Arc::new(Coder::new(base)));
+    h
+}
+
+/// runs git in `dir` with a fixed identity and returns its trimmed stdout; a failing command fails the test
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// creates `dir` as a git repository on branch `main`. the identity is set in the repo, because the
+/// coder runs git without this test's environment
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("repo dir");
+    run_git(dir, &["init", "-q", "-b", "main"]);
+    run_git(dir, &["config", "user.name", "Test"]);
+    run_git(dir, &["config", "user.email", "test@example.com"]);
+}
+
+/// writes `name`, stages it and commits it with `message`
+fn commit_file(dir: &Path, name: &str, content: &str, message: &str) {
+    std::fs::write(dir.join(name), content).expect("write file");
+    run_git(dir, &["add", "--", name]);
+    run_git(dir, &["commit", "-q", "-m", message]);
+}
+
+/// a `repo` sandbox on `main` with one commit pushed to `origin`, a bare repository beside it.
+/// returns (repo, bare)
+fn repo_with_remote(root: &Path) -> (PathBuf, PathBuf) {
+    let repo = root.join("repo");
+    let bare = root.join("origin.git");
+    init_repo(&repo);
+    run_git(root, &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()]);
+    run_git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    run_git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    (repo, bare)
+}
+
+/// POST `body` as json to a coder webui route
+async fn post_coder(h: &Harness, route: &str, body: Value) -> Reply {
+    h.send(post_json(&format!("/api/ext/coder/{route}"), &body.to_string())).await
+}
+
+#[tokio::test]
+async fn coder_git_writes_are_refused_in_read_only_mode() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    for (route, body) in [
+        ("git_commit", json!({"sandbox": "repo", "message": "x"})),
+        ("git_branch", json!({"sandbox": "repo", "name": "x"})),
+        ("git_push", json!({"sandbox": "repo"})),
+    ] {
+        let resp = post_coder(&h, route, body).await;
+        assert_eq!(resp.json(), json!({"data": "coder is in read-only mode", "success": false}), "{route}");
+    }
+}
+
+#[tokio::test]
+async fn git_commit_checks_its_fields_and_answers_with_git_output() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+    assert_eq!(
+        post_coder(&h, "git_commit", json!({"sandbox": "repo", "message": "   "})).await.json(),
+        json!({"data": "sandbox and message are both required", "success": false})
+    );
+
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    run_git(&repo, &["add", "--", "a.txt"]);
+    let resp = post_coder(&h, "git_commit", json!({"sandbox": "repo", "message": "first commit"})).await;
+    assert_eq!(resp.json()["success"], json!(true), "{}", resp.body);
+    let data = resp.json()["data"].as_str().unwrap().to_string();
+    assert!(data.starts_with("[main (root-commit) ") && data.contains("] first commit\n"), "{data}");
+
+    // a clean tree is git's failure: its stdout text is the answer
+    let resp = post_coder(&h, "git_commit", json!({"sandbox": "repo", "message": "again"})).await;
+    assert_eq!(resp.json()["success"], json!(false));
+    assert!(resp.json()["data"].as_str().unwrap().contains("nothing to commit, working tree clean"), "{}", resp.body);
+}
+
+#[tokio::test]
+async fn git_branch_switches_to_existing_branches_and_reports_git_failures() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    run_git(&repo, &["branch", "feature"]);
+    let h = harness_with_coder(&repo).await;
+
+    // git switch says "Switched to branch" on stderr, which python returns when stdout is empty
+    let resp = post_coder(&h, "git_branch", json!({"sandbox": "repo", "name": " feature "})).await;
+    assert_eq!(resp.json(), json!({"data": "Switched to branch 'feature'", "success": true}), "{}", resp.body);
+    assert_eq!(run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "feature");
+
+    let resp = post_coder(&h, "git_branch", json!({"sandbox": "repo", "name": "missing"})).await;
+    assert_eq!(resp.json()["success"], json!(false));
+    assert!(resp.json()["data"].as_str().unwrap().contains("missing"), "{}", resp.body);
+}
+
+#[tokio::test]
+async fn git_ahead_and_push_say_when_there_is_no_remote() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+    let no_remote = json!({"data": "this repo has no remotes, nowhere to push to", "success": false});
+    assert_eq!(h.get("/api/ext/coder/git_ahead?sandbox=repo").await.json(), no_remote);
+    assert_eq!(post_coder(&h, "git_push", json!({"sandbox": "repo"})).await.json(), no_remote);
+    assert_eq!(h.get("/api/ext/coder/git_ahead").await.json(), json!({"data": "no sandbox given", "success": false}));
+}
+
+#[tokio::test]
+async fn git_ahead_lists_unpushed_commits_behind_count_and_dirty_flag() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let (repo, bare) = repo_with_remote(root.path());
+    commit_file(&repo, "b.txt", "two\n", "second");
+    std::fs::write(repo.join("scratch.txt"), "x").unwrap();
+    let h = harness_with_coder(&repo).await;
+
+    let resp = h.get("/api/ext/coder/git_ahead?sandbox=repo").await;
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true), "{}", resp.body);
+    let data = &body["data"];
+    assert_eq!(data["branch"], json!("main"));
+    assert_eq!(data["remote"], json!("origin"));
+    assert_eq!(data["upstream"], json!("origin/main"));
+    assert_eq!(data["has_upstream"], json!(true));
+    assert_eq!(data["target"], json!("origin/main"));
+    assert_eq!(data["behind"], json!(0));
+    assert_eq!(data["dirty"], json!(true));
+    let ahead = data["ahead"].as_array().unwrap();
+    assert_eq!(ahead.len(), 1);
+    assert_eq!(ahead[0]["msg"], json!("second"));
+    assert!(run_git(&repo, &["rev-parse", "HEAD"]).starts_with(ahead[0]["hash"].as_str().unwrap()));
+    let keys: Vec<&str> = data.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["branch", "remote", "upstream", "has_upstream", "target", "ahead", "behind", "dirty"]);
+
+    // a commit that landed on the remote after our last fetch is counted as behind
+    let other = root.path().join("other");
+    run_git(root.path(), &["clone", "-q", bare.to_str().unwrap(), other.to_str().unwrap()]);
+    commit_file(&other, "c.txt", "three\n", "third");
+    run_git(&other, &["push", "-q", "origin", "main"]);
+    run_git(&repo, &["fetch", "-q", "origin"]);
+    std::fs::remove_file(repo.join("scratch.txt")).unwrap();
+    let data = h.get("/api/ext/coder/git_ahead?sandbox=repo").await.json()["data"].clone();
+    assert_eq!(data["behind"], json!(1));
+    assert_eq!(data["dirty"], json!(false));
+    assert_eq!(data["ahead"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn git_push_sends_the_branch_to_its_upstream_and_refuses_detached_heads() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let (repo, bare) = repo_with_remote(root.path());
+    commit_file(&repo, "b.txt", "two\n", "second");
+    let h = harness_with_coder(&repo).await;
+
+    // git push writes its report to stderr, so python's stdout-only answer is "pushed"
+    assert_eq!(
+        post_coder(&h, "git_push", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "pushed", "success": true})
+    );
+    assert_eq!(run_git(&bare, &["log", "--format=%s", "main"]), "second\nfirst");
+
+    run_git(&repo, &["checkout", "-q", "--detach"]);
+    assert_eq!(
+        post_coder(&h, "git_push", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "detached HEAD: switch to a branch before pushing", "success": false})
+    );
+    run_git(&repo, &["checkout", "-q", "main"]);
+
+    // a branch without an upstream is pushed with -u. git reports the new tracking on stdout
+    run_git(&repo, &["switch", "-q", "-c", "topic"]);
+    commit_file(&repo, "t.txt", "t\n", "topic work");
+    assert_eq!(
+        post_coder(&h, "git_push", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "branch 'topic' set up to track 'origin/topic'.", "success": true})
+    );
+    assert_eq!(run_git(&bare, &["branch", "--list", "topic", "--format=%(refname:short)"]), "topic");
+    assert_eq!(run_git(&repo, &["rev-parse", "--abbrev-ref", "topic@{u}"]), "origin/topic");
+}
+
+#[tokio::test]
+async fn git_log_returns_newest_commits_and_validates_n() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "1\n", "one");
+    commit_file(&repo, "b.txt", "2\n", "two");
+    commit_file(&repo, "c.txt", "3\n", "three");
+    let h = harness_with_coder(&repo).await;
+    let head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    let resp = h.get("/api/ext/coder/git_log?sandbox=repo&n=2").await;
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true), "{}", resp.body);
+    let log = body["data"]["log"].as_array().unwrap();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0]["msg"], json!("three"));
+    assert_eq!(log[1]["msg"], json!("two"));
+    assert!(head.starts_with(log[0]["hash"].as_str().unwrap()));
+    assert_eq!(body["data"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), vec!["log"]);
+    assert_eq!(log[0].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), vec!["hash", "msg"]);
+
+    assert_eq!(h.get("/api/ext/coder/git_log?sandbox=repo&n=0").await.json(), json!({"data": {"log": []}, "success": true}));
+    // python's int() raises, and the ext api answers with the exception text
+    assert_eq!(
+        h.get("/api/ext/coder/git_log?sandbox=repo&n=abc").await.json(),
+        json!({"data": "invalid literal for int() with base 10: 'abc'", "success": false})
+    );
+    assert_eq!(h.get("/api/ext/coder/git_log").await.json(), json!({"data": "no sandbox given", "success": false}));
+}
+
+#[tokio::test]
+async fn git_diff_shows_worktree_staged_and_untracked_changes() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+    let body = h.get("/api/ext/coder/git_diff?sandbox=repo&path=a.txt").await.json();
+    assert!(body["data"]["diff"].as_str().unwrap().contains("\n+two\n"), "{body}");
+    // unstaged, the change is not in the staged diff
+    let staged = h.get("/api/ext/coder/git_diff?sandbox=repo&path=a.txt&staged=1").await.json();
+    assert_eq!(staged, json!({"data": {"diff": "(no changes)"}, "success": true}));
+    // once staged, the staged diff holds it and the worktree diff is empty
+    run_git(&repo, &["add", "--", "a.txt"]);
+    let staged = h.get("/api/ext/coder/git_diff?sandbox=repo&path=a.txt&staged=1").await.json();
+    assert!(staged["data"]["diff"].as_str().unwrap().contains("+two"), "{staged}");
+    assert_eq!(h.get("/api/ext/coder/git_diff?sandbox=repo&path=a.txt").await.json(), json!({"data": {"diff": "(no changes)"}, "success": true}));
+
+    std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+    let body = h.get("/api/ext/coder/git_diff?sandbox=repo&path=new.txt&untracked=1").await.json();
+    assert_eq!(body["success"], json!(true));
+    assert!(body["data"]["diff"].as_str().unwrap().contains("+hello"), "{body}");
+
+    assert_eq!(
+        h.get("/api/ext/coder/git_diff?sandbox=repo&path=../../outside.txt").await.json(),
+        json!({"data": "path escapes the sandbox: ../../outside.txt", "success": false})
+    );
+    assert_eq!(
+        h.get("/api/ext/coder/git_diff?sandbox=repo").await.json(),
+        json!({"data": "sandbox and path are both required", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn coder_git_routes_keep_their_python_methods() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+    for path in ["git_ahead", "git_log", "git_diff"] {
+        let resp = h.send(post_json(&format!("/api/ext/coder/{path}"), "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "POST {path}");
+        assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}), "POST {path}");
+    }
+    for path in ["git_commit", "git_branch", "git_push"] {
+        let resp = h.get(&format!("/api/ext/coder/{path}")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "GET {path}");
+        assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}), "GET {path}");
+    }
 }

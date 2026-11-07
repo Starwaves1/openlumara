@@ -32,5 +32,6 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 [dev-dependencies]
 tempfile.workspace = true
 ol-modules-data.workspace = true
+ol-modules-dev.workspace = true
 tokio-tungstenite = "0.28"
 reqwest.workspace = true
