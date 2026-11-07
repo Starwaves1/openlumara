@@ -58,6 +58,20 @@ fn syntax_error(msg: &str, line: usize) -> PyErr {
     PyErr(format!("{msg} (<unknown>, line {line})"))
 }
 
+/// cpython's tokenizer message for a `0x` / `0o` / `0b` literal whose digits do not parse
+fn radix_literal_error(radix: u32, body: &str, line: usize) -> PyErr {
+    let name = match radix {
+        16 => "hexadecimal",
+        8 => "octal",
+        _ => "binary",
+    };
+    // octal and binary literals name the first decimal digit that is too large for the base
+    match body.chars().find(|c| c.is_ascii_digit() && c.to_digit(radix).is_none()) {
+        Some(d) if radix != 16 => syntax_error(&format!("invalid digit '{d}' in {name} literal"), line),
+        _ => syntax_error(&format!("invalid {name} literal"), line),
+    }
+}
+
 fn not_available(node: &str) -> String {
     format!("Sorry, {node} is not available in this evaluator")
 }
@@ -343,6 +357,9 @@ enum Expr {
     Name(String),
     /// a node that simpleeval parses but refuses to evaluate; the message is raised when reached
     Fail(String),
+    /// a tuple display or bare `a, b`. simpleeval refuses it when evaluated, but its elements decide
+    /// whether it is a valid assignment target
+    Tuple(Vec<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     And(Vec<Expr>),
@@ -403,6 +420,36 @@ fn lex(text: &str) -> Res<Vec<Token>> {
     Ok(lx.out)
 }
 
+/// cpython's tokenizer refuses characters that are not printable (`Py_UNICODE_ISPRINTABLE` is false):
+/// control, format, space separator other than ' ', line and paragraph separators, private use and
+/// unassigned code points. This lists the control, format, space-separator and private-use ranges
+/// (plus the unassigned ones in the same blocks), which covers the characters a calculator sees.
+fn is_non_printable(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00..=0x1F
+            | 0x7F..=0x9F
+            | 0xA0
+            | 0xAD
+            | 0x600..=0x605
+            | 0x61C
+            | 0x6DD
+            | 0x70F
+            | 0x180E
+            | 0x1680
+            | 0x2000..=0x200F
+            | 0x2028..=0x202F
+            | 0x2060..=0x206F
+            | 0x3000
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0xE000..=0xF8FF
+            | 0xE0001
+            | 0xE0020..=0xE007F
+            | 0xF0000..=0x10FFFF
+    )
+}
+
 fn bracket_op(c: char) -> &'static str {
     match c {
         '(' => "(",
@@ -424,6 +471,17 @@ impl Lexer {
         self.out.push(Token { tok, line });
     }
 
+    /// an indented line that does not open a block. When the line before ends in an operator, cpython's
+    /// parser fails at the newline that ends it, so that is the error; otherwise it is the indent itself.
+    fn unexpected_indent(&self) -> PyErr {
+        if let [.., Token { tok: Tok::Op(op), .. }, Token { tok: Tok::Newline, line }] = self.out.as_slice() {
+            if !matches!(*op, ")" | "]" | "}") {
+                return syntax_error("invalid syntax", *line);
+            }
+        }
+        syntax_error("unexpected indent", self.line)
+    }
+
     fn match_op(&self) -> Option<&'static str> {
         OPS3.iter().chain(OPS2.iter()).chain(OPS1.iter()).copied().find(|op| op.chars().enumerate().all(|(k, ch)| self.at(k) == Some(ch)))
     }
@@ -441,7 +499,7 @@ impl Lexer {
                     self.block_open = false;
                 }
                 if j > 0 && !blank && !self.block_open {
-                    return Err(syntax_error("unexpected indent", self.line));
+                    return Err(self.unexpected_indent());
                 }
                 self.i += j;
                 continue;
@@ -475,6 +533,7 @@ impl Lexer {
                         self.i += 3;
                         self.line += 1;
                     }
+                    (None, _) => return Err(syntax_error("unexpected EOF while parsing", self.line)),
                     _ => return Err(syntax_error("unexpected character after line continuation character", self.line)),
                 },
                 '0'..='9' => {
@@ -533,6 +592,8 @@ impl Lexer {
                     if let Some(op) = self.match_op() {
                         self.i += op.chars().count();
                         self.push(Tok::Op(op));
+                    } else if is_non_printable(c) {
+                        return Err(syntax_error(&format!("invalid non-printable character U+{:04X}", c as u32), self.line));
                     } else if c.is_ascii() {
                         return Err(syntax_error("invalid syntax", self.line));
                     } else {
@@ -573,9 +634,10 @@ impl Lexer {
                     self.i += 1;
                 }
                 let body: String = self.src[start..self.i].iter().filter(|c| **c != '_').collect();
-                return BigInt::parse_bytes(body.as_bytes(), radix)
-                    .map(|v| Tok::Num(Val::Int(v)))
-                    .ok_or_else(|| syntax_error("invalid syntax", line));
+                return match BigInt::parse_bytes(body.as_bytes(), radix) {
+                    Some(v) => Ok(Tok::Num(Val::Int(v))),
+                    None => Err(radix_literal_error(radix, &body, line)),
+                };
             }
         }
         let start = self.i;
@@ -592,6 +654,9 @@ impl Lexer {
                 is_float = true;
                 self.i += k;
                 self.eat_digits();
+            } else {
+                // cpython's tokenizer: an exponent marker with no exponent digits
+                return Err(syntax_error("invalid decimal literal", line));
             }
         }
         // an underscore is only allowed between two digits (cpython: "1__0" and "1_" are invalid)
@@ -636,7 +701,18 @@ impl Lexer {
         syntax_error(&format!("{kind} (detected at line {})", self.line), line0)
     }
 
-    fn hex_escape(&mut self, digits: usize, out: &mut String) -> Res<()> {
+    /// cpython's `unicode_escape` codec error for the escape that starts at `esc.0` (its backslash) in a
+    /// literal whose body starts at `esc.1`. The codec positions are byte offsets into the body and end
+    /// at the last character of the escape, which is the character before `self.i`.
+    fn escape_error(&self, esc: (usize, usize), what: &str) -> PyErr {
+        let (bs, body) = esc;
+        let bytes = |from: usize, to: usize| -> usize { self.src[from..to].iter().map(|c| c.len_utf8()).sum() };
+        let start = bytes(body, bs);
+        let end = start + bytes(bs, self.i) - 1;
+        syntax_error(&format!("(unicode error) 'unicodeescape' codec can't decode bytes in position {start}-{end}: {what}"), self.line)
+    }
+
+    fn hex_escape(&mut self, digits: usize, out: &mut String, esc: (usize, usize), truncated: &str) -> Res<()> {
         let mut v: u64 = 0;
         for _ in 0..digits {
             match self.at(0).and_then(|c| c.to_digit(16)) {
@@ -644,11 +720,11 @@ impl Lexer {
                     v = v * 16 + u64::from(x);
                     self.i += 1;
                 }
-                None => return Err(syntax_error("(unicode error) malformed escape sequence", self.line)),
+                None => return Err(self.escape_error(esc, truncated)),
             }
         }
         let ch = u32::try_from(v).ok().and_then(char::from_u32);
-        out.push(ch.ok_or_else(|| syntax_error("(unicode error) invalid unicode character", self.line))?);
+        out.push(ch.ok_or_else(|| self.escape_error(esc, "illegal Unicode character"))?);
         Ok(())
     }
 
@@ -658,6 +734,7 @@ impl Lexer {
         let quote = self.src[self.i];
         let triple = self.at(1) == Some(quote) && self.at(2) == Some(quote);
         self.i += if triple { 3 } else { 1 };
+        let body = self.i;
         let mut out = String::new();
         let mut named_escape = false;
         loop {
@@ -678,6 +755,7 @@ impl Lexer {
                 continue;
             }
             let Some(d) = self.at(1) else { return Err(self.unterminated(triple, line0)) };
+            let esc = (self.i, body);
             self.i += 2;
             if raw {
                 out.push('\\');
@@ -714,9 +792,9 @@ impl Lexer {
                     }
                     out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
                 }
-                'x' => self.hex_escape(2, &mut out)?,
-                'u' => self.hex_escape(4, &mut out)?,
-                'U' => self.hex_escape(8, &mut out)?,
+                'x' => self.hex_escape(2, &mut out, esc, "truncated \\xXX escape")?,
+                'u' => self.hex_escape(4, &mut out, esc, "truncated \\uXXXX escape")?,
+                'U' => self.hex_escape(8, &mut out, esc, "truncated \\UXXXXXXXX escape")?,
                 'N' => {
                     named_escape = true;
                     if self.at(0) == Some('{') {
@@ -780,6 +858,9 @@ fn assign_kind(e: &Expr) -> (&'static str, bool) {
         Expr::Call(..) => ("function call", true),
         Expr::Compare(..) => ("comparison", false),
         Expr::IfExp(..) => ("conditional expression", false),
+        // cpython only adds the '==' hint to targets that parse as a bitwise_or, which excludes these
+        Expr::And(_) | Expr::Or(_) | Expr::Unary(UnOp::Not, _) => ("expression", false),
+        Expr::Tuple(_) => ("tuple", false),
         _ => ("expression", true),
     }
 }
@@ -791,6 +872,17 @@ fn assign_error(e: &Expr, line: usize) -> PyErr {
         syntax_error(&format!("cannot assign to {kind} here. Maybe you meant '==' instead of '='?"), line)
     } else {
         syntax_error(&format!("cannot assign to {kind}"), line)
+    }
+}
+
+/// the compile error cpython gives for an assignment target, or None when the target is valid. A tuple
+/// target is valid when all its elements are (cpython reports a bad element with the same message as a
+/// bad plain target); simpleeval then evaluates only the value.
+fn target_error(e: &Expr, line: usize) -> Option<PyErr> {
+    match e {
+        Expr::Name(_) | Expr::Attr(..) | Expr::Subscript(..) => None,
+        Expr::Tuple(items) => items.iter().find_map(|item| target_error(item, line)),
+        _ => Some(assign_error(e, line)),
     }
 }
 
@@ -993,8 +1085,8 @@ impl Parser {
                 exprs.push(self.test_list()?);
             }
             let value = exprs.pop().unwrap_or(Expr::Const(Val::None));
-            if let Some(bad) = exprs.iter().find(|t| !is_target(t)) {
-                return Err(assign_error(bad, self.line()));
+            if let Some(err) = exprs.iter().find_map(|t| target_error(t, self.line())) {
+                return Err(err);
             }
             return Ok(Stmt::Assign(value));
         }
@@ -1015,13 +1107,14 @@ impl Parser {
         if !self.is_op(",") {
             return Ok(first);
         }
+        let mut items = vec![first];
         while self.eat_op(",") {
             if matches!(self.tok(), Tok::Newline | Tok::Eof | Tok::Op("=" | ";")) || matches!(self.tok(), Tok::Op(op) if AUG_OPS.contains(op)) {
                 break;
             }
-            self.test()?;
+            items.push(self.test()?);
         }
-        Ok(Expr::Fail(not_available("Tuple")))
+        Ok(Expr::Tuple(items))
     }
 
     fn test(&mut self) -> Res<Expr> {
@@ -1272,17 +1365,23 @@ impl Parser {
     }
 
     fn subscript(&mut self) -> Res<SubKey> {
-        let lo = if self.is_op(":") { None } else { Some(self.test()?) };
-        if self.is_op(",") {
-            // a tuple index: simpleeval refuses the Tuple node
-            while self.eat_op(",") {
-                if self.is_op("]") {
-                    break;
-                }
-                self.test()?;
-            }
-            return Ok(SubKey::Index(Box::new(Expr::Fail(not_available("Tuple")))));
+        let key = self.subscript_item()?;
+        if !self.is_op(",") {
+            return Ok(key);
         }
+        // a tuple index: the container is evaluated first, then simpleeval refuses the Tuple node
+        while self.eat_op(",") {
+            if self.is_op("]") {
+                break;
+            }
+            self.subscript_item()?;
+        }
+        Ok(SubKey::Index(Box::new(Expr::Fail(not_available("Tuple")))))
+    }
+
+    /// one item of a subscript: an index or a slice
+    fn subscript_item(&mut self) -> Res<SubKey> {
+        let lo = if self.is_op(":") { None } else { Some(self.test()?) };
         if !self.is_op(":") {
             return match lo {
                 Some(e) => Ok(SubKey::Index(Box::new(e))),
@@ -1335,6 +1434,24 @@ impl Parser {
                     self.bump();
                     Ok(Expr::Const(Val::None))
                 }
+                // these parse as expressions that simpleeval refuses by node name
+                "yield" => {
+                    self.bump();
+                    if self.is_kw("from") {
+                        self.bump();
+                        self.test()?;
+                        return Ok(Expr::Fail(not_available("YieldFrom")));
+                    }
+                    if !matches!(self.tok(), Tok::Newline | Tok::Eof | Tok::Op(")" | "]" | "}" | "," | "=" | ";")) {
+                        self.test_list()?;
+                    }
+                    Ok(Expr::Fail(not_available("Yield")))
+                }
+                "await" => {
+                    self.bump();
+                    self.atom_expr()?;
+                    Ok(Expr::Fail(not_available("Await")))
+                }
                 _ if is_keyword(&n) => self.invalid(),
                 _ => {
                     self.bump();
@@ -1344,21 +1461,31 @@ impl Parser {
             Tok::Op("(") => {
                 self.bump();
                 if self.eat_op(")") {
-                    return Ok(Expr::Fail(not_available("Tuple")));
+                    return Ok(Expr::Tuple(Vec::new()));
                 }
                 let first = self.test()?;
                 if self.is_kw("for") {
                     return self.comprehension("GeneratorExp", ")");
                 }
+                if self.eat_op(":=") {
+                    // a named expression: only a name can be assigned to
+                    if !matches!(first, Expr::Name(_)) {
+                        return self.invalid();
+                    }
+                    self.test()?;
+                    self.expect_op(")")?;
+                    return Ok(Expr::Fail(not_available("NamedExpr")));
+                }
                 if self.is_op(",") {
+                    let mut items = vec![first];
                     while self.eat_op(",") {
                         if self.is_op(")") {
                             break;
                         }
-                        self.test()?;
+                        items.push(self.test()?);
                     }
                     self.expect_op(")")?;
-                    return Ok(Expr::Fail(not_available("Tuple")));
+                    return Ok(Expr::Tuple(items));
                 }
                 self.expect_op(")")?;
                 Ok(first)
@@ -1366,7 +1493,12 @@ impl Parser {
             Tok::Op("[") => {
                 self.bump();
                 while !self.is_op("]") {
-                    self.test()?;
+                    // `*x` unpacks inside a list display, which simpleeval refuses as a List
+                    if self.eat_op("*") {
+                        self.bitor()?;
+                    } else {
+                        self.test()?;
+                    }
                     if self.is_kw("for") {
                         return self.comprehension("ListComp", "]");
                     }
@@ -1382,34 +1514,43 @@ impl Parser {
                 if self.eat_op("}") {
                     return Ok(Expr::Fail(not_available("Dict")));
                 }
-                self.test()?;
-                if self.is_kw("for") {
-                    return self.comprehension("SetComp", "}");
-                }
-                if self.eat_op(":") {
-                    self.test()?;
-                    if self.is_kw("for") {
-                        return self.comprehension("DictComp", "}");
-                    }
-                    while self.eat_op(",") {
-                        if self.is_op("}") {
-                            break;
+                // the display is a Dict when its items are key: value pairs or `**` unpacks, and a Set when
+                // they are values or `*` unpacks; mixing the two is a syntax error
+                let mut node: Option<&'static str> = None;
+                let mut first = true;
+                loop {
+                    let item = if self.eat_op("**") {
+                        self.bitor()?;
+                        "Dict"
+                    } else if self.eat_op("*") {
+                        self.bitor()?;
+                        "Set"
+                    } else {
+                        self.test()?;
+                        if first && self.is_kw("for") {
+                            return self.comprehension("SetComp", "}");
                         }
-                        self.test()?;
-                        self.expect_op(":")?;
-                        self.test()?;
+                        if self.eat_op(":") {
+                            self.test()?;
+                            if first && self.is_kw("for") {
+                                return self.comprehension("DictComp", "}");
+                            }
+                            "Dict"
+                        } else {
+                            "Set"
+                        }
+                    };
+                    if node.is_some_and(|n| n != item) {
+                        return self.invalid();
                     }
-                    self.expect_op("}")?;
-                    return Ok(Expr::Fail(not_available("Dict")));
-                }
-                while self.eat_op(",") {
-                    if self.is_op("}") {
+                    node = Some(item);
+                    first = false;
+                    if !self.eat_op(",") || self.is_op("}") {
                         break;
                     }
-                    self.test()?;
                 }
                 self.expect_op("}")?;
-                Ok(Expr::Fail(not_available("Set")))
+                Ok(Expr::Fail(not_available(node.unwrap_or("Set"))))
             }
             _ => self.invalid(),
         }
@@ -1819,14 +1960,17 @@ fn index_value(container: &Val, key: &Val) -> Res<Val> {
                 Val::Bool(b) => BigInt::from(u8::from(*b)),
                 other => return fail(format!("string indices must be integers, not '{}'", type_name(other))),
             };
+            // cpython converts the index to a Py_ssize_t before it checks the range
+            let Some(idx) = idx.to_i64() else {
+                return fail("cannot fit 'int' into an index-sized integer");
+            };
             let chars: Vec<char> = s.chars().collect();
-            let n = BigInt::from(chars.len());
-            let idx = if idx.is_negative() { idx + &n } else { idx };
-            if idx.is_negative() || idx >= n {
+            let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
+            let idx = if idx < 0 { idx + n } else { idx };
+            if idx < 0 || idx >= n {
                 return fail("string index out of range");
             }
-            let i = idx.to_usize().unwrap_or(0);
-            Ok(Val::Str(chars[i].to_string()))
+            Ok(Val::Str(chars[idx as usize].to_string()))
         }
         other => fail(format!("'{}' object is not subscriptable", type_name(other))),
     }
@@ -1908,11 +2052,12 @@ fn first_arg(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Option<Val> {
 fn call_function(f: Func, args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
     match f {
         Func::Rand => {
+            // simpleeval's `rand` is CPython's bound `random.random`, so its errors name Random.random
             if !args.is_empty() {
-                return fail(format!("random() takes no arguments ({} given)", args.len()));
+                return fail(format!("Random.random() takes no arguments ({} given)", args.len()));
             }
             if !kwargs.is_empty() {
-                return fail("random() takes no keyword arguments");
+                return fail("Random.random() takes no keyword arguments");
             }
             Ok(Val::Float(rand::random::<f64>()))
         }
@@ -1948,20 +2093,20 @@ fn random_int(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
 }
 
 fn int_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
+    // cpython counts keyword arguments with the positional ones before it looks at their names
+    let total = args.len() + kwargs.len();
+    if total > 2 {
+        return fail(format!("int() takes at most 2 arguments ({total} given)"));
+    }
     // int's `x` is positional-only; `base` is the only keyword
     if let Some((k, _)) = kwargs.iter().find(|(k, _)| k != "base") {
         return fail(format!("int() got an unexpected keyword argument '{k}'"));
     }
-    if args.len() > 2 {
-        return fail(format!("int expected at most 2 arguments, got {}", args.len()));
-    }
     let mut it = args.into_iter();
     let x = it.next();
     let mut base = it.next();
-    for (_, v) in kwargs {
-        if base.is_some() {
-            return fail("argument for int() given by name ('base') and position (2)");
-        }
+    // at most two arguments in all, so a keyword can only be the base when no second positional is given
+    if let Some((_, v)) = kwargs.into_iter().next() {
         base = Some(v);
     }
     let Some(x) = x else {
@@ -2089,6 +2234,10 @@ fn str_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
         return fail(format!("str() got an unexpected keyword argument '{k}'"));
     }
     if args.len() + kwargs.len() > 1 {
+        // cpython checks the type of the encoding argument before it looks at the object
+        if let Some(enc) = args.get(1).filter(|enc| !matches!(enc, Val::Str(_))) {
+            return fail(format!("str() argument 'encoding' must be str, not {}", type_name(enc)));
+        }
         return match args.first() {
             Some(Val::Str(_)) => fail("decoding str is not supported"),
             Some(other) => fail(format!("decoding to str: need a bytes-like object, {} found", type_name(other))),
@@ -2145,6 +2294,7 @@ impl Evaluator<'_> {
                 None => fail(format!("'{n}' is not defined for expression '{}'", self.expression)),
             },
             Expr::Fail(msg) => fail(msg.clone()),
+            Expr::Tuple(_) => fail(not_available("Tuple")),
             Expr::Unary(op, x) => {
                 let v = self.eval(x)?;
                 unary(*op, &v)

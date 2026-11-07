@@ -67,10 +67,12 @@ impl Module for Calculator {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "calculate" => match args.0.get("expression").cloned().unwrap_or(Value::Null) {
-                Value::String(expression) => self.calculate(&expression).await,
+            "calculate" => match args.0.get("expression") {
+                // python: a missing argument is a TypeError at the call site, outside the module's try
+                None => anyhow::bail!("Calculator.calculate() missing 1 required positional argument: 'expression'"),
+                Some(Value::String(expression)) => self.calculate(expression).await,
                 // python: simple_eval() calls expression.strip() first, which fails for non-strings
-                other => Ok(self.base.result(format!("'{}' object has no attribute 'strip'", crate::util::py_type_name(&other)), false)),
+                Some(other) => Ok(self.base.result(format!("'{}' object has no attribute 'strip'", crate::util::py_type_name(other)), false)),
             },
             _ => anyhow::bail!("'Calculator' object has no attribute '{}'", method),
         }
@@ -178,5 +180,109 @@ mod tests {
         assert_eq!(to_json(&Val::Func(Func::Int)).unwrap_err().to_string(), "Object of type type is not JSON serializable");
         assert_eq!(to_json(&Val::Func(Func::Rand)).unwrap_err().to_string(), "Object of type builtin_function_or_method is not JSON serializable");
         assert_eq!(to_json(&Val::Func(Func::RandInt)).unwrap_err().to_string(), "Object of type function is not JSON serializable");
+    }
+
+    #[test]
+    fn builtin_call_errors_match_cpython_text() {
+        // rand is random.random, so its messages name Random.random
+        assert_eq!(run("rand(1)"), (false, "Random.random() takes no arguments (1 given)".into()));
+        assert_eq!(run("rand(x=1)"), (false, "Random.random() takes no keyword arguments".into()));
+        // int() counts keyword arguments with the positional ones before it looks at their names
+        assert_eq!(run("int('1', base=2, x=3)"), (false, "int() takes at most 2 arguments (3 given)".into()));
+        assert_eq!(run("int('1', 2, base=2)"), (false, "int() takes at most 2 arguments (3 given)".into()));
+        // str(obj, encoding) checks the encoding type first
+        assert_eq!(run("str(1, 2)"), (false, "str() argument 'encoding' must be str, not int".into()));
+        assert_eq!(run("str(1, 'utf8')"), (false, "decoding to str: need a bytes-like object, int found".into()));
+    }
+
+    #[test]
+    fn index_conversion_and_refused_displays_match_cpython() {
+        // the index is converted to a Py_ssize_t before the range check
+        assert_eq!(run("'abc'[10**400]"), (false, "cannot fit 'int' into an index-sized integer".into()));
+        assert_eq!(run("'abc'[-10**400]"), (false, "cannot fit 'int' into an index-sized integer".into()));
+        assert_eq!(run("'abc'[10]"), (false, "string index out of range".into()));
+        assert_eq!(run("'abc'[-1]"), (true, "\"c\"".into()));
+        // unpacking inside a display makes the display node that simpleeval refuses
+        assert_eq!(run("{**x}"), (false, "Sorry, Dict is not available in this evaluator".into()));
+        assert_eq!(run("[*'ab']"), (false, "Sorry, List is not available in this evaluator".into()));
+        assert_eq!(run("{*x}"), (false, "Sorry, Set is not available in this evaluator".into()));
+        // a tuple index: the container is looked up first, then the Tuple node is refused
+        assert_eq!(run("x[1:2, 3]"), (false, "'x' is not defined for expression 'x[1:2, 3]'".into()));
+        assert_eq!(run("'abc'[1:2, 3]"), (false, "Sorry, Tuple is not available in this evaluator".into()));
+    }
+
+    #[test]
+    fn numeric_literal_errors_match_cpython_tokenizer() {
+        assert_eq!(run("0x"), (false, "invalid hexadecimal literal (<unknown>, line 1)".into()));
+        assert_eq!(run("0o8"), (false, "invalid digit '8' in octal literal (<unknown>, line 1)".into()));
+        assert_eq!(run("0b2"), (false, "invalid digit '2' in binary literal (<unknown>, line 1)".into()));
+        assert_eq!(run("1e"), (false, "invalid decimal literal (<unknown>, line 1)".into()));
+        assert_eq!(run("1e+"), (false, "invalid decimal literal (<unknown>, line 1)".into()));
+        assert_eq!(run("1e5"), (true, "100000.0".into()));
+    }
+
+    #[test]
+    fn string_escape_and_lexer_errors_match_cpython_text() {
+        assert_eq!(
+            run("'\\x4'"),
+            (false, "(unicode error) 'unicodeescape' codec can't decode bytes in position 0-2: truncated \\xXX escape (<unknown>, line 1)".into())
+        );
+        assert_eq!(
+            run("'ab\\x4'"),
+            (false, "(unicode error) 'unicodeescape' codec can't decode bytes in position 2-4: truncated \\xXX escape (<unknown>, line 1)".into())
+        );
+        assert_eq!(
+            run("'\\U00110000'"),
+            (false, "(unicode error) 'unicodeescape' codec can't decode bytes in position 0-9: illegal Unicode character (<unknown>, line 1)".into())
+        );
+        assert_eq!(run("1 +\\"), (false, "unexpected EOF while parsing (<unknown>, line 1)".into()));
+        assert_eq!(run("(\u{1})"), (false, "invalid non-printable character U+0001 (<unknown>, line 1)".into()));
+        assert_eq!(run("1 +\u{a0}2"), (false, "invalid non-printable character U+00A0 (<unknown>, line 1)".into()));
+        assert_eq!(run("1\u{3000}+ 1"), (false, "invalid non-printable character U+3000 (<unknown>, line 1)".into()));
+        // an operator at the end of a line is what cpython's parser fails on, before the indent
+        assert_eq!(run("1 +\n 2"), (false, "invalid syntax (<unknown>, line 1)".into()));
+        assert_eq!(run("1\n 2"), (false, "unexpected indent (<unknown>, line 2)".into()));
+        // printable non-ascii characters keep their own message
+        assert_eq!(run("1 € 2"), (false, "invalid character '€' (U+20AC) (<unknown>, line 1)".into()));
+    }
+
+    #[test]
+    fn assignment_targets_match_cpython_compile_errors() {
+        // simpleeval evaluates only the value of an assignment, so a valid tuple target gives the value
+        assert_eq!(run("a, b = 1"), (true, "1".into()));
+        assert_eq!(run("(a, b) = 1"), (true, "1".into()));
+        assert_eq!(run("a, b = 1, 2"), (false, "Sorry, Tuple is not available in this evaluator".into()));
+        assert_eq!(run("a, 1 = 2"), (false, "cannot assign to literal here. Maybe you meant '==' instead of '='? (<unknown>, line 1)".into()));
+        // the '==' hint only applies to targets that cpython parses as a bitwise_or
+        assert_eq!(run("x and y = 1"), (false, "cannot assign to expression (<unknown>, line 1)".into()));
+        assert_eq!(run("not x = 1"), (false, "cannot assign to expression (<unknown>, line 1)".into()));
+        assert_eq!(run("-x = 1"), (false, "cannot assign to expression here. Maybe you meant '==' instead of '='? (<unknown>, line 1)".into()));
+        assert_eq!(run("(a, b) += 1"), (false, "'tuple' is an illegal expression for augmented assignment (<unknown>, line 1)".into()));
+    }
+
+    fn call(args: Value) -> anyhow::Result<Value> {
+        let calc = Calculator::new(ModuleBase::detached("calculator"));
+        let args = ToolArgs::new(args.as_object().unwrap().clone());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(calc.call_tool("calculate", args))
+    }
+
+    #[test]
+    fn call_tool_returns_the_python_result_and_argument_errors() {
+        let base = ModuleBase::detached("calculator");
+        let ok = call(serde_json::json!({"expression": "2 ** 10"})).unwrap();
+        assert_eq!(ok, base.result(serde_json::json!(1024), true));
+        // a non-string expression fails inside python's try (str.strip is missing), as an error result
+        let bad = call(serde_json::json!({"expression": 5})).unwrap();
+        assert_eq!(bad, base.result("'int' object has no attribute 'strip'".to_string(), false));
+        // a missing argument is a TypeError at the call site, outside the module's try, so it escapes
+        let missing = call(serde_json::json!({})).unwrap_err().to_string();
+        assert_eq!(missing, "Calculator.calculate() missing 1 required positional argument: 'expression'");
+    }
+
+    #[test]
+    fn parsed_but_refused_nodes_name_their_node() {
+        assert_eq!(run("yield 1"), (false, "Sorry, Yield is not available in this evaluator".into()));
+        assert_eq!(run("await x"), (false, "Sorry, Await is not available in this evaluator".into()));
+        assert_eq!(run("(x := 1)"), (false, "Sorry, NamedExpr is not available in this evaluator".into()));
     }
 }
