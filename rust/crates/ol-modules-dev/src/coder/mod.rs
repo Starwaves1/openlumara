@@ -20,6 +20,8 @@ const REGEX_BACKTRACK_LIMIT: usize = 1_000_000;
 const BUILTIN_TEMPLATES_PATH: &str = "modules/coder/templates";
 /// files the webui editor refuses to open (binary / huge)
 const UI_MAX_READ_BYTES: u64 = 1_000_000;
+/// python's os.path error when handed the None base of a sandbox with no sandbox_paths
+const NONE_PATH_TYPE_ERROR: &str = "stat: path should be string, bytes, os.PathLike or integer, not NoneType";
 
 pub fn register(r: &mut Registry) {
     r.add_module(ModuleDescriptor {
@@ -296,23 +298,49 @@ fn py_int(v: Option<&Value>, default: i64) -> anyhow::Result<i64> {
     }
 }
 
-/// python `int(str)`: surrounding whitespace, an optional sign, and digits with single underscores between them
+/// python `int(str)`: surrounding whitespace, an optional sign, and decimal digits (any unicode script)
+/// with single underscores between them. values beyond i64 are None (python has no size limit).
 fn py_int_str(s: &str) -> Option<i64> {
     let t = s.trim();
     let (negative, body) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let parts: Vec<&str> = body.split('_').collect();
-    if parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
-        return None;
+    let mut digits = String::new();
+    for part in body.split('_') {
+        if part.is_empty() {
+            return None;
+        }
+        for c in part.chars() {
+            digits.push(char::from_digit(decimal_digit_value(c)?, 10)?);
+        }
     }
-    let n: i64 = parts.concat().parse().ok()?;
+    let n: i64 = digits.parse().ok()?;
     if negative {
         n.checked_neg()
     } else {
         Some(n)
     }
+}
+
+/// unicode general category Nd (python's str.isdecimal)
+fn is_decimal_digit(c: char) -> bool {
+    static ND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ND.get_or_init(|| regex::Regex::new(r"^\p{Nd}$").expect("static regex"));
+    re.is_match(c.encode_utf8(&mut [0u8; 4]))
+}
+
+/// the value python's int() reads from a decimal digit. unicode digits sit in runs of ten that start at zero,
+/// so the offset from the first digit of the run is the value
+fn decimal_digit_value(c: char) -> Option<u32> {
+    if !is_decimal_digit(c) {
+        return None;
+    }
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).is_some_and(is_decimal_digit) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
 }
 
 fn py_type(v: &Value) -> &'static str {
@@ -784,15 +812,26 @@ impl Coder {
     // ---------------- webui routes
 
     fn route_sandboxes(&self) -> anyhow::Result<Value> {
-        let mode = self.cfg("editor_mode").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "standard".into());
+        // python builds the dict in key order: _get_sandbox_paths() (creates the sandbox folders) runs
+        // before int(autosave_interval), so a bad autosave_interval still leaves the folders behind
+        let sandboxes = self.get_sandbox_paths().map_err(err)?;
+        // python: config.get("editor_mode") or "standard", returned as the raw config value (not stringified)
+        let mode = self.cfg("editor_mode").filter(truthy).unwrap_or_else(|| "standard".into());
         // python: int(self.config.get("autosave_interval") or 0), so bad text raises ValueError out of the route
         let autosave = py_int(self.cfg("autosave_interval").filter(truthy).as_ref(), 0)?;
         Ok(json!({
-            "sandboxes": self.get_sandbox_paths().map_err(err)?,
+            "sandboxes": sandboxes,
             "read_only": self.read_only(),
             "editor_mode": if self.cfg_bool("enable_webui_extension") { mode } else { "standard".into() },
             "autosave_interval": autosave,
         }))
+    }
+
+    /// python: with no sandbox_paths the base is None, and an empty subpath hands that None to os.path
+    /// (isdir / getsize), which raises a TypeError. a non-empty subpath fails earlier, inside sandbox_path.
+    fn empty_subpath_without_base(&self, sandbox: &str, rel_path: &str) -> bool {
+        let requested = rel_path.strip_prefix(sandbox).unwrap_or(rel_path);
+        requested.is_empty() && matches!(self.get_full_sandbox_path(sandbox), Ok(None))
     }
 
     fn route_tree(&self, q: &Map<String, Value>) -> Value {
@@ -801,11 +840,8 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        // python: with no sandbox_paths the base is None, and an empty path hands that None to os.path.isdir,
-        // which raises a TypeError outside any try block (a non-empty path fails earlier, inside sandbox_path)
-        let requested = rel_path.strip_prefix(sandbox.as_str()).unwrap_or(&rel_path);
-        if requested.is_empty() && matches!(self.get_full_sandbox_path(&sandbox), Ok(None)) {
-            return self.result("stat: path should be string, bytes, os.PathLike or integer, not NoneType", false);
+        if self.empty_subpath_without_base(&sandbox, &rel_path) {
+            return self.result(NONE_PATH_TYPE_ERROR, false);
         }
         let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
             Ok(t) => t,
@@ -870,6 +906,9 @@ impl Coder {
         let rel_path = sget(q, "path");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
+        }
+        if self.empty_subpath_without_base(&sandbox, &rel_path) {
+            return self.result(NONE_PATH_TYPE_ERROR, false);
         }
         let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
             Ok(t) => t,
@@ -1902,10 +1941,10 @@ mod tests {
 
     /// a coder whose settings are `settings`, laid out the way the channel config holds them (modules.settings.coder)
     fn coder_with(settings: Value) -> Coder {
+        // config views reload from disk, so the settings go to the file set_for_tests points at (as route_tests does)
         let config = json!({"modules": {"settings": {"coder": settings}}});
-        let dir = std::env::temp_dir().join(format!("ol-test-config-coder-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ol-test-config-{}", std::process::id()));
         ol_core::config::set_for_tests(config.clone());
-        let _ = std::fs::remove_file(dir.join("config.yml"));
         std::fs::write(dir.join("config.yml"), config.to_string()).expect("write test config");
         Coder::new(ModuleBase::detached("coder"))
     }
@@ -1950,5 +1989,52 @@ mod tests {
             coder.route_tree(&query("src")),
             json!({"status": "error", "content": "'NoneType' object has no attribute 'replace'"})
         );
+    }
+
+    #[test]
+    fn read_without_sandboxes_reports_python_getsize_error_for_the_bare_sandbox_name() {
+        let _lock = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let coder = coder_with(json!({}));
+        let query = |path: &str| {
+            let mut q = Map::new();
+            q.insert("sandbox".into(), json!("proj"));
+            q.insert("path".into(), json!(path));
+            q
+        };
+        assert_eq!(
+            coder.route_read(&query("proj")),
+            json!({"status": "error", "content": "stat: path should be string, bytes, os.PathLike or integer, not NoneType"})
+        );
+        assert_eq!(
+            coder.route_read(&query("src")),
+            json!({"status": "error", "content": "'NoneType' object has no attribute 'replace'"})
+        );
+    }
+
+    #[test]
+    fn sandboxes_create_folders_before_a_bad_autosave_interval_raises() {
+        let _lock = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("ol-test-sandbox-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sandbox = root.join("proj");
+        let coder = coder_with(json!({"sandbox_paths": [sandbox.to_string_lossy()], "autosave_interval": "abc"}));
+        // python builds the dict literal in order, so the folder exists before int() raises
+        assert_eq!(coder.route_sandboxes().unwrap_err().to_string(), "invalid literal for int() with base 10: 'abc'");
+        assert!(sandbox.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sandboxes_editor_mode_is_the_raw_config_value_and_int_reads_unicode_digits() {
+        let _lock = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mode = |v: Value| coder_with(json!({"enable_webui_extension": true, "editor_mode": v})).route_sandboxes().unwrap()["editor_mode"].clone();
+        assert_eq!(mode(json!("vim")), json!("vim"));
+        // python returns the raw value when it is truthy, so non-strings keep their JSON type
+        assert_eq!(mode(json!(["x"])), json!(["x"]));
+        assert_eq!(mode(json!(3)), json!(3));
+        // python int() accepts any unicode decimal digits: arabic-indic 3, and underscores between them
+        assert_eq!(py_int_str("\u{0663}"), Some(3));
+        assert_eq!(py_int_str("1_\u{0662}"), Some(12));
+        assert_eq!(py_int_str("\u{00B2}"), None, "superscript two is not a decimal digit");
     }
 }
