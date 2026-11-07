@@ -31,6 +31,7 @@ const KEEPS_BLANK_TEXT: &[&str] = &[
 
 /// lxml's `remove_blank_text`: libxml2 drops a whitespace-only text node when a tag (or the end of input)
 /// follows it and the element before it, or its parent when it is the first child, is not in `KEEPS_BLANK_TEXT`.
+/// At the end of input (nothing after the node in document order) it is always dropped (`areBlanks`: `CUR == 0`).
 /// Comments and processing instructions are not counted as siblings (lxml removes them while parsing).
 fn remove_blank_text(doc: &mut Html) {
     let mut dropped = Vec::new();
@@ -38,6 +39,11 @@ fn remove_blank_text(doc: &mut Html) {
         let Some(text) = node.value().as_text() else { continue };
         let blank = !text.text.is_empty() && text.text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
         if !blank || node.next_sibling().is_some_and(|n| n.value().is_text()) {
+            continue;
+        }
+        let at_end = node.next_sibling().is_none() && node.ancestors().all(|a| a.next_sibling().is_none());
+        if at_end {
+            dropped.push(node.id());
             continue;
         }
         let prev = node.prev_siblings().find(|p| p.value().is_element() || p.value().is_text());
@@ -232,6 +238,16 @@ mod tests {
         assert_eq!(text_of(&all_elements(&parse("<p><img src=x> <b>q</b></p>"))), "q");
         assert_eq!(text_of(&all_elements(&parse("<dl> <dt>a</dt></dl>"))), "a");
         assert_eq!(text_of(&all_elements(&parse("<div><img><!--c--> <b>x</b></div>"))), "x");
+    }
+
+    #[test]
+    fn blank_text_at_end_of_input_is_dropped_like_lxml() {
+        // libxml2 areBlanks: CUR == 0 drops the blank whatever the element before it (lxml 6.1.3 probes)
+        assert_eq!(text_of(&all_elements(&parse("<span>a</span> "))), "a");
+        assert_eq!(text_of(&all_elements(&parse("<div><b>x</b></div>\n\n"))), "x");
+        assert_eq!(text_of(&all_elements(&parse("<html><body><span>a</span></body></html>\n"))), "a");
+        // a blank before a trailing comment is followed by '<', so the usual rule applies and span keeps it
+        assert_eq!(text_of(&all_elements(&parse("<span>a</span> <!--c-->"))), "a ");
     }
 
     #[test]
