@@ -103,7 +103,13 @@ impl Module for Modules {
                         true,
                     ));
                 }
-                let name = args.str("name").unwrap_or_default();
+                // python calls name.lower() on the raw argument before any branch, so a non-string
+                // name (including JSON null) raises AttributeError instead of being coerced
+                let name = match args.0.get("name") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => anyhow::bail!("'{}' object has no attribute 'lower'", py_type_name(other)),
+                    None => args.str("name").unwrap_or_default(),
+                };
                 if name == "modules" {
                     return Ok(json!("module manager can only be manually turned off by using the settings dialog, the `/module` command, or editing the config file. user needs to know what you're doing!"));
                 }
@@ -210,6 +216,23 @@ mod tests {
             out,
             json!("module manager can only be manually turned off by using the settings dialog, the `/module` command, or editing the config file. user needs to know what you're doing!")
         );
+    }
+
+    fn call_result(m: &Modules, method: &str, pairs: &[(&str, Value)]) -> anyhow::Result<Value> {
+        let args: Map<String, Value> = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        block_on(m.call_tool(method, ToolArgs::new(args)))
+    }
+
+    #[test]
+    fn toggle_with_non_string_name_raises_like_python_attribute_error() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = setup(true, false);
+        // python: name.lower() on an int raises before any branch runs
+        let err = call_result(&m, "toggle", &[("name", json!(7))]).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'lower'");
+        // a JSON null is None in python, which has no lower() either
+        let err = call_result(&m, "toggle", &[("name", Value::Null)]).unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'lower'");
     }
 
     #[test]
