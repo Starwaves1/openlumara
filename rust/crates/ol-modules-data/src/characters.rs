@@ -185,14 +185,42 @@ pub fn case_insensitive_replace(text: &str, old: &str, new: &str) -> String {
     out
 }
 
-/// replaces the magic words defined in the character card spec
-pub fn replace_tags(char_name: &str, user_name: &str, text: &str) -> String {
-    let map = [("{{char}}", char_name), ("{char}", char_name), ("<BOT>", char_name), ("{{user}}", user_name), ("{user}", user_name), ("<USER>", user_name)];
-    let mut out = text.to_string();
-    for (word, rep) in map {
-        out = case_insensitive_replace(&out, word, rep);
+/// whether `old` occurs in `text` under python's lowercase comparison (an empty `old` never matches)
+fn ci_contains(text: &str, old: &str) -> bool {
+    let lower_old: Vec<char> = old.to_lowercase().chars().collect();
+    let lower_text: Vec<char> = text.to_lowercase().chars().collect();
+    !lower_old.is_empty() && lower_text.windows(lower_old.len()).any(|w| w == lower_old.as_slice())
+}
+
+/// python `_case_insensitive_replace(text, old, new)` where `new` can be any stored value. python joins
+/// the pieces with `"".join`, so a non-str replacement only raises once a match inserts it
+pub fn case_insensitive_replace_value(text: &str, old: &str, new: &Value) -> anyhow::Result<String> {
+    if !matches!(new, Value::String(_)) && ci_contains(text, old) {
+        // the first inserted replacement sits at index 1 of the join (segment, replacement, segment, ...)
+        anyhow::bail!("sequence item 1: expected str instance, {} found", py_type(new));
     }
-    out
+    Ok(case_insensitive_replace(text, old, &py_str(new)))
+}
+
+/// replaces the magic words defined in the character card spec, in python's order. the user name is
+/// the stored value (`user_profile.get("name", "user")`), so a non-str name fails on the first user tag
+pub fn replace_tags(char_name: &str, user_name: &Value, text: &str) -> anyhow::Result<String> {
+    let mut out = text.to_string();
+    for word in ["{{char}}", "{char}", "<BOT>"] {
+        out = case_insensitive_replace(&out, word, char_name);
+    }
+    for word in ["{{user}}", "{user}", "<USER>"] {
+        out = case_insensitive_replace_value(&out, word, user_name)?;
+    }
+    Ok(out)
+}
+
+/// python `obj[key] = value` on a metadata value that is not a dict
+fn item_assignment_error(v: &Value) -> String {
+    match v {
+        Value::Array(_) => "list indices must be integers or slices, not str".into(),
+        other => format!("'{}' object does not support item assignment", py_type(other)),
+    }
 }
 
 /// tags arrive from the form as a comma-separated string (or a list)
@@ -314,9 +342,10 @@ impl Characters {
         self.with_user(|u| u.get(key).cloned()).ok().flatten()
     }
 
-    /// searches for a character, case insensitive
+    /// searches for a character, case insensitive. python callers all test the result for truthiness
+    /// (`if not char`), so the first match is a miss when its stored value is falsy (e.g. an empty dict)
     fn find_character(&self, name: &str) -> Option<Value> {
-        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v)
+        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v).filter(|v| truthy(v))
     }
 
     /// searches for a character and returns the stored key with correct case
@@ -324,15 +353,12 @@ impl Characters {
         self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(k, _)| k)
     }
 
-    fn user_name(&self) -> String {
-        self.with_user(|u| {
-            u.get("name");
-            u.data.get("name").map(py_str).unwrap_or_else(|| "user".to_string())
-        })
-        .unwrap_or_else(|_| "user".into())
+    /// python `self.user_profile.get("name", "user")`: the stored value as-is, not coerced to a string
+    fn user_name(&self) -> Value {
+        self.with_user(|u| u.get("name").cloned()).ok().flatten().unwrap_or_else(|| json!("user"))
     }
 
-    fn replace(&self, char_name: &str, text: &str) -> String {
+    fn replace(&self, char_name: &str, text: &str) -> anyhow::Result<String> {
         replace_tags(char_name, &self.user_name(), text)
     }
 
@@ -340,24 +366,35 @@ impl Characters {
         self.base.channel().ok_or_else(|| anyhow!("'NoneType' object has no attribute 'context'"))
     }
 
+    /// python `self.channel.context.chat.get("metadata")`: `Chat.get` raises when no chat is loaded,
+    /// and otherwise returns the metadata (None when the chat has none)
+    fn chat_metadata(&self) -> anyhow::Result<Option<Value>> {
+        let ch = self.channel()?;
+        if ch.chat.current().is_none() {
+            anyhow::bail!("No chat is currently loaded!");
+        }
+        Ok(ch.chat.get("metadata"))
+    }
+
     /// python `_route_current` (see `current_route_value`)
     fn route_current(&self) -> anyhow::Result<Value> {
-        let ch = self.channel()?;
-        current_route_value(ch.chat.get("metadata"))
+        current_route_value(self.chat_metadata()?)
     }
 
-    /// `chat.get("metadata").get("character")`
+    /// `chat.get("metadata").get("character") or None` (same chain as the route)
     fn current_character(&self) -> anyhow::Result<Value> {
-        let ch = self.channel()?;
-        Ok(ch.chat.get("metadata").and_then(|m| m.get("character").cloned()).unwrap_or(Value::Null))
+        current_route_value(self.chat_metadata()?)
     }
 
-    /// `chat.get("metadata")["character"] = value` (in-memory, persisted on the next chat save)
+    /// `chat.get("metadata")["character"] = value` (in-memory, persisted on the next chat save). the
+    /// metadata must be a dict, python raises on a missing or non-dict value
     fn set_current_character(&self, value: Value) -> anyhow::Result<()> {
-        let ch = self.channel()?;
-        let mut meta = ch.chat.get("metadata").filter(|m| m.is_object()).unwrap_or_else(|| json!({}));
+        let mut meta = self.chat_metadata()?.unwrap_or(Value::Null);
+        if !meta.is_object() {
+            anyhow::bail!(item_assignment_error(&meta));
+        }
         meta["character"] = value;
-        ch.chat.set_current_field("metadata", meta);
+        self.channel()?.chat.set_current_field("metadata", meta);
         Ok(())
     }
 
@@ -521,7 +558,7 @@ impl Characters {
         self.switch(&char_name).await?;
         let first = character.get("first_message").cloned().unwrap_or(json!(""));
         if truthy(&first) && self.base.config.get_bool("use_first_messages") {
-            let first = self.replace(&char_name, str_for_lower(&first)?);
+            let first = self.replace(&char_name, str_for_lower(&first)?)?;
             return Ok(format!("character switched to {}\n\n{}", char_name, first));
         }
         Ok(format!("character switched to {}", char_name))
@@ -536,7 +573,7 @@ impl Characters {
         let char_name = py_str(&char_name);
         let first = ch.get("first_message").cloned().unwrap_or(json!(""));
         if truthy(&first) && self.base.config.get_bool("use_first_messages") {
-            let first = self.replace(&char_name, str_for_lower(&first)?);
+            let first = self.replace(&char_name, str_for_lower(&first)?)?;
             return Ok(self.base.result(
                 format!("Switched to {}. Begin your reply now with this exact greeting, verbatim, and add nothing else:\n\n{}", char_name, first),
                 true,
@@ -654,6 +691,10 @@ impl Characters {
     fn route_list(&self) -> anyhow::Result<Value> {
         let mut grouped: IndexMap<String, (Value, Vec<Value>)> = IndexMap::new();
         for (name, ch) in self.all() {
+            // python `char.get(...)` on a stored value that is not a dict raises
+            if !ch.is_object() {
+                anyhow::bail!("'{}' object has no attribute 'get'", py_type(&ch));
+            }
             let cat = match ch.get("category") {
                 Some(c) if truthy(c) => c.clone(),
                 _ => json!("general"),
@@ -995,10 +1036,9 @@ impl Module for Characters {
             return Ok(Some("Failed to extract character profile from character data".into()));
         }
         let scenario = ch.get("scenario").cloned().unwrap_or(json!(""));
-        let mut profile = self.replace(&char_name, &py_str(&profile)).replace("\\n", "\n");
-        let scenario = if truthy(&scenario) { self.replace(&char_name, &py_str(&scenario)).replace("\\n", "\n") } else { String::new() };
-        // keep python's ordering of operations: tags first, then escaped newlines
-        profile = profile.to_string();
+        // python: tags first, then escaped newlines
+        let profile = self.replace(&char_name, &py_str(&profile))?.replace("\\n", "\n");
+        let scenario = if truthy(&scenario) { self.replace(&char_name, &py_str(&scenario))?.replace("\\n", "\n") } else { String::new() };
 
         let mut build = vec![format!("## You: {}\n{}", char_name, profile)];
         if !scenario.is_empty() {
@@ -1016,7 +1056,7 @@ impl Module for Characters {
         if self.base.config.get_bool("use_first_messages") && truthy(&first) {
             let channel = self.channel()?;
             if channel.chat.messages_len() == 0 {
-                let first = self.replace(&char_name, &py_str(&first));
+                let first = self.replace(&char_name, &py_str(&first))?;
                 channel.push(json!({"role": "assistant", "content": first}), true).await;
             }
         }
@@ -1210,9 +1250,26 @@ mod tests {
 
     #[test]
     fn tag_replacement() {
-        assert_eq!(replace_tags("Ann", "Bob", "Hi {{USER}}, I am {{Char}} aka <bot>."), "Hi Bob, I am Ann aka Ann.");
+        assert_eq!(replace_tags("Ann", &json!("Bob"), "Hi {{USER}}, I am {{Char}} aka <bot>.").unwrap(), "Hi Bob, I am Ann aka Ann.");
         assert_eq!(case_insensitive_replace("aXbxc", "x", "-"), "a-b-c");
         assert_eq!(case_insensitive_replace("abc", "", "-"), "abc");
+    }
+
+    #[test]
+    fn non_str_user_name_only_fails_once_a_user_tag_matches() {
+        // python: "".join raises at the first inserted replacement (sequence item 1)
+        assert_eq!(replace_tags("Ann", &json!(5), "Hi there").unwrap(), "Hi there");
+        assert_eq!(replace_tags("Ann", &json!(5), "Hi {{user}}").unwrap_err().to_string(), "sequence item 1: expected str instance, int found");
+        assert_eq!(replace_tags("Ann", &Value::Null, "<USER>").unwrap_err().to_string(), "sequence item 1: expected str instance, NoneType found");
+        // the char tag is always a str in this path and still replaces
+        assert_eq!(replace_tags("Ann", &Value::Null, "{{char}}").unwrap(), "Ann");
+    }
+
+    #[test]
+    fn metadata_item_assignment_errors_match_python() {
+        assert_eq!(item_assignment_error(&Value::Null), "'NoneType' object does not support item assignment");
+        assert_eq!(item_assignment_error(&json!("x")), "'str' object does not support item assignment");
+        assert_eq!(item_assignment_error(&json!([1])), "list indices must be integers or slices, not str");
     }
 
     #[test]

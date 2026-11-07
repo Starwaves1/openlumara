@@ -1533,14 +1533,20 @@ use ol_modules_data::characters::Characters;
 
 /// the characters module loaded the way the manager loads it at startup, so its webui routes are reachable
 async fn harness_with_characters() -> Harness {
+    characters_harness(true).await
+}
+
+async fn characters_harness(open_chat: bool) -> Harness {
     let h = harness(false).await;
     let base = ModuleBase::new("characters", false, Arc::downgrade(&h.manager));
     let characters: Arc<dyn Module> = Arc::new(Characters::new(base));
     characters.on_ready().await.expect("characters load");
     h.manager.insert_module(characters);
-    // the character lives in the loaded chat's metadata, so a chat must be open (the app always has one)
-    let opened = h.send(post_json("/api/chat/new", "{}")).await;
-    assert_eq!(opened.json()["success"], json!(true), "open chat: {}", opened.body);
+    if open_chat {
+        // the character lives in the loaded chat's metadata, so a chat must be open (the app always has one)
+        let opened = h.send(post_json("/api/chat/new", "{}")).await;
+        assert_eq!(opened.json()["success"], json!(true), "open chat: {}", opened.body);
+    }
     h
 }
 
@@ -1664,6 +1670,24 @@ async fn characters_switch_with_first_messages_on_returns_the_greeting_to_stream
         "{}",
         resp.body
     );
+}
+
+#[tokio::test]
+async fn characters_current_and_switch_default_raise_python_errors_without_a_loaded_chat() {
+    // python: chat.get("metadata") raises "No chat is currently loaded!" when no chat is current
+    let h = characters_harness(false).await;
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "No chat is currently loaded!", "success": false}));
+    let resp = h.send(post_json("/api/ext/characters/switch_default", "")).await;
+    assert_eq!(resp.json(), json!({"data": "No chat is currently loaded!", "success": false}));
+}
+
+#[tokio::test]
+async fn characters_switch_default_fails_like_python_when_chat_metadata_is_not_a_dict() {
+    // python: chat.get("metadata")["character"] = "" raises on a string metadata value
+    let h = harness_with_characters().await;
+    assert!(h.ch.chat.set("metadata", json!("oops"), None).expect("set metadata"));
+    let resp = h.send(post_json("/api/ext/characters/switch_default", "")).await;
+    assert_eq!(resp.json(), json!({"data": "'str' object does not support item assignment", "success": false}));
 }
 
 #[tokio::test]
