@@ -73,12 +73,12 @@ impl Models {
         };
         // python calls name.strip() inside the loop, so a non-str name fails once there is a model to compare against
         let wanted = match name {
-            Value::String(s) => s.trim().to_lowercase(),
+            Value::String(s) => util::py_strip(s).to_lowercase(),
             other => anyhow::bail!("'{}' object has no attribute 'strip'", util::py_type_name(other)),
         };
         let mut found_id = None;
         for model_id in &models {
-            if model_id.trim().to_lowercase() == wanted {
+            if util::py_strip(model_id).to_lowercase() == wanted {
                 found_id = Some(model_id.clone());
             }
         }
@@ -173,7 +173,7 @@ impl Module for Models {
                 if args.is_empty() {
                     return Ok(Some(format!("Current model: {}", py_opt(&self.current_model()?))));
                 }
-                let r = self.switch(&json!(args.join(" ").trim())).await?;
+                let r = self.switch(&json!(util::py_strip(&args.join(" ")))).await?;
                 Ok(match r {
                     Value::Null => None,
                     other => Some(ol_core::pyjson::py_str(&other)),
@@ -258,6 +258,16 @@ mod tests {
         let err = block_on(m.call_tool("switch", args)).unwrap_err();
         assert_eq!(err.to_string(), "'int' object has no attribute 'strip'");
         assert_eq!(mgr.api().get_model().as_deref(), Some("llama-3"));
+    }
+
+    #[test]
+    fn switch_strips_python_isspace_control_chars_from_the_name() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mgr, m) = setup("llama-3", false, Some(vec!["Qwen3.5-9B", "llama-3"]));
+        // python str.strip() removes U+001C..U+001F, which Rust str::trim() keeps
+        let out = block_on(m.run_command("model", vec!["\u{1c}Qwen3.5-9B\u{1f}".into()])).unwrap();
+        assert_eq!(out.as_deref(), Some("model has been switched to Qwen3.5-9B"));
+        assert_eq!(mgr.api().get_model().as_deref(), Some("Qwen3.5-9B"));
     }
 
     #[test]
