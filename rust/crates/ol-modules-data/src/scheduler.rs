@@ -21,6 +21,7 @@ use ol_core::pyjson::{py_str, py_str_opt, truthy};
 use ol_core::storage::{StorageList, StorageType};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// names of all available channels. Equivalent to core.channel.get_available_channels(),
@@ -230,6 +231,81 @@ pub fn format_recurring_time(recur: &Value) -> String {
 
 /// python `_format_job_time`. a missing `recurs_in` is {} (`job.get(k, {})`), but a stored null or other
 /// non-dict raises AttributeError on `.get` inside python's formatter
+/// python `items.sort(key=lambda j: j.get("trigger_time") or "9999")`: the key is the stored value itself when
+/// truthy, so mixed or unorderable stored values raise python's TypeError rather than being coerced to text
+fn sort_by_trigger_time(items: &mut [Value]) -> anyhow::Result<()> {
+    let mut failure: Option<String> = None;
+    items.sort_by(|a, b| {
+        let (ka, kb) = (trigger_sort_key(a), trigger_sort_key(b));
+        match py_order(&ka, &kb) {
+            Ok(order) => order,
+            Err((ta, tb)) => {
+                failure.get_or_insert_with(|| format!("'<' not supported between instances of '{ta}' and '{tb}'"));
+                Ordering::Equal
+            }
+        }
+    });
+    match failure {
+        Some(msg) => anyhow::bail!(msg),
+        None => Ok(()),
+    }
+}
+
+fn trigger_sort_key(item: &Value) -> Value {
+    let t = item.get("trigger_time").cloned().unwrap_or(Value::Null);
+    if truthy(&t) {
+        t
+    } else {
+        json!("9999")
+    }
+}
+
+/// python `<` between two sort keys; `Err` carries the operand type names python reports
+fn py_order(a: &Value, b: &Value) -> Result<Ordering, (&'static str, &'static str)> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Ok(x.cmp(y)),
+        (Value::Array(x), Value::Array(y)) => {
+            // python list ordering: the first unequal pair decides, otherwise the shorter list is smaller
+            for (p, q) in x.iter().zip(y.iter()) {
+                if !py_eq(p, q) {
+                    return py_order(p, q);
+                }
+            }
+            Ok(x.len().cmp(&y.len()))
+        }
+        _ => cmp_numbers(a, b).ok_or((py_type(a), py_type(b))),
+    }
+}
+
+/// python `==` for json values (bools and numbers compare by value, lists and dicts element-wise)
+fn py_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| py_eq(p, q)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| py_eq(v, w)))
+        }
+        _ => cmp_numbers(a, b) == Some(Ordering::Equal),
+    }
+}
+
+/// numeric comparison for python's bool/int/float; integers compare exactly, the rest as f64
+fn cmp_numbers(a: &Value, b: &Value) -> Option<Ordering> {
+    fn parts(v: &Value) -> Option<(Option<i64>, f64)> {
+        match v {
+            Value::Bool(b) => Some((Some(*b as i64), *b as i64 as f64)),
+            Value::Number(n) => Some((n.as_i64(), n.as_f64()?)),
+            _ => None,
+        }
+    }
+    let ((ai, af), (bi, bf)) = (parts(a)?, parts(b)?);
+    match (ai, bi) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        _ => af.partial_cmp(&bf),
+    }
+}
+
 pub fn format_job_time(job: &Value) -> anyhow::Result<String> {
     if job.get("recurring").map(truthy).unwrap_or(false) {
         let empty = json!({});
@@ -857,14 +933,7 @@ impl Inner {
                 }))
             })
             .collect::<anyhow::Result<_>>()?;
-        items.sort_by_key(|j| {
-            let t = &j["trigger_time"];
-            if truthy(t) {
-                py_str(t)
-            } else {
-                "9999".to_string()
-            }
-        });
+        sort_by_trigger_time(&mut items)?;
         Ok(Value::Array(items))
     }
 
@@ -1030,6 +1099,29 @@ impl Module for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_sorts_on_stored_trigger_time_with_falsy_last() {
+        let mut items = vec![
+            json!({"id": "c", "trigger_time": ""}),
+            json!({"id": "b", "trigger_time": "2026-02-01T00:00:00"}),
+            json!({"id": "a", "trigger_time": "2026-01-01T00:00:00"}),
+        ];
+        sort_by_trigger_time(&mut items).unwrap();
+        let ids: Vec<&str> = items.iter().map(|j| j["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn mixed_stored_trigger_time_fails_like_python_sort() {
+        // python: [{"trigger_time": "2026-..."}, {"trigger_time": 5}].sort(key=...) -> 5 < "2026-..." raises
+        let mut items = vec![json!({"trigger_time": "2026-01-01T00:00:00"}), json!({"trigger_time": 5})];
+        let err = sort_by_trigger_time(&mut items).unwrap_err().to_string();
+        assert_eq!(err, "'<' not supported between instances of 'int' and 'str'");
+        // a single job is never compared, so it cannot fail
+        let mut single = vec![json!({"trigger_time": 5})];
+        assert!(sort_by_trigger_time(&mut single).is_ok());
+    }
 
     fn dt(s: &str) -> NaiveDateTime {
         crate::util::fromisoformat(s).unwrap()
