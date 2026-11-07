@@ -24,10 +24,22 @@ const MAX_JSON_DEPTH: usize = 128;
 /// python `json.loads` on a request body (starlette's `request.json()`): the same accepted documents,
 /// the same error positions (in characters) and the same messages as python's C scanner
 pub fn py_json_loads(body: &[u8]) -> Result<Value, BodyJsonError> {
+    parse_document(body, false)
+}
+
+/// `py_json_loads` for a handler that only reads keys whose non-string values it treats as falsy or
+/// as a failure. python's NaN, Infinity and out-of-range numbers are read as null here, so the body
+/// is accepted as python accepts it. (python's `nan` is truthy, so a handler that fails on a
+/// non-string value gives the same result for `nan` and for null.)
+pub fn py_json_loads_lenient(body: &[u8]) -> Result<Value, BodyJsonError> {
+    parse_document(body, true)
+}
+
+fn parse_document(body: &[u8], lenient: bool) -> Result<Value, BodyJsonError> {
     // json.loads on bytes decodes with utf-8-sig, which drops a leading byte order mark
     let Ok(text) = std::str::from_utf8(body) else { return Err(BodyJsonError::Unrepresentable) };
     let doc: Vec<char> = text.strip_prefix('\u{feff}').unwrap_or(text).chars().collect();
-    let scanner = JsonScanner { doc: &doc };
+    let scanner = JsonScanner { doc: &doc, lenient };
     let start = scanner.ws(0);
     let (value, end) = scanner.value(start, 0)?;
     let end = scanner.ws(end);
@@ -64,6 +76,8 @@ fn decode_error(doc: &[char], msg: &str, pos: usize) -> BodyJsonError {
 /// first character it may consume and returns the index just past what it consumed
 struct JsonScanner<'a> {
     doc: &'a [char],
+    /// read python-only values (NaN, Infinity, out-of-range numbers) as null instead of failing
+    lenient: bool,
 }
 
 impl JsonScanner<'_> {
@@ -78,6 +92,15 @@ impl JsonScanner<'_> {
         word.chars().enumerate().all(|(k, c)| self.doc.get(i + k) == Some(&c))
     }
 
+    /// a value python parses but `Value` cannot hold: a failure, or null when lenient, ending at `end`
+    fn python_only(&self, end: usize) -> Result<(Value, usize), BodyJsonError> {
+        if self.lenient {
+            Ok((Value::Null, end))
+        } else {
+            Err(BodyJsonError::Unrepresentable)
+        }
+    }
+
     fn value(&self, i: usize, depth: usize) -> Result<(Value, usize), BodyJsonError> {
         match self.doc.get(i) {
             Some('"') => {
@@ -89,9 +112,9 @@ impl JsonScanner<'_> {
             Some('n') if self.word(i, "null") => Ok((Value::Null, i + 4)),
             Some('t') if self.word(i, "true") => Ok((Value::Bool(true), i + 4)),
             Some('f') if self.word(i, "false") => Ok((Value::Bool(false), i + 5)),
-            Some('N') if self.word(i, "NaN") => Err(BodyJsonError::Unrepresentable),
-            Some('I') if self.word(i, "Infinity") => Err(BodyJsonError::Unrepresentable),
-            Some('-') if self.word(i, "-Infinity") => Err(BodyJsonError::Unrepresentable),
+            Some('N') if self.word(i, "NaN") => self.python_only(i + 3),
+            Some('I') if self.word(i, "Infinity") => self.python_only(i + 8),
+            Some('-') if self.word(i, "-Infinity") => self.python_only(i + 9),
             _ => self.number(i),
         }
     }
@@ -132,12 +155,12 @@ impl JsonScanner<'_> {
         if is_float {
             return match text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
                 Some(n) => Ok((Value::Number(n), j)),
-                None => Err(BodyJsonError::Unrepresentable),
+                None => self.python_only(j),
             };
         }
         match text.parse::<i64>().map(Value::from).or_else(|_| text.parse::<u64>().map(Value::from)) {
             Ok(v) => Ok((v, j)),
-            Err(_) => Err(BodyJsonError::Unrepresentable),
+            Err(_) => self.python_only(j),
         }
     }
 
@@ -921,5 +944,22 @@ mod tests {
         assert_eq!(parse_body(b"-0").unwrap(), json!(0));
         // python accepts NaN; a value cannot hold it, so the text is serde's and the body is rejected
         assert!(parse_body(b"[NaN]").is_err());
+    }
+
+    #[test]
+    fn lenient_bodies_read_python_only_numbers_as_null() {
+        // python's json.loads accepts these; the lenient reader keeps every other key intact
+        assert_eq!(
+            py_json_loads_lenient(b"{\"category\": \"work\", \"x\": NaN, \"y\": [Infinity, -Infinity, 1e400, 123456789012345678901234567890]}")
+                .unwrap(),
+            json!({"category": "work", "x": null, "y": [null, null, null, null]})
+        );
+        assert_eq!(py_json_loads_lenient(b"NaN").unwrap(), Value::Null);
+        // structural errors still fail with python's messages, and the strict reader still rejects NaN
+        assert_eq!(
+            py_json_loads_lenient(b"{\"a\": NaN,}").unwrap_err(),
+            BodyJsonError::Decode("Expecting property name enclosed in double quotes: line 1 column 11 (char 10)".into())
+        );
+        assert_eq!(py_json_loads(b"[NaN]").unwrap_err(), BodyJsonError::Unrepresentable);
     }
 }

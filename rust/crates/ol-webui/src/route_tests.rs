@@ -1032,6 +1032,24 @@ async fn chat_new_opens_a_chat_in_the_posted_category_or_general() {
 }
 
 #[tokio::test]
+async fn chat_new_reads_bodies_python_json_loads_accepts_like_python() {
+    let h = harness(false).await;
+    // python's json.loads takes NaN in another key, so the category is still read
+    let kept = h.send(post_json("/api/chat/new", r#"{"category": "work", "x": NaN, "y": -Infinity}"#)).await;
+    assert_eq!(kept.json()["success"], json!(true));
+    let id = kept.json()["data"]["id"].as_str().expect("new chat id").to_string();
+    assert_eq!(index_entry(&h, &id)["category"], json!("work"));
+
+    // a non-string category (nan is truthy, then fails at .strip()) and a non-object body keep 'general'
+    for body in [r#"{"category": NaN}"#, r#"{"category": Infinity}"#, "NaN", "[NaN]"] {
+        let plain = h.send(post_json("/api/chat/new", body)).await;
+        assert_eq!(plain.json()["success"], json!(true), "body {body}");
+        let id = plain.json()["data"]["id"].as_str().expect("new chat id").to_string();
+        assert_eq!(index_entry(&h, &id)["category"], json!("general"), "body {body}");
+    }
+}
+
+#[tokio::test]
 async fn chat_rename_retitles_the_chat_and_reports_each_failure() {
     let h = harness(false).await;
     let id = chat_at(&h, "general", "old", "2026-11-01T10:00:00", &[]).await;

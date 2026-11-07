@@ -11,8 +11,8 @@ use crate::listing::{
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
-    export_chat_text, get_strip, or_strip, parse_body, py_contains, py_int, py_int_str, py_iter, py_slice,
-    py_sorted_unique, py_strip, py_type_name,
+    export_chat_text, get_strip, or_strip, parse_body, py_contains, py_int, py_int_str, py_iter, py_json_loads_lenient,
+    py_slice, py_sorted_unique, py_strip, py_type_name,
 };
 use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
@@ -592,9 +592,10 @@ async fn get_prompt(State(app): State<Arc<Shared>>) -> Response {
 
 async fn chat_new(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    // python: any failure reading the body keeps the category at 'general'
+    // python: any failure reading the body keeps the category at 'general'. python's json.loads takes
+    // NaN and Infinity too, which the lenient reader reads as null: the same 'general' for this key
     let mut category = "general".to_string();
-    if let Some(obj) = json_object(&body) {
+    if let Some(obj) = py_json_loads_lenient(&body).ok().and_then(|v| v.as_object().cloned()) {
         if let Ok(c) = or_strip(obj.get("category"), "general") {
             category = if c.is_empty() { "general".to_string() } else { c };
         }
