@@ -56,6 +56,23 @@ impl Docs {
             .collect()
     }
 
+    /// python `_get_folder_path(folder)` for a folder argument that may be None (a JSON null). A None
+    /// folder fails on the first configured entry at `folder.rstrip()`, and is not found without entries.
+    fn folder_path_of(&self, folder: Option<&str>) -> anyhow::Result<Option<String>> {
+        match folder {
+            Some(f) => self.get_folder_path(f),
+            None => {
+                if let Some(first) = self.folder_items()?.first() {
+                    if first.as_str().is_none() {
+                        anyhow::bail!("'{}' object has no attribute 'rstrip'", util::py_type_name(first));
+                    }
+                    anyhow::bail!("'NoneType' object has no attribute 'rstrip'");
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// resolves a folder basename to its full path
     pub fn get_folder_path(&self, folder: &str) -> anyhow::Result<Option<String>> {
         let wanted = util::rstrip_sep(folder);
@@ -101,6 +118,15 @@ fn strip_folder(path: &str, folder: &str) -> String {
     }
 }
 
+/// a required string argument as python sees it: None for a JSON null (ToolArgs::str drops nulls, so
+/// they would otherwise read as ''), and '' for an absent key
+fn py_arg(args: &ToolArgs, key: &str) -> Option<String> {
+    match args.0.get(key) {
+        Some(Value::Null) => None,
+        _ => Some(args.str(key).unwrap_or_default()),
+    }
+}
+
 fn query_str(query: &Map<String, Value>, key: &str) -> String {
     query.get(key).filter(|v| !v.is_null()).map(py_str).unwrap_or_default()
 }
@@ -127,6 +153,10 @@ impl Module for Docs {
                 anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(&item));
             };
             let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(folder))?);
+            // a folder at the filesystem root is rstripped to ''; python os.makedirs('') raises ENOENT, std does not
+            if p.is_empty() {
+                anyhow::bail!("[Errno 2] No such file or directory: {}", util::repr_str(""));
+            }
             // python os.makedirs() raises ValueError for a NUL in the path; std reports a different text
             if p.contains('\0') {
                 anyhow::bail!("embedded null byte");
@@ -151,15 +181,16 @@ impl Module for Docs {
         match method {
             "get_topics" => Ok(self.base.result(json!(self.get_folder_names()?), true)),
             "list" => {
-                let folder = args.str("folder").unwrap_or_default();
+                let folder = py_arg(&args, "folder");
+                let folder_name = folder.clone().unwrap_or_else(|| "None".to_string());
                 let subfolder = args.str("subfolder");
                 let attempt = || -> Result<(Vec<String>, Vec<String>), Result<String, String>> {
-                    let folder_path = self.get_folder_path(&folder).map_err(|e| Err(e.to_string()))?;
+                    let folder_path = self.folder_path_of(folder.as_deref()).map_err(|e| Err(e.to_string()))?;
                     let Some(folder_path) = folder_path.filter(|p| !p.is_empty()) else {
-                        return Err(Ok(format!("Folder '{}' does not exist within the docs module configuration.", folder)));
+                        return Err(Ok(format!("Folder '{}' does not exist within the docs module configuration.", folder_name)));
                     };
                     let subfolder = match &subfolder {
-                        Some(s) if !s.is_empty() && s.starts_with(&folder) => Some(strip_folder(s, &folder)),
+                        Some(s) if !s.is_empty() && s.starts_with(&folder_name) => Some(strip_folder(s, &folder_name)),
                         other => other.clone(),
                     };
                     let base_path = ol_core::paths::sandbox_path(&folder_path, Some(subfolder.as_deref().unwrap_or(""))).map_err(|e| Err(e.to_string()))?;
@@ -171,9 +202,17 @@ impl Module for Docs {
                 }
             }
             "read" => {
-                let folder = args.str("folder").unwrap_or_default();
-                let path = args.str("path").unwrap_or_default();
-                let folder_path = self.get_folder_path(&folder)?;
+                let folder = py_arg(&args, "folder");
+                let path = py_arg(&args, "path");
+                let folder_path = self.folder_path_of(folder.as_deref())?;
+                // python `path.startswith(folder)` runs before the folder check: a None path fails on the
+                // attribute lookup, and a None folder fails as the argument of startswith
+                let Some(path) = path else {
+                    anyhow::bail!("'NoneType' object has no attribute 'startswith'");
+                };
+                let Some(folder) = folder else {
+                    anyhow::bail!("startswith first arg must be str or a tuple of str, not NoneType");
+                };
                 let path = strip_folder(&path, &folder);
                 let Some(folder_path) = folder_path.filter(|p| !p.is_empty()) else {
                     return Ok(self.base.result(json!(format!("Folder '{}' does not exist within the docs module configuration.", folder)), false));
@@ -419,5 +458,39 @@ mod tests {
         let err = block_on(m.on_ready()).unwrap_err();
         assert_eq!(err.to_string(), "embedded null byte");
         assert!(m.disabled_tools().is_empty());
+    }
+
+    #[test]
+    fn root_folder_fails_makedirs_like_python() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // "/" is rstripped to '' and python os.makedirs('') raises ENOENT before get_topics is disabled
+        let m = install_config(json!(["/"]), true);
+        let err = block_on(m.on_ready()).unwrap_err();
+        assert_eq!(err.to_string(), "[Errno 2] No such file or directory: ''");
+        assert!(m.disabled_tools().is_empty());
+    }
+
+    #[test]
+    fn null_arguments_take_python_none_paths() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // list(folder=None) with folders: folder.rstrip() fails, caught by list and returned as an error
+        let (m, _dir) = setup(true);
+        let out = block_on(m.call_tool("list", args(json!({"folder": null})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "'NoneType' object has no attribute 'rstrip'"}));
+        // list(folder=None) without folders: the folder is reported as 'None'
+        let m = install_config(json!([]), true);
+        let out = block_on(m.call_tool("list", args(json!({"folder": null})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "Folder 'None' does not exist within the docs module configuration."}));
+        // read(path=None) raises outside any try, so the call itself fails
+        let (m, _dir) = setup(true);
+        let err = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": null})))).unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'startswith'");
+        // read(folder=None) with folders fails at folder.rstrip() in _get_folder_path
+        let err = block_on(m.call_tool("read", args(json!({"folder": null, "path": "a.md"})))).unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'rstrip'");
+        // without folders the lookup returns None, and path.startswith(None) fails
+        let m = install_config(json!([]), true);
+        let err = block_on(m.call_tool("read", args(json!({"folder": null, "path": "a.md"})))).unwrap_err();
+        assert_eq!(err.to_string(), "startswith first arg must be str or a tuple of str, not NoneType");
     }
 }
