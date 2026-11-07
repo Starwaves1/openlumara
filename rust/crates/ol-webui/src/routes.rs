@@ -52,9 +52,9 @@ pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
         .route("/api/chat/delete/{chat_id}", post(chat_delete_by_id))
         .route("/api/chat/set-category/{chat_id}", post(chat_set_category))
         .route("/api/input_history", get_only(input_history_get).post(input_history_add))
-        .route("/api/settings/load", get(settings_load))
-        .route("/api/check_connection", get(check_connection))
-        .route("/api/models", get(models_get))
+        .route("/api/settings/load", get_only(settings_load))
+        .route("/api/check_connection", get_only(check_connection))
+        .route("/api/models", get_only(models_get))
         .route("/api/model/set", post(model_set))
         .route("/api/settings/save", post(settings_save))
         .route("/api/reconnect", post(reconnect))
@@ -742,9 +742,13 @@ async fn model_set(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
 async fn settings_save(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
     let Some(obj) = json_object(&body) else { return internal_error() };
+    // python: list(data.get("changed_modules", [])). list() of a string is its characters and of a dict its keys;
+    // list() of a number, bool or null raises, which is a plain 500
     let changed_modules: Vec<String> = match obj.get("changed_modules") {
         None => Vec::new(),
         Some(Value::Array(items)) => items.iter().map(py_str).collect(),
+        Some(Value::String(s)) => s.chars().map(String::from).collect(),
+        Some(Value::Object(m)) => m.keys().cloned().collect(),
         Some(_) => return internal_error(),
     };
     let categories = match obj.get("categories") {

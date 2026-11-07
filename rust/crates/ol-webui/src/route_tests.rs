@@ -1183,3 +1183,122 @@ async fn chat_write_routes_answer_get_with_405_allow_post() {
         assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "GET {uri}");
     }
 }
+
+#[tokio::test]
+async fn settings_load_returns_the_render_ready_categories_and_the_unsafe_flag() {
+    let h = harness(false).await;
+    let resp = h.get("/api/settings/load").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true));
+    let data = body["data"].as_object().expect("settings data is an object");
+    assert_eq!(data.keys().map(String::as_str).collect::<Vec<_>>(), ["categories", "show_unsafe_settings"]);
+    assert!(data["categories"].is_object(), "categories: {}", data["categories"]);
+    assert_eq!(data["show_unsafe_settings"], json!(false));
+
+    ol_core::config::update(|c| {
+        c.insert("channels".to_string(), json!({"settings": {"webui": {"show_unsafe_settings": true}}}));
+    });
+    assert_eq!(h.ch.config.get1("show_unsafe_settings"), Some(json!(true)));
+    let unsafe_on = h.get("/api/settings/load").await.json();
+    assert_eq!(unsafe_on["data"]["show_unsafe_settings"], json!(true));
+
+    // a HEAD on a python @app.get route is starlette's 405 with Allow: GET, not the body
+    let head = h.send(request(Method::HEAD, "/api/settings/load", None, None, "")).await;
+    assert_eq!(head.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(head.headers.get(header::ALLOW).unwrap(), "GET");
+    assert!(head.body.is_empty());
+}
+
+#[tokio::test]
+async fn check_connection_and_models_follow_the_api_connection() {
+    let h = harness(false).await;
+    set_api_url("http://API_URL_HERE/v1");
+    // python answers the plain string with success false while the api is not connected
+    let offline = h.get("/api/check_connection").await;
+    assert_eq!(offline.json(), json!({"data": "not connected", "success": false}));
+
+    set_api_url(&mock_api().await);
+    let models = h.get("/api/models").await;
+    assert_eq!(models.status, StatusCode::OK);
+    assert_eq!(models.json(), json!({"data": [], "success": true}));
+    // the first models call connected the api, so the connection check now answers True
+    let online = h.get("/api/check_connection").await;
+    assert_eq!(online.json(), json!({"data": true, "success": true}));
+}
+
+#[tokio::test]
+async fn models_reports_a_failed_listing_as_the_error_string() {
+    let h = harness(false).await;
+    set_api_url("http://API_URL_HERE/v1");
+    let resp = h.get("/api/models").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(false));
+    assert!(body["data"].is_string(), "error envelope data: {body}");
+    let offline = h.get("/api/check_connection").await;
+    assert_eq!(offline.json()["success"], json!(false));
+}
+
+#[tokio::test]
+async fn model_set_stores_the_stripped_name_and_rejects_an_empty_one() {
+    let h = harness(false).await;
+    let empty = h.send(post_json("/api/model/set", r#"{"name": "   "}"#)).await;
+    assert_eq!(empty.json(), json!({"data": "Model name cannot be empty", "success": false}));
+    let missing = h.send(post_json("/api/model/set", "{}")).await;
+    assert_eq!(missing.json(), json!({"data": "Model name cannot be empty", "success": false}));
+
+    let set = h.send(post_json("/api/model/set", r#"{"name": "  qwen-3  "}"#)).await;
+    assert_eq!(set.json(), json!({"data": {"name": "qwen-3"}, "success": true}));
+    assert_eq!(ol_core::config::get_str(&["model", "name"]).as_deref(), Some("qwen-3"));
+
+    // python's .strip() on a non-string raises, and a non-object body raises at .get(): both plain 500s
+    let number = h.send(post_json("/api/model/set", r#"{"name": 5}"#)).await;
+    assert_eq!(number.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let list = h.send(post_json("/api/model/set", "[]")).await;
+    assert_eq!(list.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(ol_core::config::get_str(&["model", "name"]).as_deref(), Some("qwen-3"));
+}
+
+#[tokio::test]
+async fn settings_save_writes_the_config_and_flags_a_module_change_as_a_restart() {
+    let h = harness(false).await;
+    let categories = json!({
+        "modules": {"isModuleCategory": true, "enabled": ["alpha"], "disabled": ["beta"]},
+    });
+    let body = json!({"categories": categories, "changed_modules": []});
+    let resp = h.send(post_json("/api/settings/save", &body.to_string())).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({"data": {"requires_restart": true, "requires_reconnect": false}, "success": true})
+    );
+    assert_eq!(ol_core::config::snapshot()["modules"], json!({"enabled": ["alpha"], "disabled": ["beta"]}));
+}
+
+#[tokio::test]
+async fn settings_save_flags_an_api_only_change_as_a_reconnect() {
+    let h = harness(false).await;
+    set_api_url("http://old.example/v1");
+    // the saved tree has no api section, so the api differs while no module list does
+    let body = json!({"categories": {}});
+    let resp = h.send(post_json("/api/settings/save", &body.to_string())).await;
+    assert_eq!(
+        resp.json(),
+        json!({"data": {"requires_restart": false, "requires_reconnect": true}, "success": true})
+    );
+    // the saved tree replaced the config, so the old url is gone (a read of the empty config falls back to the defaults)
+    assert_ne!(ol_core::config::get_str(&["api", "url"]).as_deref(), Some("http://old.example/v1"));
+}
+
+#[tokio::test]
+async fn settings_save_rejects_a_non_object_body_and_bad_changed_modules() {
+    let h = harness(false).await;
+    for body in ["[]", r#"{"changed_modules": 5, "categories": {}}"#, r#"{"changed_modules": null, "categories": {}}"#] {
+        let resp = h.send(post_json("/api/settings/save", body)).await;
+        assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR, "body {body}");
+    }
+    // python list("ab") is ["a", "b"]; a string without any module names still saves the empty tree
+    let resp = h.send(post_json("/api/settings/save", r#"{"changed_modules": "ab", "categories": {}}"#)).await;
+    assert_eq!(resp.json(), json!({"data": {"requires_restart": false, "requires_reconnect": false}, "success": true}));
+}
