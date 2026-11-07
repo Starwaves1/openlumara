@@ -23,6 +23,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub fn add_routes(router: Router<Arc<Shared>>, app: &Arc<Shared>) -> Router<Arc<Shared>> {
     router
         .nest_service("/assets", ServeDir::new(app.webui_dir.join("assets")).append_index_html_on_directories(false))
+        .route("/ext-assets/{module_name}/", get(ext_module_assets_root))
         .route("/ext-assets/{module_name}/{*asset_path}", get(ext_module_assets))
         .route("/api/themes", get(get_themes))
         .route("/api/themes/{family_name}", get(get_theme))
@@ -48,11 +49,21 @@ fn real(path: &FsPath) -> Option<PathBuf> {
 
 /// python `module_dir` lookup + realpath containment check for `/ext-assets/<module>/<path>`
 async fn ext_module_assets(State(app): State<Arc<Shared>>, Path((module_name, asset_path)): Path<(String, String)>, req: Request) -> Response {
-    let Some(module_dir) = app.asset_dirs().remove(&module_name) else {
+    serve_ext_asset(&app, &module_name, &asset_path, req).await
+}
+
+/// `/ext-assets/<module>/` with an empty asset path: starlette's `{asset_path:path}` matches the empty
+/// remainder, so python runs the same lookup with `""` (which is the module dir itself, never a file)
+async fn ext_module_assets_root(State(app): State<Arc<Shared>>, Path(module_name): Path<String>, req: Request) -> Response {
+    serve_ext_asset(&app, &module_name, "", req).await
+}
+
+async fn serve_ext_asset(app: &Shared, module_name: &str, asset_path: &str, req: Request) -> Response {
+    let Some(module_dir) = app.asset_dirs().remove(module_name) else {
         return detail_response(StatusCode::NOT_FOUND, "Unknown module or no assets");
     };
     let root = real(&module_dir).unwrap_or(module_dir.clone());
-    let full = real(&module_dir.join(&asset_path));
+    let full = real(&module_dir.join(asset_path));
     match full {
         Some(full) if full.starts_with(&root) && full != root && full.is_file() => serve_file(full, req).await,
         _ => detail_response(StatusCode::NOT_FOUND, "Asset not found"),

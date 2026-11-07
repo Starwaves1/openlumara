@@ -287,6 +287,17 @@ async fn ext_api_parses_a_json_body_with_a_utf8_bom_like_python() {
 }
 
 #[tokio::test]
+async fn ext_assets_with_an_empty_asset_path_answer_like_python() {
+    // python: `{asset_path:path}` matches the empty remainder, and the module lookup runs first
+    let h = harness(false).await;
+    let unknown = h.get("/ext-assets/nobody/").await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.json(), json!({"detail": "Unknown module or no assets"}));
+    let missing = h.get("/ext-assets/nobody/a.css").await;
+    assert_eq!(missing.json(), json!({"detail": "Unknown module or no assets"}));
+}
+
+#[tokio::test]
 async fn ext_api_rejects_the_wrong_method_and_unknown_routes_like_python() {
     let h = harness_with_probe().await;
     let wrong = h.send(request(Method::POST, "/api/ext/probe/ping", None, None, "")).await;

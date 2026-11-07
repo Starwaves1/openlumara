@@ -345,7 +345,7 @@ static DECIMAL_DIGIT: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\p{Nd}$").unwrap(
 /// value of a unicode decimal digit (category Nd), as python's int() accepts them.
 /// unicode guarantees each Nd run is made of blocks of ten digits that start at zero,
 /// so the offset from the start of the contiguous run gives the digit value
-fn decimal_value(c: char) -> Option<u32> {
+pub fn decimal_value(c: char) -> Option<u32> {
     if c.is_ascii_digit() {
         return Some(c as u32 - '0' as u32);
     }
@@ -358,6 +358,12 @@ fn decimal_value(c: char) -> Option<u32> {
         start -= 1;
     }
     Some((c as u32 - start) % 10)
+}
+
+/// `text` with every unicode decimal digit replaced by its ascii digit, for parsers that only take ascii
+/// digits (python's int() and float() accept any Nd digit in a str)
+pub fn ascii_decimal_digits(text: &str) -> String {
+    text.chars().map(|c| decimal_value(c).map(|d| char::from(b'0' + d as u8)).unwrap_or(c)).collect()
 }
 
 /// python `int(str)`: surrounding whitespace (python's definition) allowed, optional sign,

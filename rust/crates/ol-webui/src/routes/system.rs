@@ -3,6 +3,7 @@
 //! api routes; the GET routes are `@app.get` in python, so they answer HEAD and other methods with 405.
 
 use crate::server::{api_result, get_only, internal_error, Shared};
+use crate::util::ascii_decimal_digits;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -99,7 +100,8 @@ fn py_int_from_float(f: f64) -> Result<PyInt, String> {
 
 /// python `int(str)`: surrounding whitespace, an optional sign, and digits with single underscores between them
 fn py_int_from_str(s: &str) -> Option<PyInt> {
-    let t = s.trim();
+    let digits = ascii_decimal_digits(s.trim());
+    let t = digits.as_str();
     let (negative, body) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -149,7 +151,8 @@ fn py_float(v: &Value) -> Option<f64> {
 
 /// python `float(str)`: surrounding whitespace, and single underscores only between two digits (so '1_0' is 10.0)
 fn py_float_str(s: &str) -> Option<f64> {
-    let t = s.trim();
+    let digits = ascii_decimal_digits(s.trim());
+    let t = digits.as_str();
     let bytes = t.as_bytes();
     for (i, b) in bytes.iter().enumerate() {
         if *b == b'_' {
@@ -323,6 +326,18 @@ mod tests {
         assert_eq!(py_float(&json!("1__0")), None);
         assert_eq!(py_float(&json!("_1")), None);
         assert_eq!(py_float(&json!("1_")), None);
+    }
+
+    #[test]
+    fn py_int_and_py_float_take_unicode_decimal_digits_like_python() {
+        // python: int('\u{661}\u{662}') == 12 (arabic-indic digits), int('\u{663}_\u{664}') == 34, float('\u{661}_\u{662}') == 12.0
+        assert_eq!(py_int(&json!("\u{661}\u{662}")), Ok(PyInt("12".into())));
+        assert_eq!(py_int(&json!("\u{663}_\u{664}")), Ok(PyInt("34".into())));
+        assert_eq!(py_float(&json!("\u{661}\u{662}")), Some(12.0));
+        assert_eq!(py_float(&json!("\u{661}_\u{662}")), Some(12.0));
+        // a unicode digit does not make underscores legal where python rejects them
+        assert_eq!(py_float(&json!("\u{661}__\u{662}")), None);
+        assert!(py_int(&json!("\u{661}x")).is_err());
     }
 
     #[test]

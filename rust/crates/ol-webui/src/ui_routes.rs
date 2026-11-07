@@ -3,7 +3,7 @@
 //! wrapped in the api envelope.
 
 use crate::server::{api_result, internal_error, method_not_allowed_allowing, module_ui_enabled, slash_redirect, Shared};
-use crate::util::py_strip_lower;
+use crate::util::{py_json_loads_python_only_true, py_strip_lower};
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::handler::Handler;
@@ -108,6 +108,16 @@ async fn ext_api_root(
     dispatch(app, module_name, String::new(), method, raw_query, body).await
 }
 
+/// python `await request.json()` for a non-GET ext api request, or None where python's `except` gives None.
+/// python's json.loads takes NaN, Infinity and -Infinity, so those bodies go through
+/// `py_json_loads_python_only_true` (read as `true`) rather than failing like serde_json does
+fn ext_request_body(method: &Method, body: &[u8]) -> Option<Value> {
+    if *method == Method::GET {
+        return None;
+    }
+    py_json_loads_python_only_true(body).ok().filter(|v| !v.is_null())
+}
+
 async fn dispatch(
     app: Arc<Shared>,
     module_name: String,
@@ -133,12 +143,7 @@ async fn dispatch(
 
     // python: request.json() for every method but GET; a failed parse or a JSON null is None.
     // json.loads on bytes accepts a UTF-8 BOM (detect_encoding picks utf-8-sig), serde_json does not
-    let json_body = if method == Method::GET {
-        None
-    } else {
-        let bytes = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&body);
-        serde_json::from_slice::<Value>(bytes).ok().filter(|v| !v.is_null())
-    };
+    let json_body = ext_request_body(&method, &body);
 
     match module.ui_route(&wanted, method_name, json_body, query_map(raw_query.as_deref())).await {
         Ok(outcome) => {
@@ -163,6 +168,7 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn query_keeps_last_value_of_repeated_keys() {
@@ -171,6 +177,17 @@ mod tests {
         assert_eq!(q.get("b"), Some(&Value::String("x y".into())));
         assert_eq!(q.keys().collect::<Vec<_>>(), vec!["a", "b"]);
         assert!(query_map(None).is_empty());
+    }
+
+    #[test]
+    fn ext_request_body_reads_bodies_like_python_request_json() {
+        // python: GET never reads a body; json.loads takes NaN and a BOM; a null or a bad body is None
+        assert_eq!(ext_request_body(&Method::GET, br#"{"x": 1}"#), None);
+        assert_eq!(ext_request_body(&Method::POST, br#"{"x": 1}"#), Some(json!({"x": 1})));
+        assert_eq!(ext_request_body(&Method::POST, "\u{feff}{\"x\": 1}".as_bytes()), Some(json!({"x": 1})));
+        assert_eq!(ext_request_body(&Method::POST, br#"{"x": NaN}"#), Some(json!({"x": true})));
+        assert_eq!(ext_request_body(&Method::POST, b"null"), None);
+        assert_eq!(ext_request_body(&Method::POST, b"{x"), None);
     }
 
     #[test]
