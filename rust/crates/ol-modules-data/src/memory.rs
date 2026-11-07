@@ -3,7 +3,7 @@
 #[path = "../../../generated/modules/memory.rs"]
 pub mod meta;
 
-use crate::util::{body_get, dict_body, iso, now, py_type, query_str, round2, truthy_opt};
+use crate::util::{body_get, dict_body, iso, now, py_strip, py_type, query_str, round2, truthy_opt};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -66,26 +66,34 @@ fn search_content_flag(query: &Map<String, Value>) -> bool {
     !matches!(query_str(query, "search_content", "true").to_lowercase().as_str(), "false" | "0" | "no")
 }
 
+/// python `mem.get(key)` on a stored entry. only a dict has `get`: any other entry raises AttributeError
+fn entry_get<'a>(mem: &'a Value, key: &str) -> anyhow::Result<Option<&'a Value>> {
+    match mem {
+        Value::Object(o) => Ok(o.get(key)),
+        other => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+    }
+}
+
 /// compact JSON shape used by the webui memory sidebar
-fn ui_item(mem: &Value, score: Option<f64>) -> Value {
-    let tags = mem.get("tags").filter(|t| truthy(t)).cloned().unwrap_or(json!([]));
+fn ui_item(mem: &Value, score: Option<f64>) -> anyhow::Result<Value> {
+    let tags = entry_get(mem, "tags")?.filter(|t| truthy(t)).cloned().unwrap_or(json!([]));
     let mut item = json!({
-        "id": mem.get("id").cloned().unwrap_or(Value::Null),
-        "content": mem.get("content").cloned().unwrap_or(json!("")),
+        "id": entry_get(mem, "id")?.cloned().unwrap_or(Value::Null),
+        "content": entry_get(mem, "content")?.cloned().unwrap_or(json!("")),
         "tags": tags,
-        "pinned": truthy_opt(mem.get("pinned")),
-        "date_created": mem.get("date_created").cloned().unwrap_or(json!("")),
+        "pinned": truthy_opt(entry_get(mem, "pinned")?),
+        "date_created": entry_get(mem, "date_created")?.cloned().unwrap_or(json!("")),
     });
     if let Some(s) = score {
         item["score"] = json!(round2(s));
     }
-    item
+    Ok(item)
 }
 
 /// python `for tag in mem.get("tags", []) or []`: a list yields its items, a string its characters, a dict its
 /// keys; any other truthy value raises TypeError
 fn tag_items(mem: &Value) -> anyhow::Result<Vec<Value>> {
-    Ok(match mem.get("tags").filter(|t| truthy(t)) {
+    Ok(match entry_get(mem, "tags")?.filter(|t| truthy(t)) {
         None => vec![],
         Some(Value::Array(a)) => a.clone(),
         Some(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
@@ -160,11 +168,27 @@ fn query_limit(query: &Map<String, Value>, key: &str, default: i128) -> i128 {
 /// case-insensitive tag filter used by the webui routes
 fn matches_tag(mem: &Value, tag: Option<&Value>) -> anyhow::Result<bool> {
     let Some(tag) = tag.filter(|t| truthy(t)) else { return Ok(true) };
-    let wanted = py_str(tag).trim().to_lowercase();
+    let wanted = py_strip(&py_str(tag)).to_lowercase();
     if wanted.is_empty() {
         return Ok(true);
     }
-    Ok(tag_items(mem)?.iter().any(|t| py_str(t).trim().to_lowercase() == wanted))
+    Ok(tag_items(mem)?.iter().any(|t| py_strip(&py_str(t)).to_lowercase() == wanted))
+}
+
+/// python `_route_tags` tag collection: every stripped, non-empty tag of the entries, sorted case-insensitively
+fn sorted_tags(entries: &[Value]) -> anyhow::Result<Vec<String>> {
+    let mut tags: Vec<String> = Vec::new();
+    for mem in entries {
+        for tag in tag_items(mem)? {
+            let t = py_strip(&py_str(&tag)).to_string();
+            if !t.is_empty() && !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+    }
+    tags.sort();
+    tags.sort_by_key(|t| t.to_lowercase());
+    Ok(tags)
 }
 
 impl Memory {
@@ -195,11 +219,11 @@ impl Memory {
     /// scans, so a stored id that is not a string raises as soon as the scan reaches that memory
     fn get_index(data: &[Value], id: &str) -> anyhow::Result<i64> {
         for (i, mem) in data.iter().enumerate() {
-            let stored = match mem.get("id") {
+            let stored = match entry_get(mem, "id")? {
                 Some(Value::String(s)) => s.as_str(),
                 other => anyhow::bail!("'{}' object has no attribute 'strip'", other.map_or("NoneType", py_type)),
             };
-            if id.trim() == stored.trim() {
+            if py_strip(id) == py_strip(stored) {
                 return Ok(i as i64);
             }
         }
@@ -357,11 +381,17 @@ impl Memory {
     fn route_tags(&self, query: &Map<String, Value>) -> anyhow::Result<Value> {
         self.reload()?;
         let tab = query_str(query, "tab", "all").to_lowercase();
-        let q = query_str(query, "q", "").trim().to_string();
+        let q = py_strip(&query_str(query, "q", "")).to_string();
         let limit = query_limit(query, "limit", 200).clamp(1, 500);
         let all = self.entries()?;
         let entries: Vec<Value> = if tab == "pinned" {
-            all.into_iter().filter(|m| truthy_opt(m.get("pinned"))).collect()
+            let mut pinned = Vec::new();
+            for mem in all {
+                if truthy_opt(entry_get(&mem, "pinned")?) {
+                    pinned.push(mem);
+                }
+            }
+            pinned
         } else if tab == "search" && !q.is_empty() {
             search_entries(&all, &q, search_content_flag(query), limit as usize)
                 .into_iter()
@@ -371,18 +401,7 @@ impl Memory {
         } else {
             all
         };
-        let mut tags: Vec<String> = Vec::new();
-        for mem in &entries {
-            for tag in tag_items(mem)? {
-                let t = py_str(&tag).trim().to_string();
-                if !t.is_empty() && !tags.contains(&t) {
-                    tags.push(t);
-                }
-            }
-        }
-        tags.sort();
-        tags.sort_by_key(|t| t.to_lowercase());
-        Ok(json!(tags))
+        Ok(json!(sorted_tags(&entries)?))
     }
 
     fn route_list(&self, query: &Map<String, Value>, pinned_only: bool) -> anyhow::Result<Value> {
@@ -391,13 +410,13 @@ impl Memory {
         let tag = query.get("tag");
         let mut items = Vec::new();
         for mem in self.entries()?.iter().rev() {
-            if pinned_only && !truthy_opt(mem.get("pinned")) {
+            if pinned_only && !truthy_opt(entry_get(mem, "pinned")?) {
                 continue;
             }
             if !matches_tag(mem, tag)? {
                 continue;
             }
-            items.push(ui_item(mem, None));
+            items.push(ui_item(mem, None)?);
             if (!pinned_only || limit != 0) && items.len() as i128 >= limit {
                 break;
             }
@@ -407,7 +426,7 @@ impl Memory {
 
     fn route_search(&self, query: &Map<String, Value>) -> anyhow::Result<Value> {
         self.reload()?;
-        let q = query_str(query, "q", "").trim().to_string();
+        let q = py_strip(&query_str(query, "q", "")).to_string();
         if q.is_empty() {
             return Ok(json!([]));
         }
@@ -422,11 +441,11 @@ impl Memory {
         if entries.is_empty() {
             return Ok(json!([]));
         }
-        let items: Vec<Value> = search_entries(&entries, &q, search_content_flag(query), limit as usize)
+        let items = search_entries(&entries, &q, search_content_flag(query), limit as usize)
             .into_iter()
             .filter(|(entry, _)| truthy(entry))
             .map(|(entry, score)| ui_item(&entry, Some(score)))
-            .collect();
+            .collect::<anyhow::Result<Vec<Value>>>()?;
         Ok(Value::Array(items))
     }
 
@@ -434,14 +453,14 @@ impl Memory {
         self.reload()?;
         let content = body_get(body, "content");
         let content = match content {
-            Some(c) if !c.is_null() && !py_str(&c).trim().is_empty() => py_str(&c).trim().to_string(),
+            Some(c) if !c.is_null() && !py_strip(&py_str(&c)).is_empty() => py_strip(&py_str(&c)).to_string(),
             _ => return Ok(self.base.result("memory content cannot be empty", false)),
         };
         let tags: Vec<Value> = match body_get(body, "tags") {
             Some(Value::Array(a)) => a,
             _ => vec![],
         };
-        let tags: Vec<Value> = tags.iter().map(|t| py_str(t).trim().to_string()).filter(|t| !t.is_empty()).map(Value::String).collect();
+        let tags: Vec<Value> = tags.iter().map(|t| py_strip(&py_str(t)).to_string()).filter(|t| !t.is_empty()).map(Value::String).collect();
         let Some(id) = self.lookup_id(mem_id)? else {
             return Ok(self.base.result("memory with that ID not found!", false));
         };
@@ -595,8 +614,32 @@ mod tests {
     #[test]
     fn ui_item_shape() {
         let m = json!({"id": "A", "content": "c", "tags": null, "pinned": 1});
-        let i = ui_item(&m, Some(1.23456));
+        let i = ui_item(&m, Some(1.23456)).unwrap();
         assert_eq!(i, json!({"id": "A", "content": "c", "tags": [], "pinned": true, "date_created": "", "score": 1.23}));
+    }
+
+    #[test]
+    fn separator_chars_are_stripped_like_python() {
+        // python str.strip() removes U+001C..U+001F, rust trim() does not
+        assert_eq!(Memory::get_index(&[json!({"id": "\u{1c}ab\u{1c}"})], "ab\u{1f}").unwrap(), 0);
+        assert!(matches_tag(&json!({"tags": ["\u{1f}Food"]}), Some(&json!("food\u{1c}"))).unwrap());
+        // a tag that is only separators is empty after strip, so python's filter matches everything
+        assert!(matches_tag(&json!({"tags": []}), Some(&json!("\u{1c}"))).unwrap());
+        // ...and a tag that is only separators is dropped from the tag list
+        assert_eq!(sorted_tags(&[json!({"tags": ["\u{1c}", " b\u{1f}"]})]).unwrap(), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn non_dict_entries_raise_like_python_mem_get() {
+        // python: mem.get(...) on a str entry raises AttributeError, so the route reports the error
+        let err = ui_item(&json!("note"), None).unwrap_err();
+        assert_eq!(err.to_string(), "'str' object has no attribute 'get'");
+        let err = Memory::get_index(&[json!("note")], "x").unwrap_err();
+        assert_eq!(err.to_string(), "'str' object has no attribute 'get'");
+        let err = sorted_tags(&[json!(["tag-list"])]).unwrap_err();
+        assert_eq!(err.to_string(), "'list' object has no attribute 'get'");
+        let err = entry_get(&json!(null), "pinned").unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'get'");
     }
 
     #[test]
