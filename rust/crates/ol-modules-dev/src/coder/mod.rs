@@ -53,9 +53,79 @@ fn sget(m: &Map<String, Value>, key: &str) -> String {
     }
 }
 
+/// `(body or {}).get(key, "")` followed by `if not value`: a falsy value (0, false, [], {})
+/// counts as missing, like null, instead of being stringified
+fn sget_required(m: &Map<String, Value>, key: &str) -> String {
+    if present(m, key) {
+        sget(m, key)
+    } else {
+        String::new()
+    }
+}
+
 /// python truthiness of a str-or-other value fetched with a "" default
 fn present(m: &Map<String, Value>, key: &str) -> bool {
     m.get(key).map(truthy).unwrap_or(false)
+}
+
+/// python's type name for a JSON value, as it appears in TypeError/AttributeError text
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) => {
+            if n.is_f64() {
+                "float"
+            } else {
+                "int"
+            }
+        }
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// python's `(body or {})` in the coder's POST routes: a truthy body that is not a dict makes
+/// `.get` raise AttributeError, which the webui reports with that exception text
+fn body_dict(path: &str, body: Option<Value>) -> anyhow::Result<Map<String, Value>> {
+    match body {
+        Some(Value::Object(m)) => Ok(m),
+        Some(v) if truthy(&v) && matches!(path, "save" | "lint" | "create" | "move" | "delete" | "duplicate") => {
+            anyhow::bail!("'{}' object has no attribute 'get'", py_type_name(&v))
+        }
+        _ => Ok(Map::new()),
+    }
+}
+
+/// python's `(body or {}).get("content", "")` passed on unchanged: only a str can be written or
+/// linted. Err carries the python type name of the value that was given.
+fn raw_content(m: &Map<String, Value>) -> Result<String, &'static str> {
+    match m.get("content") {
+        None => Ok(String::new()),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(v) => Err(py_type_name(v)),
+    }
+}
+
+/// the language python's treesitter gate checks for this path (None: the gate lets it through)
+fn checked_language(file_path: &str) -> Option<&'static str> {
+    let lang = syntax::detect_language_from_path(file_path)?;
+    (!matches!(lang, "vimdoc" | "html" | "htm")).then_some(lang)
+}
+
+const PARSE_FAILED: &str = "Failed to parse the file for syntax errors. For safety, the file was not written to disk.";
+
+/// python `_check_syntax`: the save gate's error list for a file's content
+fn syntax_errors(code: &str, file_path: &str) -> Vec<String> {
+    let Some(lang) = checked_language(file_path) else { return Vec::new() };
+    match syntax::diagnostics(code, lang) {
+        Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
+        // python: a falsy tslp result (parse failure) is refused; a language with no grammar
+        // compiled in is passed, like a language python's treesitter can't check
+        None if syntax::is_supported(lang) => vec![PARSE_FAILED.into()],
+        None => Vec::new(),
+    }
 }
 
 /// compile a user regex like python's `regex.compile(pattern, flags)`
@@ -382,18 +452,6 @@ impl Coder {
 
     // ---------------- treesitter helpers
 
-    fn check_syntax(&self, code: &str, file_path: &str) -> Vec<String> {
-        let Some(lang) = syntax::detect_language_from_path(file_path) else { return Vec::new() };
-        if matches!(lang, "vimdoc" | "html" | "htm") {
-            return Vec::new();
-        }
-        match syntax::diagnostics(code, lang) {
-            // language not compiled in: like an unsupported language in python, pass
-            None => Vec::new(),
-            Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
-        }
-    }
-
     // ---------------- template helpers
 
     fn get_template_folders(&self) -> Vec<String> {
@@ -553,7 +611,7 @@ impl Coder {
         let path = a.str_or("path", "");
         let content = a.str_or("content", "");
         let target = self.get_sandbox_subpath(&sandbox, &path).map_err(err)?;
-        let errors = self.check_syntax(&content, &target);
+        let errors = syntax_errors(&content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -752,7 +810,7 @@ impl Coder {
         if new_content == content {
             return Ok(self.result("Failed to match your original code string against the file contents. Try again!", false));
         }
-        let errors = self.check_syntax(&new_content, &target);
+        let errors = syntax_errors(&new_content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -868,9 +926,8 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let content = sget(b, "content");
+        let sandbox = sget_required(b, "sandbox");
+        let rel_path = sget_required(b, "path");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
@@ -878,7 +935,20 @@ impl Coder {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
-        let errors = self.check_syntax(&content, &target);
+        let content = match raw_content(b) {
+            Ok(c) => c,
+            Err(ty) => {
+                // python: a syntax-checked language raises inside tslp before the file is opened;
+                // any other language opens it with 'w' (truncating it) and then write() fails
+                if checked_language(&target).is_none() {
+                    if let Err(e) = pyos::write_file(&target, b"") {
+                        return self.result(e, false);
+                    }
+                }
+                return self.result(format!("write() argument must be str, not {}", ty), false);
+            }
+        };
+        let errors = syntax_errors(&content, &target);
         if !errors.is_empty() {
             return self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false);
         }
@@ -889,9 +959,8 @@ impl Coder {
     }
 
     fn route_lint(&self, b: &Map<String, Value>) -> Value {
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let content = sget(b, "content");
+        let sandbox = sget_required(b, "sandbox");
+        let rel_path = sget_required(b, "path");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
@@ -899,10 +968,13 @@ impl Coder {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
-        let Some(lang) = syntax::detect_language_from_path(&target) else { return json!({"annotations": []}) };
-        if matches!(lang, "vimdoc" | "html" | "htm") {
-            return json!({"annotations": []});
-        }
+        let Some(lang) = checked_language(&target) else { return json!({"annotations": []}) };
+        let content = match raw_content(b) {
+            Ok(c) => c,
+            // python: tslp.process(content) raises here and the error becomes the failure text
+            Err(ty) => return self.result(format!("write() argument must be str, not {}", ty), false),
+        };
+        // python: `if not result` (a parse failure) stays quiet while typing
         let diags = syntax::diagnostics(&content, lang).unwrap_or_default();
         let annotations: Vec<Value> = diags
             .iter()
@@ -923,8 +995,8 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
+        let sandbox = sget_required(b, "sandbox");
+        let rel_path = sget_required(b, "path");
         let is_dir = present(b, "is_dir");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
@@ -950,9 +1022,9 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let src = sget(b, "src");
-        let dst = sget(b, "dst");
+        let sandbox = sget_required(b, "sandbox");
+        let src = sget_required(b, "src");
+        let dst = sget_required(b, "dst");
         if sandbox.is_empty() || src.is_empty() || dst.is_empty() {
             return self.result("sandbox, src and dst are all required", false);
         }
@@ -975,8 +1047,8 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
+        let sandbox = sget_required(b, "sandbox");
+        let rel_path = sget_required(b, "path");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
@@ -999,8 +1071,8 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
+        let sandbox = sget_required(b, "sandbox");
+        let rel_path = sget_required(b, "path");
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
@@ -1796,7 +1868,7 @@ impl Module for Coder {
     }
 
     async fn ui_route(&self, path: &str, _method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
-        let b: Map<String, Value> = body.and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let b = body_dict(path, body)?;
         let q = &query;
         Ok(match path {
             "sandboxes" => self.route_sandboxes()?,
@@ -1869,5 +1941,44 @@ mod tests {
         // python quirk: context_lines[:1] includes the line *after* the match
         assert_eq!(b, vec![json!("b")]);
         assert_eq!(a, vec![json!("b")]);
+    }
+
+    #[test]
+    fn falsy_request_fields_are_missing_not_stringified() {
+        let b = json!({"sandbox": "s", "path": 0, "src": false, "dst": [], "content": null, "n": 5});
+        let m = b.as_object().unwrap();
+        assert_eq!(sget_required(m, "sandbox"), "s");
+        assert_eq!(sget_required(m, "path"), "");
+        assert_eq!(sget_required(m, "src"), "");
+        assert_eq!(sget_required(m, "dst"), "");
+        assert_eq!(sget_required(m, "absent"), "");
+        // truthy non-strings keep the stringified form
+        assert_eq!(sget_required(m, "n"), "5");
+        // a null content is not "" in python: write() gets None
+        assert_eq!(raw_content(m), Err("NoneType"));
+        assert_eq!(raw_content(json!({"content": "hi"}).as_object().unwrap()), Ok("hi".to_string()));
+        assert_eq!(raw_content(json!({}).as_object().unwrap()), Ok(String::new()));
+    }
+
+    #[test]
+    fn non_dict_bodies_match_python_get() {
+        let e = body_dict("save", Some(json!(["x"]))).unwrap_err();
+        assert_eq!(e.to_string(), "'list' object has no attribute 'get'");
+        assert!(body_dict("lint", Some(json!("abc"))).is_err());
+        assert!(body_dict("create", Some(json!(1.5))).is_err());
+        // falsy bodies are `{}` in python, and non-coder routes never fail on the body shape
+        assert!(body_dict("save", Some(json!([]))).unwrap().is_empty());
+        assert!(body_dict("git_status", Some(json!("abc"))).unwrap().is_empty());
+        assert_eq!(body_dict("save", Some(json!({"path": "a"}))).unwrap()["path"], "a");
+    }
+
+    #[test]
+    fn syntax_gate_reports_python_positions() {
+        // a language with no grammar compiled in passes the gate, as in python's unsupported case
+        assert!(syntax_errors("puts 'hi'\n", "a.rb").is_empty());
+        assert!(syntax_errors("x = 1\n", "a.py").is_empty());
+        let errs = syntax_errors("def f(:\n", "a.py");
+        assert!(!errs.is_empty());
+        assert!(errs.iter().all(|e| e.starts_with("Line 1, Col ")), "{:?}", errs);
     }
 }

@@ -553,6 +553,27 @@ pub fn copytree(src: &str, dst: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// shutil.copytree(src, dst, symlinks=True): links are recreated as links, not followed
+fn copytree_symlinks(src: &str, dst: &str) -> Result<(), String> {
+    let entries = std::fs::read_dir(src).map_err(|e| os_err(&e, src))?;
+    makedirs(dst, false)?;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let s = join(src, &name);
+        let d = join(dst, &name);
+        let ft = e.file_type().map_err(|err| os_err(&err, &s))?;
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&s).map_err(|err| os_err(&err, &s))?;
+            std::os::unix::fs::symlink(target, &d).map_err(|err| os_err(&err, &d))?;
+        } else if ft.is_dir() {
+            copytree_symlinks(&s, &d)?;
+        } else {
+            copy_file_with_meta(Path::new(&s), Path::new(&d)).map_err(|e| os_err(&e, &s))?;
+        }
+    }
+    Ok(())
+}
+
 /// shutil.rmtree
 pub fn rmtree(p: &str) -> Result<(), String> {
     std::fs::remove_dir_all(p).map_err(|e| os_err(&e, p))
@@ -585,7 +606,7 @@ pub fn shutil_move(src: &str, dst: &str) -> Result<(), String> {
                 if b.starts_with(&format!("{}/", a.trim_end_matches('/'))) {
                     return Err(format!("Cannot move a directory '{}' into itself '{}'.", src, real_dst));
                 }
-                copytree(src, &real_dst)?;
+                copytree_symlinks(src, &real_dst)?;
                 rmtree(src)
             } else {
                 if !exists(src) {
@@ -688,5 +709,19 @@ mod tests {
         assert_eq!(decode_utf8(b"ab\xff").unwrap_err(), "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte");
         assert_eq!(universal_newlines("a\r\nb\rc"), "a\nb\nc");
         assert_eq!(readlines("a\nb"), vec!["a\n", "b"]);
+    }
+
+    #[test]
+    fn copytree_symlinks_keeps_links_as_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(format!("{}/src/inner", root)).unwrap();
+        std::fs::write(format!("{}/src/inner/real.txt", root), "x").unwrap();
+        std::os::unix::fs::symlink("inner/real.txt", format!("{}/src/link.txt", root)).unwrap();
+        copytree_symlinks(&format!("{}/src", root), &format!("{}/dst", root)).unwrap();
+        let link = std::fs::symlink_metadata(format!("{}/dst/link.txt", root)).unwrap();
+        assert!(link.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(format!("{}/dst/link.txt", root)).unwrap().to_string_lossy(), "inner/real.txt");
+        assert_eq!(std::fs::read_to_string(format!("{}/dst/inner/real.txt", root)).unwrap(), "x");
     }
 }
