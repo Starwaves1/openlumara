@@ -1,0 +1,28 @@
+[package]
+name = "ol-modules-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ol-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+base64 = "0.22"
+tokio-util = "0.7"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2.4"
+flate2 = "1.0"
+
+[dev-dependencies]
+tempfile.workspace = true

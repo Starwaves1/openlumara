@@ -1,0 +1,424 @@
+//! Port of modules/web_reader/module.py: `WebReader`, a subclass of `Http` that scrapes the
+//! title, headers, paragraphs, images, links and class/id text out of web pages.
+//!
+//! Python subclasses `modules.http.Http`, so `WebReader` reuses `HttpCore` by composition
+//! (same security checks, rate limit, on_ready IP lookup). Its `settings` are inherited from
+//! `Http` in python, so the registry descriptor uses `http::meta::settings`.
+
+#[path = "../../../generated/modules/web_reader.rs"]
+pub mod meta;
+
+mod html_parser;
+
+use crate::http::{HttpCore, Method, RequestOpts};
+use crate::pytext::{py_split, py_strip, urlsplit};
+use crate::sanitize::ContentSanitizer;
+use crate::util::py_type_name;
+use anyhow::{anyhow, bail};
+use async_trait::async_trait;
+use html_parser::Document;
+use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
+use ol_core::pyjson::truthy;
+use regex::Regex;
+use serde_json::{json, Map, Value};
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+
+/// python `allowed_text_types`
+const ALLOWED_TEXT_TYPES: &[&str] = &[
+    "text/plain",
+    "text/markdown",
+    "text/x-markdown",
+    "application/markdown",
+    "application/json",
+    "text/html",
+    "application/xhtml+xml",
+    "application/xml",
+    "text/xml",
+];
+
+/// python `_process_webpage` class-name / id fallbacks, in python order
+const FALLBACK_NAMES: &[&str] = &["content", "description", "title", "text", "article"];
+
+const NOTHING_SCRAPED: &str = "nothing could be scraped from the page!";
+
+/// `Arc` fields so `read_multiple` can hand each item to a detached task (python's `gather` keeps
+/// sibling tasks running after one raises).
+#[derive(Clone)]
+pub struct WebReader {
+    base: Arc<ModuleBase>,
+    core: Arc<HttpCore>,
+}
+
+/// python `_remove_duplicates`: keep the first occurrence of each item, in order
+fn dedupe(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items.into_iter().filter(|s| seen.insert(s.clone())).collect()
+}
+
+/// python `element.text.strip()` if non-empty, appended to `items`
+fn push_stripped_text(doc: &Document, el: usize, items: &mut Vec<String>) {
+    let text = doc.get_text(el);
+    let stripped = py_strip(&text);
+    if !stripped.is_empty() {
+        items.push(stripped.to_string());
+    }
+}
+
+/// python `_process_webpage` class/id fallback: `{name: [text, ...]}` for names with matches
+fn fallback_classes(doc: &Document) -> Map<String, Value> {
+    let all = doc.elements(|_| true);
+    let mut out = Map::new();
+    for name in FALLBACK_NAMES {
+        let re = Regex::new(&format!(r"\b{}\b", name)).expect("static pattern");
+        let mut items: Vec<String> = Vec::new();
+        // find_all(class_=re): bs4 matches any class token of the multi-valued class attribute
+        for &el in &all {
+            if doc.attr(el, "class").is_some_and(|c| py_split(c).iter().any(|t| re.is_match(t))) {
+                push_stripped_text(doc, el, &mut items);
+            }
+        }
+        // find_all(id=re)
+        for &el in &all {
+            if doc.attr(el, "id").is_some_and(|i| re.is_match(i)) {
+                push_stripped_text(doc, el, &mut items);
+            }
+        }
+        let items = dedupe(items);
+        if !items.is_empty() {
+            let sanitized: Vec<Value> = items.iter().map(|s| json!(ContentSanitizer::sanitize_html_content(s))).collect();
+            out.insert(name.to_string(), Value::Array(sanitized));
+        }
+    }
+    out
+}
+
+/// python `_process_webpage(html)`: structured summary of an HTML/XML document
+fn process_webpage(html: &str) -> anyhow::Result<Value> {
+    let doc = html_parser::parse(html).map_err(|e| anyhow!(e))?;
+    let mut output = Map::new();
+
+    if let Some(&title) = doc.elements(|n| n == "title").first() {
+        output.insert("title".into(), json!(py_strip(&doc.get_text(title))));
+    }
+
+    let headers = dedupe(
+        doc.elements(|n| matches!(n, "h1" | "h2" | "h3" | "h4" | "h5" | "h6"))
+            .into_iter()
+            .map(|e| py_strip(&doc.get_text(e)).to_string())
+            .collect(),
+    );
+    let paragraphs = dedupe(
+        doc.elements(|n| n == "p").into_iter().map(|e| py_strip(&doc.get_text(e)).to_string()).collect(),
+    );
+    let images = dedupe(
+        doc.elements(|n| n == "img")
+            .into_iter()
+            .filter_map(|e| doc.attr(e, "alt"))
+            .filter(|alt| !alt.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    let urls = dedupe(
+        doc.elements(|n| n == "a").into_iter().filter_map(|e| doc.attr(e, "href")).map(|s| s.to_string()).collect(),
+    );
+
+    let sanitize_all = |items: &[String]| -> Value {
+        Value::Array(items.iter().map(|s| json!(ContentSanitizer::sanitize_html_content(s))).collect())
+    };
+    if !headers.is_empty() {
+        output.insert("headers".into(), sanitize_all(&headers));
+    }
+    if !paragraphs.is_empty() {
+        output.insert("paragraphs".into(), sanitize_all(&paragraphs));
+    }
+    if !images.is_empty() {
+        output.insert("images".into(), sanitize_all(&images));
+    }
+    if !urls.is_empty() {
+        output.insert("urls".into(), Value::Array(urls.into_iter().map(Value::String).collect()));
+    }
+
+    if headers.is_empty() && paragraphs.is_empty() {
+        let classes = fallback_classes(&doc);
+        if classes.is_empty() {
+            output.insert("message".into(), json!(NOTHING_SCRAPED));
+        } else {
+            output.insert("classes".into(), Value::Object(classes));
+        }
+    }
+
+    Ok(Value::Object(output))
+}
+
+/// python `asyncio.Semaphore(value)`: any non-negative number is accepted, and a fractional value
+/// admits `ceil(value)` holders (asyncio admits a waiter while the value is > 0). Tokio panics above
+/// `Semaphore::MAX_PERMITS`; a semaphore that large never blocks, so capping it changes nothing.
+fn permits_from(v: &Value) -> anyhow::Result<usize> {
+    match v {
+        Value::Bool(b) => Ok(usize::from(*b)),
+        Value::Number(n) => {
+            let f = n.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                bail!("Semaphore initial value must be >= 0");
+            }
+            let cap = Semaphore::MAX_PERMITS;
+            if f >= cap as f64 {
+                Ok(cap)
+            } else {
+                Ok(f.ceil() as usize)
+            }
+        }
+        other => bail!("'<' not supported between instances of '{}' and 'int'", py_type_name(other)),
+    }
+}
+
+/// python `for x in iterable` over a tool argument
+fn py_iterate(v: &Value) -> anyhow::Result<Vec<Value>> {
+    match v {
+        Value::Array(a) => Ok(a.clone()),
+        Value::String(s) => Ok(s.chars().map(|c| Value::String(c.to_string())).collect()),
+        Value::Object(m) => Ok(m.keys().map(|k| Value::String(k.clone())).collect()),
+        other => bail!("'{}' object is not iterable", py_type_name(other)),
+    }
+}
+
+impl WebReader {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
+    pub fn new(base: ModuleBase) -> Self {
+        let core = HttpCore::new(base.config.clone());
+        Self { base: Arc::new(base), core: Arc::new(core) }
+    }
+
+    /// python `asyncio.Semaphore(self.config.get("max_concurrent_tasks", 4))`
+    fn max_concurrent_tasks(&self) -> anyhow::Result<usize> {
+        permits_from(&self.base.config.get1("max_concurrent_tasks").unwrap_or(json!(4)))
+    }
+
+    /// python `read(path)`: every failure is returned as a result, never raised
+    pub async fn read(&self, path: &Value) -> anyhow::Result<Value> {
+        match self.read_inner(path).await {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(self.base.result(format!("error {}", e), false)),
+        }
+    }
+
+    async fn read_inner(&self, path: &Value) -> anyhow::Result<Value> {
+        // urlparse(path): falsy non-strings parse as '', truthy non-strings fail on .decode()
+        let path_str: &str = match path {
+            Value::String(s) => s,
+            other if truthy(other) => bail!("'{}' object has no attribute 'decode'", py_type_name(other)),
+            _ => "",
+        };
+        let parsed = urlsplit(path_str).map_err(|e| anyhow!(e))?;
+        if !matches!(parsed.scheme.as_str(), "http" | "https") {
+            return Ok(self.base.result("Invalid URL. Please provide a valid http or https link.", false));
+        }
+        let domain = parsed.netloc.clone();
+
+        let result = self
+            .core
+            .make_request(Method::Get, path_str, RequestOpts { include_content: true, ..Default::default() })
+            .await?;
+        let data = result.get("content").cloned().unwrap_or(Value::Null);
+        let data_map = match &data {
+            Value::Object(m) => m,
+            _ => return Ok(self.base.result(data.clone(), false)),
+        };
+
+        // data.get("headers", {}).get("Content-Type", "").lower()
+        let mut content_type = data_map
+            .get("headers")
+            .and_then(|h| h.get("Content-Type"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        if py_strip(&content_type).is_empty() {
+            content_type = "text/html".into();
+        }
+        let file_content = data_map.get("content").and_then(Value::as_str).unwrap_or("");
+
+        if !ALLOWED_TEXT_TYPES.iter().any(|t| content_type.starts_with(t)) {
+            return Ok(self.base.result(format!("Unsupported or disallowed content type: {}", content_type), false));
+        }
+
+        let output = if content_type.contains("html") || content_type.contains("xml") {
+            process_webpage(file_content)?
+        } else {
+            json!({"text": file_content})
+        };
+        let wrapped = self.core.wrap_untrusted(&output, Some(&format!("webpage:{}", domain)));
+        Ok(self.base.result(wrapped, true))
+    }
+
+    /// python `read_multiple(paths)`: results in input order, at most max_concurrent_tasks in flight.
+    /// The first error ends the call, as python's `asyncio.gather` does, but the other items keep
+    /// running in the background (dropping a `JoinHandle` detaches the task instead of cancelling it).
+    pub async fn read_multiple(&self, paths: &Value) -> anyhow::Result<Value> {
+        let permits = self.max_concurrent_tasks()?;
+        let items = py_iterate(paths)?;
+        let sem = Arc::new(Semaphore::new(permits));
+        let handles: Vec<JoinHandle<anyhow::Result<Value>>> = items
+            .into_iter()
+            .map(|p| {
+                let reader = self.clone();
+                let sem = sem.clone();
+                tokio::spawn(async move { reader.handle_one(sem, p).await })
+            })
+            .collect();
+        let results = futures::future::try_join_all(handles.into_iter().map(|h| async move {
+            match h.await {
+                Ok(r) => r,
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        }))
+        .await?;
+        Ok(self.base.result(Value::Array(results), true))
+    }
+
+    async fn handle_one(&self, sem: Arc<Semaphore>, p: Value) -> anyhow::Result<Value> {
+        let _permit = sem.acquire().await?;
+        let path = match &p {
+            Value::Object(m) => m.get("path").cloned().ok_or_else(|| anyhow!("'path'"))?,
+            _ => p.clone(),
+        };
+        match self.read(&path).await {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(json!({"path": path, "error": e.to_string()})),
+        }
+    }
+}
+
+#[async_trait]
+impl Module for WebReader {
+    fn base(&self) -> &ModuleBase {
+        &self.base
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        meta::tools()
+    }
+
+    async fn on_ready(&self) -> anyhow::Result<()> {
+        // inherited from Http.on_ready
+        self.core.on_ready().await;
+        Ok(())
+    }
+
+    async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
+        match method {
+            "read" => self.read(&args.raw("path").cloned().unwrap_or(Value::Null)).await,
+            "read_multiple" => self.read_multiple(&args.raw("paths").cloned().unwrap_or(Value::Null)).await,
+            _ => bail!("'{}' object has no attribute '{}'", meta::CLASS_NAME, method),
+        }
+    }
+
+    fn ui_routes(&self) -> Vec<UiRoute> {
+        meta::ui_routes().into_iter().map(|(r, _)| r).collect()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detached() -> WebReader {
+        WebReader::new(ModuleBase::detached("web_reader"))
+    }
+
+    #[tokio::test]
+    async fn read_rejects_non_http_schemes_with_exact_message() {
+        let r = detached();
+        let out = r.call_tool("read", ToolArgs(json!({"path": "ftp://example.com/x"}).as_object().unwrap().clone())).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "Invalid URL. Please provide a valid http or https link."}));
+    }
+
+    #[tokio::test]
+    async fn read_non_string_path_matches_python_errors() {
+        let r = detached();
+        let out = r.read(&json!(5)).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "error 'int' object has no attribute 'decode'"}));
+        let out = r.read(&Value::Null).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "Invalid URL. Please provide a valid http or https link."}));
+    }
+
+    #[tokio::test]
+    async fn read_multiple_keeps_input_order_and_dict_paths() {
+        let r = detached();
+        let paths = json!(["ftp://a.example", {"path": "gopher://b.example"}]);
+        let out = r.read_multiple(&paths).await.unwrap();
+        let invalid = json!({"status": "error", "content": "Invalid URL. Please provide a valid http or https link."});
+        assert_eq!(out, json!({"status": "success", "content": [invalid.clone(), invalid]}));
+    }
+
+    #[test]
+    fn process_webpage_extracts_structure_in_python_order() {
+        let html = r#"<html><head><title> T </title><script>var x=1;</script></head>
+            <body><h1>Head</h1><p>Para one</p><p>Para one</p><img alt="pic"><img alt="">
+            <a href="/a">a</a><a href="/a">a</a></body></html>"#;
+        let out = process_webpage(html).unwrap();
+        assert_eq!(
+            out,
+            json!({"title": "T", "headers": ["Head"], "paragraphs": ["Para one"], "images": ["pic"], "urls": ["/a"]})
+        );
+        let keys: Vec<&String> = out.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["title", "headers", "paragraphs", "images", "urls"]);
+    }
+
+    #[test]
+    fn process_webpage_falls_back_to_class_and_id_text() {
+        let html = r#"<html><body><div class="article-body"><span>Hello world</span></div>
+            <div id="main-text">Body</div></body></html>"#;
+        assert_eq!(process_webpage(html).unwrap(), json!({"classes": {"text": ["Body"], "article": ["Hello world"]}}));
+    }
+
+    #[test]
+    fn process_webpage_text_follows_bs4_html_parser() {
+        // bs4 with html.parser: ruby annotations are their own string class and are skipped
+        assert_eq!(process_webpage("<p>漢<rt>kan</rt><rp>(</rp>x</p>").unwrap(), json!({"paragraphs": ["漢x"]}));
+        // a container element matched by the fallback keeps its own text
+        assert_eq!(process_webpage(r#"<div class="content">A<rt>B</rt></div>"#).unwrap(), json!({"classes": {"content": ["A"]}}));
+        assert_eq!(process_webpage(r#"<rt class="content">k<rp>(</rp>an</rt>"#).unwrap(), json!({"classes": {"content": ["kan"]}}));
+        assert_eq!(process_webpage(r#"<script class="content">var a;</script>"#).unwrap(), json!({"classes": {"content": ["var a;"]}}));
+    }
+
+    #[test]
+    fn process_webpage_nested_paragraphs_keep_nesting() {
+        // html.parser does not close the first <p>, so its text includes the nested one
+        assert_eq!(process_webpage("<p>1<p>2</p></p>").unwrap(), json!({"paragraphs": ["12", "2"]}));
+    }
+
+    #[test]
+    fn permits_follow_asyncio_semaphore_values() {
+        // asyncio admits ceil(value) holders for a fractional value
+        assert_eq!(permits_from(&json!(2.5)).unwrap(), 3);
+        assert_eq!(permits_from(&json!(true)).unwrap(), 1);
+        assert_eq!(permits_from(&json!(0)).unwrap(), 0);
+        // huge python values must not panic tokio's Semaphore::new
+        assert_eq!(permits_from(&json!(1e30)).unwrap(), Semaphore::MAX_PERMITS);
+        assert_eq!(permits_from(&json!(1e18)).unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(permits_from(&json!(-1)).unwrap_err().to_string(), "Semaphore initial value must be >= 0");
+    }
+
+    #[tokio::test]
+    async fn read_multiple_first_error_ends_the_call_with_python_message() {
+        // python: handle_one's p["path"] raises KeyError('path'), which gather re-raises as "'path'"
+        let r = detached();
+        let err = r.read_multiple(&json!([{"other": 1}, "ftp://a.example"])).await.unwrap_err();
+        assert_eq!(err.to_string(), "'path'");
+    }
+
+    #[test]
+    fn process_webpage_reports_when_nothing_is_scraped() {
+        assert_eq!(process_webpage("<html><body></body></html>").unwrap(), json!({"message": "nothing could be scraped from the page!"}));
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "ol-channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ol-core.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "form", "query"] }
+tower-http = { version = "0.6", features = ["cors"] }
+minijinja = "2"
+uuid = { version = "1", features = ["v4"] }
+rustyline = { version = "17", features = ["case_insensitive_history_search"] }
+terminal_size = "0.4"
+url.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
