@@ -101,6 +101,7 @@ fn py_type_name(v: &Value) -> &'static str {
 /// the coder's POST routes that read `(body or {}).get(...)`
 const BODY_ROUTES: &[&str] = &[
     "save",
+    "upload",
     "lint",
     "create",
     "move",
@@ -223,6 +224,68 @@ fn raw_content(m: &Map<String, Value>) -> Result<String, &'static str> {
         None => Ok(String::new()),
         Some(Value::String(s)) => Ok(s.clone()),
         Some(v) => Err(py_type_name(v)),
+    }
+}
+
+/// python `base64.b64decode(s)` (validate=False) on a str, which is `binascii.a2b_base64` in
+/// non-strict mode. a non-ASCII str is a ValueError. every character outside the alphabet is
+/// skipped, '=' counts as padding without ending the data, and the trailing bits of the last
+/// character are not checked. the data fails when it ends with one stray character, or mid-quad
+/// with fewer '=' than the quad needs (two for a 2-character quad, one for a 3-character quad).
+fn b64decode_lenient(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let mut quad = 0u8;
+    let mut pads = 0u8;
+    let mut left = 0u8;
+    for ch in s.bytes() {
+        if ch == b'=' {
+            pads = pads.saturating_add(1);
+            continue;
+        }
+        let Some(v) = b64_value(ch) else { continue };
+        pads = 0;
+        match quad {
+            0 => {
+                quad = 1;
+                left = v;
+            }
+            1 => {
+                quad = 2;
+                out.push((left << 2) | (v >> 4));
+                left = v & 0x0f;
+            }
+            2 => {
+                quad = 3;
+                out.push((left << 4) | (v >> 2));
+                left = v & 0x03;
+            }
+            _ => {
+                quad = 0;
+                out.push((left << 6) | v);
+                left = 0;
+            }
+        }
+    }
+    match quad {
+        0 => Some(out),
+        1 => None,
+        q if pads >= 4 - q => Some(out),
+        _ => None,
+    }
+}
+
+/// the 6-bit value of a base64 alphabet character
+fn b64_value(ch: u8) -> Option<u8> {
+    match ch {
+        b'A'..=b'Z' => Some(ch - b'A'),
+        b'a'..=b'z' => Some(ch - b'a' + 26),
+        b'0'..=b'9' => Some(ch - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -2041,42 +2104,49 @@ impl Coder {
         self.result(format!("reverted {} to HEAD", rel_path), true)
     }
 
-    fn route_upload(&self, b: &Map<String, Value>) -> Value {
-        use base64::Engine;
+    /// python `_route_upload`: the request values are used raw. a truthy non-str filename or path
+    /// raises inside `regex.sub` / `.rstrip` (the exception text is the route's error), while a
+    /// non-str sandbox fails in `_get_sandbox_subpath` and returns that text as the result.
+    fn route_upload(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let content_b64 = sget(b, "content");
-        let filename = sget(b, "filename");
-        if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
-            return self.result("sandbox, path and filename are all required", false);
-        }
+        let (Some(sandbox), Some(rel_raw), Some(filename_raw)) =
+            (required_field(b, "sandbox"), required_field(b, "path"), required_field(b, "filename"))
+        else {
+            return Ok(self.result("sandbox, path and filename are all required", false));
+        };
+        let Value::String(filename) = filename_raw else {
+            anyhow::bail!("a bytes-like object is required, not '{}'", py_type_name(filename_raw));
+        };
+        let Value::String(rel_path) = rel_raw else {
+            anyhow::bail!("'{}' object has no attribute 'rstrip'", py_type_name(rel_raw));
+        };
+        // sanitize filename: strip path separators
         let safe_name = filename.replace(['/', '\\'], "_");
-        let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
-        let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
+        let target_rel = format!("{}/{}", rel_path.trim_end_matches('/'), safe_name);
+        let target = match self.sandbox_subpath_raw(sandbox, &Value::String(target_rel.clone())) {
             Ok(t) => t,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
         };
         if pyos::exists(&target) {
-            return self.result(format!("file already exists: {}", target_rel), false);
+            return Ok(self.result(format!("file already exists: {}", target_rel), false));
         }
-        // python b64decode (non-validating): drop characters outside the alphabet
-        let cleaned: String = content_b64.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
-        let raw = match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
-            Ok(r) => r,
-            Err(_) => return self.result("invalid base64 content", false),
+        // python `base64.b64decode(content)` inside a try: any failure, including a non-str
+        // content value (absent means ""), is "invalid base64 content"
+        let raw = match raw_content(b).ok().and_then(|c| b64decode_lenient(&c)) {
+            Some(r) => r,
+            None => return Ok(self.result("invalid base64 content", false)),
         };
         if raw.len() > 10_000_000 {
-            return self.result("file too large (max 10MB)", false);
+            return Ok(self.result("file too large (max 10MB)", false));
         }
         let parent = pyos::dirname(&target);
         let r = if parent.is_empty() { Ok(()) } else { pyos::makedirs(&parent, true) };
         if let Err(e) = r.and_then(|_| pyos::write_file(&target, &raw)) {
-            return self.result(e, false);
+            return Ok(self.result(e, false));
         }
-        self.result(format!("uploaded {}", target_rel), true)
+        Ok(self.result(format!("uploaded {}", target_rel), true))
     }
 }
 
@@ -2210,6 +2280,7 @@ impl Module for Coder {
         if matches!(
             path,
             "save"
+                | "upload"
                 | "create"
                 | "move"
                 | "delete"
@@ -2261,7 +2332,7 @@ impl Module for Coder {
             "git_conflicts" => self.route_git_conflicts(q).await,
             "git_resolve" => self.route_git_resolve(&b).await,
             "git_revert_file" => self.route_git_revert_file(&b).await,
-            "upload" => self.route_upload(&b),
+            "upload" => self.route_upload(&b)?,
             "git_split_diff" => self.route_git_split_diff(q).await,
             _ => anyhow::bail!("route not found: {}", path),
         })
@@ -2394,6 +2465,47 @@ mod tests {
         assert_eq!(body_dict("search", Some(json!("abc"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
         assert_eq!(body_dict("git_stage", Some(json!(7))).unwrap_err().to_string(), "'int' object has no attribute 'get'");
         assert!(body_dict("git_status", Some(json!("abc"))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upload_content_decodes_like_python_b64decode() {
+        // python's non-validating decoder: data after '=' padding keeps decoding, and the
+        // trailing bits of the last character are ignored
+        assert_eq!(b64decode_lenient("QQ==QQ==").unwrap(), b"A\x04\x10");
+        assert_eq!(b64decode_lenient("YQ==YQ==").unwrap(), b"a\x06\x10");
+        assert_eq!(b64decode_lenient("QR==").unwrap(), b"A");
+        assert_eq!(b64decode_lenient("ABCD=").unwrap(), b"\x00\x10\x83");
+        assert_eq!(b64decode_lenient("QUJ=D").unwrap(), b"ABC");
+        assert_eq!(b64decode_lenient("QUJD\n").unwrap(), b"ABC");
+        assert_eq!(b64decode_lenient("").unwrap(), b"");
+        // a non-ASCII str is a ValueError; a stray character or short padding is incorrect
+        assert!(b64decode_lenient("QUJD€").is_none());
+        assert!(b64decode_lenient("Q").is_none());
+        assert!(b64decode_lenient("QQ=").is_none());
+        assert!(b64decode_lenient("QQ=Q").is_none());
+        // an explicit null content is a TypeError in python, so it is invalid, not an empty file
+        assert!(raw_content(json!({"content": null}).as_object().unwrap()).ok().and_then(|c| b64decode_lenient(&c)).is_none());
+        assert_eq!(raw_content(json!({}).as_object().unwrap()).ok().and_then(|c| b64decode_lenient(&c)).unwrap(), b"");
+    }
+
+    #[test]
+    fn upload_uses_raw_request_values_like_python() {
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        // a falsy sandbox is missing, even though it is not a string
+        let out = coder.route_upload(json!({"sandbox": 0, "path": "p", "filename": "f"}).as_object().unwrap()).unwrap();
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["content"], "sandbox, path and filename are all required");
+        // a truthy non-str path raises at .rstrip, before the sandbox is looked at
+        let e = coder.route_upload(json!({"sandbox": "s", "path": 5, "filename": "f"}).as_object().unwrap()).unwrap_err();
+        assert_eq!(e.to_string(), "'int' object has no attribute 'rstrip'");
+        // a truthy non-str filename raises inside regex.sub, which runs first
+        let e = coder.route_upload(json!({"sandbox": "s", "path": "p", "filename": ["f"]}).as_object().unwrap()).unwrap_err();
+        assert_eq!(e.to_string(), "a bytes-like object is required, not 'list'");
+        // a non-str sandbox fails in _get_sandbox_subpath, and that text is the result
+        let out = coder.route_upload(json!({"sandbox": 5, "path": "p", "filename": "f"}).as_object().unwrap()).unwrap();
+        assert_eq!(out["content"], "startswith first arg must be str or a tuple of str, not int");
+        // python's `(body or {}).get` needs a dict for the upload route too
+        assert_eq!(body_dict("upload", Some(json!(["x"]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
     }
 
     #[test]
