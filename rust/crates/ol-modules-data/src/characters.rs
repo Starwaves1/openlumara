@@ -4,7 +4,7 @@
 #[path = "../../../generated/modules/characters.rs"]
 pub mod meta;
 
-use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_json_loads, py_strip, py_type};
+use crate::util::{b64decode, b64decode_text, body_get, body_str, dict_body, eq_ci_strip, py_json_loads, py_strip, py_type, py_utf8_decode};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -165,7 +165,8 @@ pub fn extract_card_from_png(bytes: &[u8]) -> Option<Map<String, Value>> {
             }
             let decoded = b64decode(&remainder).map_err(|_| ())?;
             let text = String::from_utf8(decoded).map_err(|_| ())?;
-            let card: Value = serde_json::from_str(&text).map_err(|_| ())?;
+            // python json.loads: accepts NaN and Infinity, so the same card is imported
+            let card = py_json_loads(&text).map_err(|_| ())?;
             if let Value::Object(m) = card {
                 return Ok(Some(m));
             }
@@ -256,11 +257,6 @@ fn clean_tags(raw: Option<&Value>) -> Vec<Value> {
         Some(Value::Array(a)) => a.iter().map(|t| py_strip(&py_str(t)).to_string()).filter(|t| !t.is_empty()).map(Value::String).collect(),
         _ => vec![],
     }
-}
-
-/// `str(x).lower()` sort key
-fn lower_key(v: &Value) -> String {
-    py_str(v).to_lowercase()
 }
 
 /// python's numeric value of a number or bool (True is 1, False is 0)
@@ -689,6 +685,27 @@ impl Characters {
         Ok(self.base.result("user persona set", true))
     }
 
+    /// python `existing_name = self._find_char_name(name)` then `key = existing_name or name`, for the
+    /// normalized name of an imported card. a non-str name only reaches python's dict when the store is
+    /// empty, because the lookup calls `.lower()` on it for every stored key
+    fn card_storage_key(&self, name: &Value) -> anyhow::Result<String> {
+        match name {
+            Value::String(card_name) => Ok(self.find_char_name(card_name).filter(|k| !k.is_empty()).unwrap_or_else(|| card_name.clone())),
+            other => {
+                if !self.all().is_empty() {
+                    anyhow::bail!("'{}' object has no attribute 'lower'", py_type(other));
+                }
+                // python `self.characters[name] = ...` with an empty store: a list or dict is unhashable
+                if matches!(other, Value::Array(_) | Value::Object(_)) {
+                    anyhow::bail!("unhashable type: '{}'", py_type(other));
+                }
+                // a truthy scalar name (int, float, bool) is stored under its text; python keeps the
+                // number as the dict key, but every later name lookup or /all sort raises on `.lower()`
+                Ok(py_str(other))
+            }
+        }
+    }
+
     pub async fn import_json(&self, json_code: &str) -> anyhow::Result<Value> {
         let obj: Value = match py_json_loads(json_code) {
             Ok(v) => v,
@@ -703,24 +720,7 @@ impl Characters {
         let Some(normalized) = normalized else {
             return Ok(self.base.result("error: failed to extract a usable name and profile from this character card", false));
         };
-        // python `existing_name = self._find_char_name(name)`; `name = existing_name or normalized name`
-        let key = match normalized["name"].clone() {
-            Value::String(card_name) => self.find_char_name(&card_name).filter(|k| !k.is_empty()).unwrap_or(card_name),
-            other => {
-                // python's lookup calls `.lower()` on the name for every stored key, so a non-str name
-                // raises once any character is stored
-                if !self.all().is_empty() {
-                    anyhow::bail!("'{}' object has no attribute 'lower'", py_type(&other));
-                }
-                // python `self.characters[name] = ...` with an empty store: a list or dict is unhashable
-                if matches!(other, Value::Array(_) | Value::Object(_)) {
-                    anyhow::bail!("unhashable type: '{}'", py_type(&other));
-                }
-                // a truthy scalar name (int, float, bool) is stored under its text; python keeps the
-                // number as the dict key, but every later name lookup or /all sort raises on `.lower()`
-                py_str(&other)
-            }
-        };
+        let key = self.card_storage_key(&normalized["name"])?;
         self.with_chars(|c| {
             c.data.insert(key, normalized);
             c.save()
@@ -933,42 +933,45 @@ impl Characters {
         }
     }
 
+    /// python `_route_import_file`: `(body or {})` reads, then json or png by the filename
     async fn route_import_file(&self, body: &Option<Value>) -> anyhow::Result<Value> {
-        let filename = body_str(body, "filename", "").trim().to_string();
+        let filename = py_strip(&body_str(body, "filename", "")).to_string();
         let mut data_b64 = body_str(body, "data", "");
         if filename.is_empty() || data_b64.is_empty() {
             return Ok(self.base.result("error: no file data received", false));
         }
         // strip a data-URL prefix if the browser sent one
-        if data_b64.contains(',') && data_b64.trim().starts_with("data:") {
+        if data_b64.contains(',') && py_strip(&data_b64).starts_with("data:") {
             data_b64 = data_b64.split_once(',').map(|(_, b)| b.to_string()).unwrap_or_default();
         }
         let lower = filename.to_lowercase();
         if lower.ends_with(".json") {
-            let decoded = b64decode(data_b64.as_bytes()).and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()));
+            let decoded = b64decode_text(&data_b64).and_then(|b| py_utf8_decode(&b));
             return match decoded {
                 Ok(code) => self.import_json(&code).await,
                 Err(e) => Ok(self.base.result(format!("error: could not decode file: {}", e), false)),
             };
         }
         if lower.ends_with(".png") {
-            let raw = match b64decode(data_b64.as_bytes()) {
+            let raw = match b64decode_text(&data_b64) {
                 Ok(r) => r,
                 Err(e) => return Ok(self.base.result(format!("error: could not decode file: {}", e), false)),
             };
-            let Some(card) = extract_card_from_png(&raw) else {
+            // python `if not card:` is false for an empty dict too
+            let Some(card) = extract_card_from_png(&raw).filter(|c| !c.is_empty()) else {
                 return Ok(self.base.result("error: no character card found inside this png", false));
             };
-            let name: String = filename.chars().take(filename.chars().count() - 4).collect::<String>().trim().to_string();
-            let normalized = normalize_character(&name, &Value::Object(card)).filter(|n| n.get("profile").map(truthy).unwrap_or(false));
+            let name = py_strip(&filename.chars().take(filename.chars().count() - 4).collect::<String>()).to_string();
+            // python `_normalize_character` errors (a non-str profile joined with extras) propagate as an exception
+            let normalized = normalize_card(&name, &Value::Object(card)).map_err(anyhow::Error::msg)?
+                .filter(|n| n.get("profile").map(truthy).unwrap_or(false));
             let Some(mut normalized) = normalized else {
                 return Ok(self.base.result("error: failed to extract a usable name and profile from this png", false));
             };
             if !normalized.get("name").map(truthy).unwrap_or(false) {
                 normalized["name"] = json!(name);
             }
-            let nname = py_str(&normalized["name"]);
-            let key = self.find_char_name(&nname).unwrap_or(nname);
+            let key = self.card_storage_key(&normalized["name"])?;
             self.with_chars(|c| {
                 c.data.insert(key, normalized);
                 c.save()
@@ -978,30 +981,60 @@ impl Characters {
         Ok(self.base.result("error: unsupported file type, use .json or .png", false))
     }
 
-    fn chat_character(chat: &Value) -> String {
-        chat.get("metadata").and_then(|m| m.get("character")).filter(|c| truthy(c)).map(py_str).unwrap_or_default()
+    /// python `_chat_character`: `(chat.get("metadata") or {}).get("character") or ""`. the value is kept as
+    /// stored; a truthy metadata that is not a dict raises the `.get` AttributeError
+    fn chat_character(chat: &Value) -> anyhow::Result<Value> {
+        let meta = chat.get("metadata").cloned().unwrap_or(Value::Null);
+        let meta = if truthy(&meta) { meta } else { json!({}) };
+        let Some(obj) = meta.as_object() else {
+            anyhow::bail!("'{}' object has no attribute 'get'", py_type(&meta));
+        };
+        let c = obj.get("character").cloned().unwrap_or(Value::Null);
+        Ok(if truthy(&c) { c } else { json!("") })
     }
 
-    fn route_names(&self) -> Value {
-        let mut entries: Vec<Value> = self.all().into_iter().map(|(k, ch)| json!({"key": k, "name": or_value(ch.get("name"), json!(k))})).collect();
-        entries.sort_by_key(|e| lower_key(&e["name"]));
-        Value::Array(entries)
+    /// python `_route_names`: `e["name"].lower()` is the sort key for every entry, so a truthy non-str
+    /// display name raises for the whole list
+    fn route_names(&self) -> anyhow::Result<Value> {
+        let mut rows: Vec<(String, Value)> = Vec::new();
+        for (key, ch) in self.all() {
+            // python `char.get(...)` on a stored value that is not a dict raises
+            if !ch.is_object() {
+                anyhow::bail!("'{}' object has no attribute 'get'", py_type(&ch));
+            }
+            let name = or_value(ch.get("name"), json!(&key));
+            let sort_key = str_for_lower(&name)?.to_lowercase();
+            rows.push((sort_key, json!({"key": key, "name": name})));
+        }
+        // stable sort, like python's sorted()
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Value::Array(rows.into_iter().map(|(_, v)| v).collect()))
     }
 
     fn route_chats_count(&self) -> anyhow::Result<Value> {
         let ch = self.channel()?;
         let mut counts: IndexMap<String, i64> = IndexMap::new();
         for chat in ch.chat.get_all() {
-            let c = Self::chat_character(&chat);
-            if !c.is_empty() {
-                *counts.entry(c).or_insert(0) += 1;
+            let c = Self::chat_character(&chat)?;
+            if truthy(&c) {
+                // python uses the stored value as a dict key: a list or dict is unhashable
+                if matches!(c, Value::Array(_) | Value::Object(_)) {
+                    anyhow::bail!("unhashable type: '{}'", py_type(&c));
+                }
+                *counts.entry(py_str(&c)).or_insert(0) += 1;
             }
         }
         Ok(json!(counts))
     }
 
+    /// python `self._find_char_name(name) or char.get("name")`: the canonical stored key, or the card's name
+    /// when the key is missing or empty
+    fn canonical_char_name(&self, name: &str, ch: &Value) -> Value {
+        stored_name_or(self.find_char_name(name), ch.get("name").cloned().unwrap_or(Value::Null))
+    }
+
     fn route_apply(&self, body: &Option<Value>) -> anyhow::Result<Value> {
-        let name = body_str(body, "name", "").trim().to_string();
+        let name = py_strip(&body_str(body, "name", "")).to_string();
         if name.is_empty() {
             self.set_current_character(json!(""))?;
             return Ok(self.base.result("character cleared", true));
@@ -1009,10 +1042,7 @@ impl Characters {
         let Some(ch) = self.find_character(&name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let char_name = match self.find_char_name(&name) {
-            Some(n) => json!(n),
-            None => ch.get("name").cloned().unwrap_or(Value::Null),
-        };
+        let char_name = self.canonical_char_name(&name, &ch);
         self.set_current_character(char_name.clone())?;
         Ok(self.base.result(char_name, true))
     }
@@ -1020,31 +1050,27 @@ impl Characters {
     fn route_chats(&self, query: &Map<String, Value>) -> anyhow::Result<Value> {
         let character = query.get("character").map(py_str).unwrap_or_default();
         let ch = self.channel()?;
-        let items: Vec<Value> = ch
-            .chat
-            .get_all()
-            .into_iter()
-            .filter(|c| Self::chat_character(c) == character)
-            .map(|c| {
-                json!({
-                    "id": c.get("id").cloned().unwrap_or(Value::Null),
-                    "title": or_value(c.get("title"), json!("New chat")),
-                    "updated": or_value(c.get("updated"), json!("")),
-                })
-            })
-            .collect();
+        let mut items: Vec<Value> = Vec::new();
+        for c in ch.chat.get_all() {
+            // python `==`: only a stored str equals the query string
+            if !matches!(Self::chat_character(&c)?, Value::String(s) if s == character) {
+                continue;
+            }
+            items.push(json!({
+                "id": c.get("id").cloned().unwrap_or(Value::Null),
+                "title": or_value(c.get("title"), json!("New chat")),
+                "updated": or_value(c.get("updated"), json!("")),
+            }));
+        }
         Ok(Value::Array(items))
     }
 
     async fn route_create_chat(&self, body: &Option<Value>) -> anyhow::Result<Value> {
-        let name = body_str(body, "name", "").trim().to_string();
+        let name = py_strip(&body_str(body, "name", "")).to_string();
         let Some(ch) = self.find_character(&name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let key = match self.find_char_name(&name) {
-            Some(n) => json!(n),
-            None => ch.get("name").cloned().unwrap_or(Value::Null),
-        };
+        let key = self.canonical_char_name(&name, &ch);
         let category = self.base.config.get1("category").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "general".into());
         let channel = self.channel()?;
         let id = channel.chat.new_chat(&category, "New chat", Some(json!({"character": key}))).await;
@@ -1247,12 +1273,21 @@ impl Module for Characters {
                 dict_body(&body)?;
                 self.route_edit(&body)
             }
-            ("import_file", "POST") => self.route_import_file(&body).await,
-            ("names", "GET") => Ok(self.route_names()),
+            ("import_file", "POST") => {
+                dict_body(&body)?;
+                self.route_import_file(&body).await
+            }
+            ("names", "GET") => self.route_names(),
             ("chats_count", "GET") => self.route_chats_count(),
-            ("apply", "POST") => self.route_apply(&body),
+            ("apply", "POST") => {
+                dict_body(&body)?;
+                self.route_apply(&body)
+            }
             ("chats", "GET") => self.route_chats(&query),
-            ("create_chat", "POST") => self.route_create_chat(&body).await,
+            ("create_chat", "POST") => {
+                dict_body(&body)?;
+                self.route_create_chat(&body).await
+            }
             _ => anyhow::bail!("route not found: {}", path),
         }
     }
@@ -1433,5 +1468,68 @@ mod tests {
         // without personality or example text the non-str profile is stored as it is
         let plain = normalize_card("", &json!({"data": {"name": "Ann", "description": 5}})).unwrap().unwrap();
         assert_eq!(plain["profile"], json!(5));
+    }
+
+    #[test]
+    fn import_file_decoding_matches_python_errors() {
+        use crate::util::{b64decode_text, py_utf8_decode};
+        // python base64.b64decode: missing padding, the real data-character count, and non-ASCII str input
+        assert_eq!(b64decode_text("QQ").unwrap_err(), "Incorrect padding");
+        assert_eq!(b64decode_text("QQ==").unwrap(), b"A");
+        assert_eq!(b64decode_text("QUI=").unwrap(), b"AB");
+        assert_eq!(
+            b64decode_text("QUFEF").unwrap_err(),
+            "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4"
+        );
+        assert_eq!(
+            b64decode_text("QUFEFGHIJ").unwrap_err(),
+            "Invalid base64-encoded string: number of data characters (9) cannot be 1 more than a multiple of 4"
+        );
+        assert_eq!(b64decode_text("caf\u{e9}").unwrap_err(), "string argument should contain only ASCII characters");
+        // python bytes.decode("utf-8") messages
+        assert_eq!(py_utf8_decode(b"\xff").unwrap_err(), "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte");
+        assert_eq!(py_utf8_decode(b"\xe4A").unwrap_err(), "'utf-8' codec can't decode byte 0xe4 in position 0: invalid continuation byte");
+        assert_eq!(py_utf8_decode(b"A\xc3").unwrap_err(), "'utf-8' codec can't decode byte 0xc3 in position 1: unexpected end of data");
+        assert_eq!(py_utf8_decode(b"\xe4\xb8A").unwrap_err(), "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte");
+    }
+
+    #[test]
+    fn png_card_is_read_with_python_json_and_empty_card_is_falsy() {
+        use base64::Engine;
+        let png = |json_text: &str| {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(json_text);
+            let mut payload = b"chara\0".to_vec();
+            payload.extend_from_slice(b64.as_bytes());
+            png_with_text(b"tEXt", &payload)
+        };
+        // python json.loads reads NaN, so this card is found and keeps its name
+        let card = extract_card_from_png(&png(r#"{"data": {"name": "Ann", "description": NaN}}"#)).unwrap();
+        assert_eq!(card["data"]["name"], json!("Ann"));
+        // an empty object is a card for extraction; the route treats it as "no card" (python `if not card`)
+        let empty = extract_card_from_png(&png("{}")).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn chat_character_follows_python_get_chain() {
+        // a missing or falsy metadata reads as {} and a falsy character reads as ""
+        assert_eq!(Characters::chat_character(&json!({})).unwrap(), json!(""));
+        assert_eq!(Characters::chat_character(&json!({"metadata": {"character": ""}})).unwrap(), json!(""));
+        assert_eq!(Characters::chat_character(&json!({"metadata": {"character": "Ann"}})).unwrap(), json!("Ann"));
+        // a non-str character is kept as-is, so python's `==` against a str query never matches it
+        assert_eq!(Characters::chat_character(&json!({"metadata": {"character": 5}})).unwrap(), json!(5));
+        // truthy non-dict metadata raises the python AttributeError
+        assert_eq!(
+            Characters::chat_character(&json!({"metadata": "x"})).unwrap_err().to_string(),
+            "'str' object has no attribute 'get'"
+        );
+    }
+
+    #[test]
+    fn non_object_route_bodies_raise_like_python() {
+        // python `(body or {}).get(...)`: falsy bodies read as an empty dict, truthy non-dicts raise
+        assert!(dict_body(&Some(json!([]))).is_ok());
+        assert!(dict_body(&None).is_ok());
+        assert_eq!(dict_body(&Some(json!(["x"]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
     }
 }

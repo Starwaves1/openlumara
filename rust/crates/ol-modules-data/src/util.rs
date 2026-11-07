@@ -179,30 +179,77 @@ pub fn expanduser(p: &str) -> String {
     p.to_string()
 }
 
-/// lenient base64 decode like python's `base64.b64decode` (non-alphabet characters are discarded)
+/// python `base64.b64decode(s)` on bytes (binascii `a2b_base64`, non-strict, python 3.14). non-alphabet
+/// bytes are skipped. a '=' only counts as padding after a partial quad, and the run of pads that directly
+/// follows the last data character must complete the quad: a short run or a 1-character tail is an error
 pub fn b64decode(s: &[u8]) -> Result<Vec<u8>, String> {
     use base64::engine::{general_purpose::GeneralPurpose, DecodePaddingMode, GeneralPurposeConfig};
     use base64::Engine;
-    let filtered: Vec<u8> = s.iter().copied().filter(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/' || *c == b'=').collect();
-    // python stops at the first padding group; strip everything after the padding
-    let cut = match filtered.iter().position(|c| *c == b'=') {
-        Some(p) => {
-            let mut end = p;
-            while end < filtered.len() && filtered[end] == b'=' {
-                end += 1;
+    let mut data: Vec<u8> = Vec::new();
+    let mut quad_pos = 0usize;
+    let mut pad_run = 0usize;
+    for &c in s {
+        if c == b'=' {
+            if quad_pos >= 2 {
+                pad_run += 1;
             }
-            &filtered[..end]
+            continue;
         }
-        None => &filtered[..],
-    };
-    if cut.iter().filter(|c| **c != b'=').count() % 4 == 1 {
-        return Err("Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4".into());
+        if !(c.is_ascii_alphanumeric() || c == b'+' || c == b'/') {
+            continue;
+        }
+        data.push(c);
+        quad_pos = (quad_pos + 1) % 4;
+        pad_run = 0;
+    }
+    match quad_pos {
+        1 => {
+            return Err(format!(
+                "Invalid base64-encoded string: number of data characters ({}) cannot be 1 more than a multiple of 4",
+                data.len()
+            ))
+        }
+        2 if pad_run < 2 => return Err("Incorrect padding".into()),
+        3 if pad_run < 1 => return Err("Incorrect padding".into()),
+        _ => {}
     }
     let engine = GeneralPurpose::new(
         &base64::alphabet::STANDARD,
-        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(DecodePaddingMode::Indifferent),
+        GeneralPurposeConfig::new().with_decode_allow_trailing_bits(true).with_decode_padding_mode(DecodePaddingMode::RequireNone),
     );
-    engine.decode(cut).map_err(|_| "Incorrect padding".to_string())
+    engine.decode(&data).map_err(|_| "Incorrect padding".to_string())
+}
+
+/// python `base64.b64decode(str)`: a str argument must be ASCII before it is decoded
+pub fn b64decode_text(s: &str) -> Result<Vec<u8>, String> {
+    if !s.is_ascii() {
+        return Err("string argument should contain only ASCII characters".into());
+    }
+    b64decode(s.as_bytes())
+}
+
+/// python `bytes.decode("utf-8")`, with CPython's UnicodeDecodeError text
+pub fn py_utf8_decode(bytes: &[u8]) -> Result<String, String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text.to_string()),
+        Err(e) => {
+            let start = e.valid_up_to();
+            let (end, reason) = match e.error_len() {
+                Some(n) => {
+                    // a lead byte that is valid on its own fails on the continuation byte after it
+                    let lead_ok = matches!(bytes[start], 0xC2..=0xDF | 0xE0..=0xEF | 0xF0..=0xF4);
+                    (start + n, if lead_ok { "invalid continuation byte" } else { "invalid start byte" })
+                }
+                None => (bytes.len(), "unexpected end of data"),
+            };
+            let at = if end - start == 1 {
+                format!("byte 0x{:02x} in position {}", bytes[start], start)
+            } else {
+                format!("bytes in position {}-{}", start, end - 1)
+            };
+            Err(format!("'utf-8' codec can't decode {}: {}", at, reason))
+        }
+    }
 }
 
 /// python `str.strip()`: strips every char for which `str.isspace()` is true. that set is rust's
@@ -509,6 +556,25 @@ mod tests {
     #[test]
     fn base64_lenient() {
         assert_eq!(b64decode(b"aGVs\nbG8=").unwrap(), b"hello");
-        assert_eq!(b64decode(b"aGVsbG8").unwrap(), b"hello");
+        // python rejects missing padding ("Incorrect padding") rather than decoding the partial quad
+        assert_eq!(b64decode(b"aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(b64decode(b"aGVsbG8").unwrap_err(), "Incorrect padding");
+    }
+
+    #[test]
+    fn base64_padding_matches_python_3_14() {
+        // outputs captured from python 3.14 base64.b64decode
+        assert_eq!(b64decode(b"QQ==").unwrap(), b"A");
+        assert_eq!(b64decode(b"QUI=").unwrap(), b"AB");
+        assert_eq!(b64decode(b"QQ==QQ==").unwrap(), b"A\x04\x10");
+        assert_eq!(b64decode(b"QUFE=QUFE=").unwrap(), b"AADAAD");
+        assert_eq!(b64decode(b"QUI=Q").unwrap(), b"AB\x10");
+        assert_eq!(b64decode(b"QQ=").unwrap_err(), "Incorrect padding");
+        assert_eq!(b64decode(b"QQ==Q").unwrap_err(), "Incorrect padding");
+        assert_eq!(b64decode(b"QUI=QUI=").unwrap_err(), "Incorrect padding");
+        assert_eq!(
+            b64decode(b"QUFEF=").unwrap_err(),
+            "Invalid base64-encoded string: number of data characters (5) cannot be 1 more than a multiple of 4"
+        );
     }
 }
