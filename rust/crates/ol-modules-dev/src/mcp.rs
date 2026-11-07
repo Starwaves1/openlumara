@@ -29,16 +29,22 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use std::process::Stdio;
 
 /// protocol revision this client asks for (the server may answer with another one)
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// revisions the python SDK accepts in an initialize answer (mcp_types HANDSHAKE_PROTOCOL_VERSIONS)
+const HANDSHAKE_PROTOCOL_VERSIONS: [&str; 4] = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const PROTOCOL_HEADER: &str = "MCP-Protocol-Version";
 const TOOL_LIST_CHANGED: &str = "notifications/tools/list_changed";
-/// how long a stdio server gets to exit after its stdin is closed (python: 2s)
+/// how long a stdio server gets to exit after its stdin is closed (python: PROCESS_TERMINATION_TIMEOUT 2s)
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// how long a stdio server gets after SIGTERM before SIGKILL (python: FORCE_KILL_TIMEOUT 2s)
+const FORCE_KILL_TIMEOUT: Duration = Duration::from_secs(2);
+/// how long the kill is given to be observed (python: _KILL_REAP_TIMEOUT 2s)
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 /// how long a server task gets to unwind on shutdown before it is aborted (python: 10s)
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// environment variables the python SDK passes to stdio servers (default environment)
@@ -65,6 +71,13 @@ impl McpError {
     fn other(kind: &'static str, message: impl Into<String>) -> Self {
         McpError::Other { kind, message: message.into() }
     }
+
+    /// python `str(e)`: the bare message (MCPError.__str__ returns the message)
+    pub fn raw_message(&self) -> &str {
+        match self {
+            McpError::Rpc { message, .. } | McpError::Other { message, .. } => message,
+        }
+    }
 }
 
 impl fmt::Display for McpError {
@@ -73,8 +86,9 @@ impl fmt::Display for McpError {
     }
 }
 
+/// python SDK `CONNECTION_CLOSED` (-32000), raised as MCPError for pending and post-close requests
 fn connection_closed() -> McpError {
-    McpError::other("McpError", "Connection closed")
+    McpError::Rpc { code: -32000, message: "Connection closed".into(), data: None }
 }
 
 /// python `_flatten_error` for the errors this client can produce
@@ -106,43 +120,102 @@ fn chained(e: &dyn std::error::Error) -> String {
     text
 }
 
-fn io_error(e: &std::io::Error) -> McpError {
-    let kind = match e.kind() {
-        std::io::ErrorKind::BrokenPipe => "BrokenPipeError",
+/// python exception class CPython raises for an OSError errno (OSError subclass by errno)
+fn os_error_class(code: i32) -> &'static str {
+    match code {
+        libc::EPIPE | libc::ESHUTDOWN => "BrokenPipeError",
+        libc::EAGAIN | libc::EALREADY | libc::EINPROGRESS => "BlockingIOError",
+        libc::ECHILD => "ChildProcessError",
+        libc::ECONNABORTED => "ConnectionAbortedError",
+        libc::ECONNREFUSED => "ConnectionRefusedError",
+        libc::ECONNRESET => "ConnectionResetError",
+        libc::EEXIST => "FileExistsError",
+        libc::ENOENT => "FileNotFoundError",
+        libc::EISDIR => "IsADirectoryError",
+        libc::ENOTDIR => "NotADirectoryError",
+        libc::EINTR => "InterruptedError",
+        libc::EACCES | libc::EPERM => "PermissionError",
+        libc::ESRCH => "ProcessLookupError",
+        libc::ETIMEDOUT => "TimeoutError",
         _ => "OSError",
-    };
-    McpError::Other { kind, message: chained(e) }
-}
-
-fn spawn_error(e: &std::io::Error, command: &str) -> McpError {
-    match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            McpError::other("FileNotFoundError", format!("[Errno 2] No such file or directory: '{}'", command))
-        }
-        std::io::ErrorKind::PermissionDenied => {
-            McpError::other("PermissionError", format!("[Errno 13] Permission denied: '{}'", command))
-        }
-        _ => io_error(e),
     }
 }
 
-fn http_error(e: &reqwest::Error) -> McpError {
-    let kind = if e.is_timeout() {
-        "TimeoutError"
-    } else if e.is_connect() {
-        "ConnectError"
-    } else {
-        "HTTPError"
-    };
-    McpError::Other { kind, message: chained(e) }
+/// python `str(OSError)`: `[Errno N] strerror` (Rust's Display appends ` (os error N)`, which python does not)
+fn errno_text(e: &std::io::Error, code: i32) -> String {
+    let full = e.to_string();
+    let suffix = format!(" (os error {})", code);
+    let detail = full.strip_suffix(suffix.as_str()).unwrap_or(full.as_str());
+    format!("[Errno {}] {}", code, detail)
 }
 
-fn status_error(status: reqwest::StatusCode, url: &str) -> McpError {
-    let class = if status.is_client_error() { "Client error" } else { "Server error" };
-    McpError::other(
-        "HTTPStatusError",
-        format!("{} '{} {}' for url '{}'", class, status.as_u16(), status.canonical_reason().unwrap_or(""), url),
-    )
+fn io_error(e: &std::io::Error) -> McpError {
+    match e.raw_os_error() {
+        Some(code) => McpError::Other { kind: os_error_class(code), message: errno_text(e, code) },
+        None => McpError::other("OSError", e.to_string()),
+    }
+}
+
+/// python subprocess spawn failure: the OSError subclass for the errno, with the command as filename
+fn spawn_error(e: &std::io::Error, command: &str) -> McpError {
+    match e.raw_os_error() {
+        Some(code) => McpError::Other {
+            kind: os_error_class(code),
+            message: format!("{}: '{}'", errno_text(e, code), command),
+        },
+        None => io_error(e),
+    }
+}
+
+/// the innermost std::io::Error in a reqwest error's source chain
+fn find_io_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(io);
+        }
+        current = err.source();
+    }
+    None
+}
+
+/// python httpx errors: ConnectError carries the socket error text, timeouts are httpx's own classes
+fn http_error(e: &reqwest::Error) -> McpError {
+    if e.is_timeout() {
+        let kind = if e.is_connect() { "ConnectTimeout" } else { "ReadTimeout" };
+        return McpError::Other { kind, message: chained(e) };
+    }
+    if e.is_connect() {
+        let os = find_io_error(e).and_then(|io| io.raw_os_error().map(|code| errno_text(io, code)));
+        return McpError::Other { kind: "ConnectError", message: os.unwrap_or_else(|| chained(e)) };
+    }
+    McpError::Other { kind: "HTTPError", message: chained(e) }
+}
+
+/// python httpx `raise_for_status` message for a non-success response
+fn status_error(status: reqwest::StatusCode, url: &str, location: Option<&str>) -> McpError {
+    let code = status.as_u16();
+    let class = match code / 100 {
+        1 => "Informational response",
+        3 => "Redirect response",
+        4 => "Client error",
+        5 => "Server error",
+        _ => "Invalid status code",
+    };
+    let mut message = format!("{} '{} {}' for url '{}'", class, code, status.canonical_reason().unwrap_or(""), url);
+    if matches!(code, 301 | 302 | 303 | 307 | 308) {
+        if let Some(location) = location {
+            message.push_str(&format!("\nRedirect location: '{}'", location));
+        }
+    }
+    message.push_str(&format!("\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/{}", code));
+    McpError::other("HTTPStatusError", message)
+}
+
+/// `status_error` for a response, using its final (normalized) URL like httpx does
+fn response_status_error(resp: &reqwest::Response) -> McpError {
+    let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
+    status_error(resp.status(), resp.url().as_str(), location)
 }
 
 /// python `Duration` for a float number of seconds (never panics on odd config values)
@@ -179,11 +252,19 @@ fn sanitize(text: &str) -> String {
     }
 }
 
+/// python `urllib.parse.urlparse(url).hostname`: the raw netloc host, lowercased, with no IDNA
+/// encoding (so `bücher.de` keeps its unicode label)
 fn url_hostname(url: &str) -> String {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.trim_start_matches('[').trim_end_matches(']').to_lowercase()))
-        .unwrap_or_default()
+    let Some((_, rest)) = url.split_once("://") else {
+        return String::new();
+    };
+    let netloc = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostinfo = netloc.rsplit_once('@').map(|(_, host)| host).unwrap_or(netloc);
+    let host = match hostinfo.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => hostinfo.split(':').next().unwrap_or(""),
+    };
+    host.to_lowercase()
 }
 
 /// python `_derive_url_name`: mcp.exa.ai -> exa
@@ -215,14 +296,48 @@ fn derive_stdio_name(argv: &[String]) -> String {
     sanitize(command)
 }
 
-/// message python puts in `_parse_error` for a shlex failure (ValueError text)
+/// message python puts in `_parse_error` for a shlex failure (ValueError text).
+/// Follows shlex's posix state machine: a backslash escapes the next char outside quotes and
+/// inside double quotes (single quotes keep it literal); hitting EOF while escaping gives
+/// "No escaped character", hitting EOF inside a quote gives "No closing quotation".
 fn shlex_error(entry: &str) -> &'static str {
-    let trailing = entry.chars().rev().take_while(|&c| c == '\\').count();
-    if trailing % 2 == 1 {
-        "No escaped character"
-    } else {
-        "No closing quotation"
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
     }
+    let mut quote = Quote::None;
+    let mut chars = entry.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::None => match c {
+                '\\' => {
+                    if chars.next().is_none() {
+                        return "No escaped character";
+                    }
+                }
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                _ => {}
+            },
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match c {
+                '\\' => {
+                    if chars.next().is_none() {
+                        return "No escaped character";
+                    }
+                }
+                '"' => quote = Quote::None,
+                _ => {}
+            },
+        }
+    }
+    "No closing quotation"
 }
 
 /// parse one config entry: Ok(None) = skip, Err = invalid entry (python `_parse_error`)
@@ -426,6 +541,16 @@ impl Drop for Tasks {
     }
 }
 
+/// send a signal to a stdio server's process group (the group id is the leader's pid)
+fn signal_group(pgid: Option<libc::pid_t>, signal: libc::c_int) {
+    if let Some(pgid) = pgid {
+        // SAFETY: killpg only sends a signal; a stale group id just fails with ESRCH
+        unsafe {
+            libc::killpg(pgid, signal);
+        }
+    }
+}
+
 /// stdio: newline-delimited JSON-RPC over a child process's stdin/stdout
 pub struct StdioTransport {
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
@@ -442,6 +567,8 @@ impl StdioTransport {
                 cmd.env(var, value);
             }
         }
+        // own process group, so shutdown can signal the whole tree (python: start_new_session=True)
+        cmd.process_group(0);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -480,12 +607,20 @@ impl StdioTransport {
         stdin.flush().await.map_err(|e| io_error(&e))
     }
 
-    /// close stdin, give the server a moment to exit, then kill it (python stdio_client)
+    /// python stdio_client shutdown: close stdin, wait out the grace period, SIGTERM the process
+    /// group, wait again, then SIGKILL the group (python terminate_posix_process_tree)
     async fn close(&self) {
         drop(self.stdin.lock().await.take());
         let mut child = self.child.lock().await;
+        let pgid = child.id().map(|pid| pid as libc::pid_t);
         if tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await.is_err() {
-            let _ = child.kill().await;
+            signal_group(pgid, libc::SIGTERM);
+            if tokio::time::timeout(FORCE_KILL_TIMEOUT, child.wait()).await.is_err() {
+                signal_group(pgid, libc::SIGKILL);
+                if tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await.is_err() {
+                    let _ = child.kill().await;
+                }
+            }
         }
         self.tasks.abort_all();
     }
@@ -539,9 +674,8 @@ impl HttpTransport {
         if let Some(id) = resp.headers().get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
             *self.state.session_id.lock() = Some(id.to_string());
         }
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(status_error(status, &self.url));
+        if !resp.status().is_success() {
+            return Err(response_status_error(&resp));
         }
         let content_type = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
         if content_type.starts_with("text/event-stream") {
@@ -604,9 +738,8 @@ impl SseTransport {
             .send()
             .await
             .map_err(|e| http_error(&e))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(status_error(status, url));
+        if !resp.status().is_success() {
+            return Err(response_status_error(&resp));
         }
         let (endpoint_tx, endpoint_rx) = oneshot::channel::<Result<String, McpError>>();
         let base = url.to_string();
@@ -655,9 +788,8 @@ impl SseTransport {
             .send()
             .await
             .map_err(|e| http_error(&e))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(status_error(status, &self.endpoint));
+        if !resp.status().is_success() {
+            return Err(response_status_error(&resp));
         }
         Ok(())
     }
@@ -733,7 +865,19 @@ impl Session {
         let reader = tokio::spawn(dispatch_loop(rx, Arc::downgrade(&transport), pending.clone(), on_notify));
         let session = Arc::new(Session { transport, pending, next_id: AtomicI64::new(0), reader });
 
-        let init = session
+        // a failed handshake tears the transport down the way the python context exit does
+        match session.handshake().await {
+            Ok(()) => Ok(session),
+            Err(e) => {
+                session.close().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// python `ClientSession.initialize` plus the stream the SDK opens afterwards
+    async fn handshake(&self) -> Result<(), McpError> {
+        let init = self
             .request(
                 "initialize",
                 json!({
@@ -743,11 +887,11 @@ impl Session {
                 }),
             )
             .await?;
-        let negotiated = init.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION).to_string();
-        session.transport.on_negotiated(&negotiated);
-        session.notify("notifications/initialized", json!({})).await?;
-        session.transport.open_server_stream();
-        Ok(session)
+        let negotiated = negotiated_version(&init)?;
+        self.transport.on_negotiated(&negotiated);
+        self.notify("notifications/initialized", json!({})).await?;
+        self.transport.open_server_stream();
+        Ok(())
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
@@ -791,6 +935,25 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.reader.abort();
+    }
+}
+
+/// the protocol revision of an initialize answer (python `ClientSession.initialize` checks it
+/// against HANDSHAKE_PROTOCOL_VERSIONS and raises RuntimeError when it is not one of them)
+fn negotiated_version(init: &Value) -> Result<String, McpError> {
+    let Some(version) = init.get("protocolVersion").and_then(Value::as_str) else {
+        return Err(McpError::other(
+            "ValidationError",
+            "1 validation error for InitializeResult\nprotocolVersion\n  Field required",
+        ));
+    };
+    if HANDSHAKE_PROTOCOL_VERSIONS.contains(&version) {
+        Ok(version.to_string())
+    } else {
+        Err(McpError::other(
+            "RuntimeError",
+            format!("Unsupported protocol version from the server: {}", version),
+        ))
     }
 }
 
@@ -982,15 +1145,15 @@ async fn connection_lifecycle(inner: Arc<Inner>, name: String, srv: Arc<Server>)
     };
 
     if let Err(e) = &outcome {
-        let text = flatten_error(e);
         {
             let mut st = srv.state.lock();
             if st.state != "timeout" {
                 st.state = "error";
-                st.error = Some(text.clone());
+                st.error = Some(flatten_error(e));
             }
         }
-        inner.log(&format!("server '{}' stopped: {}", name, ol_core::detail_error(&text)));
+        // python logs core.detail_error(e), which is str(e) (the bare message) without debug
+        inner.log(&format!("server '{}' stopped: {}", name, ol_core::detail_error(e.raw_message())));
     }
 
     // always release the startup wait, even on early failure
@@ -1351,7 +1514,69 @@ mod tests {
         assert_eq!(flatten_error(&e), "MCPError [-32602] Invalid params | data: {'path': 'x'}");
         let e = McpError::Rpc { code: -1, message: "boom".into(), data: None };
         assert_eq!(flatten_error(&e), "MCPError [-1] boom");
-        assert_eq!(flatten_error(&connection_closed()), "McpError: Connection closed");
+        assert_eq!(flatten_error(&connection_closed()), "MCPError [-32000] Connection closed");
+        assert_eq!(connection_closed().raw_message(), "Connection closed");
+    }
+
+    #[test]
+    fn os_errors_use_python_errno_text_and_class() {
+        let broken = std::io::Error::from_raw_os_error(libc::EPIPE);
+        assert_eq!(flatten_error(&io_error(&broken)), "BrokenPipeError: [Errno 32] Broken pipe");
+        let exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        assert_eq!(flatten_error(&spawn_error(&exec, "./server")), "OSError: [Errno 8] Exec format error: './server'");
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(
+            flatten_error(&spawn_error(&missing, "/nope")),
+            "FileNotFoundError: [Errno 2] No such file or directory: '/nope'"
+        );
+    }
+
+    #[test]
+    fn http_status_errors_match_httpx_text() {
+        assert_eq!(
+            status_error(reqwest::StatusCode::NOT_FOUND, "http://h.test/mcp/", None).raw_message(),
+            "Client error '404 Not Found' for url 'http://h.test/mcp/'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404"
+        );
+        assert_eq!(
+            status_error(reqwest::StatusCode::MOVED_PERMANENTLY, "http://h.test/", Some("/new")).raw_message(),
+            "Redirect response '301 Moved Permanently' for url 'http://h.test/'\nRedirect location: '/new'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/301"
+        );
+        assert!(status_error(reqwest::StatusCode::BAD_GATEWAY, "http://h.test/", None)
+            .raw_message()
+            .starts_with("Server error '502 Bad Gateway'"));
+    }
+
+    #[test]
+    fn shlex_failures_name_the_python_reason() {
+        assert_eq!(shlex_error("run \"a\\\""), "No closing quotation");
+        assert_eq!(shlex_error("run 'abc\\"), "No closing quotation");
+        assert_eq!(shlex_error("run abc\\"), "No escaped character");
+        assert_eq!(shlex_error("run \"abc\\"), "No escaped character");
+    }
+
+    #[test]
+    fn url_hostnames_are_not_idna_encoded() {
+        assert_eq!(url_hostname("https://bücher.de/mcp"), "bücher.de");
+        assert_eq!(derive_url_name("https://bücher.de/mcp"), "b_cher");
+        assert_eq!(derive_url_name("http://user:pw@[::1]:8000/mcp"), "1");
+    }
+
+    #[test]
+    fn unsupported_protocol_version_fails_the_handshake() {
+        assert_eq!(negotiated_version(&json!({"protocolVersion": "2025-06-18"})).unwrap(), "2025-06-18");
+        let err = negotiated_version(&json!({"protocolVersion": "1999-01-01"})).unwrap_err();
+        assert_eq!(flatten_error(&err), "RuntimeError: Unsupported protocol version from the server: 1999-01-01");
+    }
+
+    #[tokio::test]
+    async fn stdio_shutdown_sends_sigterm_before_sigkill() {
+        // ignores its stdin closing; exits 0 only when it gets SIGTERM (trap), so a SIGKILL would show
+        let script = "trap 'exit 0' TERM; while true; do sleep 0.1; done";
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let transport = StdioTransport::spawn("sh", &["-c".to_string(), script.to_string()], tx).expect("spawn sh");
+        transport.close().await;
+        let status = transport.child.lock().await.try_wait().expect("try_wait").expect("child exited");
+        assert_eq!(status.code(), Some(0), "server should exit on SIGTERM, not be killed");
     }
 
     #[test]
