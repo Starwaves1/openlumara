@@ -122,6 +122,16 @@ fn load_body(index: &Index, name: &str) -> Result<String, LoadError> {
     Ok(py_strip(&body).to_string())
 }
 
+/// the `name` argument of the `use` tool: python's `name not in self.index` hashes it first, so a JSON
+/// array or object raises TypeError before any message is built; any other value is used as str()
+fn use_name_arg(v: &Value) -> anyhow::Result<String> {
+    match v {
+        Value::Array(_) => anyhow::bail!("unhashable type: 'list'"),
+        Value::Object(_) => anyhow::bail!("unhashable type: 'dict'"),
+        _ => Ok(py_str(v)),
+    }
+}
+
 /// `", ".join(self.index.keys()) if self.index else "none installed"`
 fn available(index: &Index) -> String {
     if index.is_empty() {
@@ -239,7 +249,7 @@ impl Module for Skills {
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
             "use" => {
-                let name = py_str(args.0.get("name").unwrap_or(&Value::Null));
+                let name = use_name_arg(args.0.get("name").unwrap_or(&Value::Null))?;
                 self.use_skill(&name)
             }
             _ => anyhow::bail!("'Skills' object has no attribute '{}'", method),
@@ -361,6 +371,24 @@ mod tests {
             missing,
             json!({"status": "error", "content": "No skill named 'nope'. Available skills: Alpha Skill, beta"})
         );
+    }
+
+    #[test]
+    fn use_tool_name_argument_follows_python_types() {
+        let (m, _dir) = setup();
+        // python: a list or dict name raises TypeError from the `in` check, so the call fails
+        let err = block_on(m.call_tool("use", ToolArgs::new(json!({"name": ["beta"]}).as_object().unwrap().clone()))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'list'");
+        let err = block_on(m.call_tool("use", ToolArgs::new(json!({"name": {"a": 1}}).as_object().unwrap().clone()))).unwrap_err();
+        assert_eq!(err.to_string(), "unhashable type: 'dict'");
+
+        // python: an int, bool or None name is not in the index and gets str() text in the message
+        let n = block_on(m.call_tool("use", ToolArgs::new(json!({"name": 5}).as_object().unwrap().clone()))).unwrap();
+        assert_eq!(n, json!({"status": "error", "content": "No skill named '5'. Available skills: Alpha Skill, beta"}));
+        let b = block_on(m.call_tool("use", ToolArgs::new(json!({"name": true}).as_object().unwrap().clone()))).unwrap();
+        assert_eq!(b, json!({"status": "error", "content": "No skill named 'True'. Available skills: Alpha Skill, beta"}));
+        let nul = block_on(m.call_tool("use", ToolArgs::new(json!({"name": null}).as_object().unwrap().clone()))).unwrap();
+        assert_eq!(nul, json!({"status": "error", "content": "No skill named 'None'. Available skills: Alpha Skill, beta"}));
     }
 
     #[test]
