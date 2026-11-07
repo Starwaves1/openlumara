@@ -2105,3 +2105,78 @@ async fn memory_routes_answer_wrong_methods_with_python_messages() {
     let resp = h.send(post_json("/api/ext/memory/search", "{}")).await;
     assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
 }
+
+// ---------------- /api/ext/memory (update, delete) ----------------
+
+#[tokio::test]
+async fn memory_update_strips_content_and_tags_and_answers_with_the_python_message() {
+    // python _route_update: str(content).strip(), tags stringified and stripped, empty tags dropped
+    let (h, memory) = harness_with_memory().await;
+    let id = seed(&memory, "likes tea", &["food"], false).await;
+
+    let body = json!({"id": id, "content": "  likes green tea  ", "tags": [" tea ", "", 7]});
+    let resp = h.send(post_json("/api/ext/memory/update", &body.to_string())).await;
+    assert_eq!(resp.json(), json!({"data": format!("memory {id} edited"), "success": true}), "{}", resp.body);
+
+    let listed = h.get("/api/ext/memory/list").await.json();
+    assert_eq!(listed["data"][0]["content"], json!("likes green tea"));
+    assert_eq!(listed["data"][0]["tags"], json!(["tea", "7"]));
+}
+
+#[tokio::test]
+async fn memory_update_refuses_missing_empty_and_unknown_targets_like_python() {
+    let (h, memory) = harness_with_memory().await;
+    let id = seed(&memory, "keep me", &[], false).await;
+
+    assert_eq!(
+        h.send(post_json("/api/ext/memory/update", r#"{"content": "x"}"#)).await.json(),
+        json!({"data": "no memory id given", "success": false})
+    );
+    // a missing or whitespace-only content is refused before the id is looked up
+    assert_eq!(
+        h.send(post_json("/api/ext/memory/update", &json!({"id": id}).to_string())).await.json(),
+        json!({"data": "memory content cannot be empty", "success": false})
+    );
+    assert_eq!(
+        h.send(post_json("/api/ext/memory/update", &json!({"id": id, "content": "  \t "}).to_string())).await.json(),
+        json!({"data": "memory content cannot be empty", "success": false})
+    );
+    assert_eq!(
+        h.send(post_json("/api/ext/memory/update", r#"{"id": "nope", "content": "x"}"#)).await.json(),
+        json!({"data": "memory with that ID not found!", "success": false})
+    );
+    // a refused update leaves the stored memory untouched
+    assert_eq!(h.get("/api/ext/memory/list").await.json()["data"][0]["content"], json!("keep me"));
+}
+
+#[tokio::test]
+async fn memory_update_and_delete_are_post_only_like_python() {
+    let (h, _memory) = harness_with_memory().await;
+    for path in ["update", "delete"] {
+        let resp = h.get(&format!("/api/ext/memory/{path}")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+        assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn memory_delete_removes_the_memory_and_answers_with_python_messages() {
+    let (h, memory) = harness_with_memory().await;
+    let keep = seed(&memory, "keep", &[], false).await;
+    let gone = seed(&memory, "gone", &[], false).await;
+
+    // ids are matched after strip(), but the answer echoes the id as it was sent
+    let padded = format!(" {gone} ");
+    let resp = h.send(post_json("/api/ext/memory/delete", &json!({"id": padded}).to_string())).await;
+    assert_eq!(resp.json(), json!({"data": format!("memory  {gone}  deleted"), "success": true}), "{}", resp.body);
+    assert_eq!(ids(&h.get("/api/ext/memory/list").await.json()["data"]), vec![keep.clone()]);
+
+    // an unknown id is a success answer with the not-found text, as in python's delete()
+    let unknown = h.send(post_json("/api/ext/memory/delete", r#"{"id": "nope"}"#)).await;
+    assert_eq!(unknown.json(), json!({"data": "memory with that ID not found!", "success": true}));
+    assert_eq!(
+        h.send(post_json("/api/ext/memory/delete", "{}")).await.json(),
+        json!({"data": "no memory id given", "success": false})
+    );
+    assert_eq!(ids(&h.get("/api/ext/memory/list").await.json()["data"]), vec![keep]);
+}
