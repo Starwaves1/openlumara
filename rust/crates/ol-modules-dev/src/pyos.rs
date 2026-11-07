@@ -1167,6 +1167,28 @@ mod tests {
     }
 
     #[test]
+    fn stream_lines_lone_cr_around_a_bad_chunk_matches_python() {
+        // python 3.14 `for line in open(p, encoding="utf-8")` on these files
+        let d = tempfile::tempdir().unwrap();
+        let f = join(&d.path().to_string_lossy(), "cr.txt");
+        // a bad chunk is dropped whole, lone CR included: python yields no lines from it
+        std::fs::write(&f, b"x\na\rb\r\xff").unwrap();
+        let (lines, err) = stream_lines(&f).unwrap();
+        assert!(lines.is_empty());
+        assert_eq!(err.as_deref(), Some("'utf-8' codec can't decode byte 0xff in position 6: invalid start byte"));
+        // a CR ending the last good 8 KiB chunk is held back (python gives 4095 lines, not 4096)
+        let mut data = (b"a\rb\r".to_vec().into_iter().chain(b"c\n".repeat(5000))).take(8191).collect::<Vec<u8>>();
+        data.push(b'\r');
+        data.push(0xff);
+        std::fs::write(&f, &data).unwrap();
+        let (lines, err) = stream_lines(&f).unwrap();
+        assert_eq!(lines.len(), 4095);
+        assert_eq!(&lines[..2], &["a\n".to_string(), "b\n".to_string()]);
+        assert_eq!(lines.last().map(String::as_str), Some("c\n"));
+        assert_eq!(err.as_deref(), Some("'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"));
+    }
+
+    #[test]
     fn copy2_same_file_and_dir_source_errors() {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().to_string_lossy().to_string();

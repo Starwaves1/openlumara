@@ -25,6 +25,7 @@ url.workspace = true
 reqwest.workspace = true
 libc = "0.2"
 fancy-regex = "0.16"
+unicode-properties = "0.1"
 # syntax checking / outlines (python: tree_sitter_language_pack)
 tree-sitter = "0.26"
 tree-sitter-python = "0.23"

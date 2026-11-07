@@ -373,8 +373,114 @@ fn py_int(v: Option<&Value>, default: i64) -> anyhow::Result<i64> {
         None => Ok(default),
         Some(Value::Number(n)) => Ok(n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)),
         Some(Value::Bool(b)) => Ok(*b as i64),
-        Some(Value::String(s)) => s.trim().parse::<i64>().map_err(|_| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
+        Some(Value::String(s)) => parse_py_int(s).ok_or_else(|| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
         Some(other) => Err(anyhow!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(other))),
+    }
+}
+
+/// the value of a unicode decimal digit (general category Nd), or None. Nd digits come in
+/// contiguous runs of ten, 0 through 9, so the value is the offset from the start of the run
+fn unicode_decimal_value(c: char) -> Option<u32> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let is_nd = |c: char| c.general_category() == GeneralCategory::DecimalNumber;
+    if !is_nd(c) {
+        return None;
+    }
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).is_some_and(is_nd) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// python `int(s)` for a str: surrounding whitespace, an optional sign, Unicode decimal digits
+/// and single underscores between digits (`int(" ٣_0 ") == 30`). None where python raises.
+fn parse_py_int(s: &str) -> Option<i64> {
+    // python strips the White_Space code points (int("\u{3000}5") == 5), but not \x1c-\x1f
+    let t = s.trim_matches(char::is_whitespace);
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for c in body.chars().filter(|&c| c != '_') {
+        // char::is_numeric is too wide ('½' is numeric but not a digit): only Nd counts
+        let d = if c.is_ascii() { c.to_digit(10)? } else { unicode_decimal_value(c)? };
+        let d = i64::from(d);
+        value = value.checked_mul(10)?;
+        value = if neg { value.checked_sub(d)? } else { value.checked_add(d)? };
+    }
+    Some(value)
+}
+
+/// python's `folder_blacklist` on the right of `in`: a list or dict tests membership, a str
+/// tests substring. the call sites use `(... or [])`, so falsy values behave as an empty list.
+#[derive(Debug, PartialEq)]
+enum Blacklist {
+    Members(Vec<String>),
+    Substring(String),
+}
+
+impl Blacklist {
+    fn from_value(v: Option<Value>) -> Self {
+        match v {
+            Some(v) if truthy(&v) => match v {
+                Value::String(s) => Self::Substring(s),
+                Value::Array(a) => Self::Members(a.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
+                Value::Object(m) => Self::Members(m.keys().cloned().collect()),
+                // python raises TypeError ("argument of type 'int' is not iterable") here
+                _ => Self::Members(Vec::new()),
+            },
+            _ => Self::Members(Vec::new()),
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::Members(v) => v.iter().any(|x| x == name),
+            Self::Substring(s) => s.contains(name),
+        }
+    }
+}
+
+/// the coder's POST routes that read `(body or {}).get(...)` in python
+const BODY_ROUTES: &[&str] = &[
+    "save",
+    "lint",
+    "create",
+    "move",
+    "delete",
+    "duplicate",
+    "search",
+    "git_stage",
+    "git_unstage",
+    "git_commit",
+    "git_branch",
+    "git_push",
+    "git_fetch",
+    "git_pull",
+    "git_branch_create",
+    "git_branch_delete",
+    "git_resolve",
+    "git_revert_file",
+    "upload",
+];
+
+/// python's `(body or {}).get(...)` in the coder's POST routes: a truthy body that is not a dict
+/// makes `.get` raise AttributeError, which the webui reports with that exception text.
+/// python refuses in read-only mode before it reads the body (every BODY route except lint and
+/// search), so a read-only coder never reaches the error there.
+fn body_dict(path: &str, body: Option<Value>, read_only: bool) -> anyhow::Result<Map<String, Value>> {
+    let refuses_first = read_only && !matches!(path, "lint" | "search");
+    match body {
+        Some(Value::Object(m)) => Ok(m),
+        Some(v) if truthy(&v) && BODY_ROUTES.contains(&path) && !refuses_first => {
+            anyhow::bail!("'{}' object has no attribute 'get'", py_type(&v))
+        }
+        _ => Ok(Map::new()),
     }
 }
 
@@ -418,8 +524,8 @@ impl Coder {
         }
     }
 
-    fn blacklist(&self) -> Vec<String> {
-        self.cfg_list("folder_blacklist")
+    fn blacklist(&self) -> Blacklist {
+        Blacklist::from_value(self.cfg("folder_blacklist"))
     }
 
     fn read_only(&self) -> bool {
@@ -514,7 +620,7 @@ impl Coder {
         let mut total: i64 = 0;
         for m in matches {
             let rel = pyos::relpath(&m, &target_path);
-            if rel.split('/').any(|p| blacklist.iter().any(|b| b == p)) {
+            if rel.split('/').any(|p| blacklist.contains(p)) {
                 continue;
             }
             total += 1;
@@ -1773,15 +1879,36 @@ impl Coder {
         self.result(format!("reverted {} to HEAD", rel_path), true)
     }
 
-    fn route_upload(&self, b: &Map<String, Value>) -> Value {
+    fn route_upload(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let filename = sget(b, "filename");
-        if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
-            return self.result("sandbox, path and filename are all required", false);
+        // python tests the raw values, so 0, false, [] and {} are as missing as ""
+        let raw_of = |k: &str| b.get(k).cloned().unwrap_or_else(|| json!(""));
+        let (sandbox_v, path_v, filename_v) = (raw_of("sandbox"), raw_of("path"), raw_of("filename"));
+        if !truthy(&sandbox_v) || !truthy(&path_v) || !truthy(&filename_v) {
+            return Ok(self.result("sandbox, path and filename are all required", false));
+        }
+        // python: regex.sub(r"[/\\]", "_", filename) raises outside the try
+        let Value::String(filename) = &filename_v else {
+            anyhow::bail!("a bytes-like object is required, not '{}'", py_type(&filename_v));
+        };
+        let safe_name = filename.replace(['/', '\\'], "_");
+        // python: rel_path.rstrip("/") raises outside the try
+        let Value::String(rel_path) = &path_v else {
+            anyhow::bail!("'{}' object has no attribute 'rstrip'", py_type(&path_v));
+        };
+        let target_rel = format!("{}/{}", rel_path.trim_end_matches('/'), safe_name);
+        // python: _get_sandbox_subpath runs inside the try, so its errors become the result text
+        let Value::String(sandbox) = &sandbox_v else {
+            return Ok(self.result(format!("startswith first arg must be str or a tuple of str, not {}", py_type(&sandbox_v)), false));
+        };
+        let target = match self.get_sandbox_subpath(sandbox, &target_rel) {
+            Ok(t) => t,
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        if pyos::exists(&target) {
+            return Ok(self.result(format!("file already exists: {}", target_rel), false));
         }
         // python: body.get("content", ""); b64decode raises for any non-str value (None here)
         let content_b64: Option<String> = match b.get("content") {
@@ -1789,28 +1916,19 @@ impl Coder {
             Some(Value::String(s)) => Some(s.clone()),
             Some(_) => None,
         };
-        let safe_name = filename.replace(['/', '\\'], "_");
-        let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
-        let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
-            Ok(t) => t,
-            Err(e) => return self.result(e, false),
-        };
-        if pyos::exists(&target) {
-            return self.result(format!("file already exists: {}", target_rel), false);
-        }
         let raw = match content_b64.as_deref().and_then(py_b64decode) {
             Some(r) => r,
-            None => return self.result("invalid base64 content", false),
+            None => return Ok(self.result("invalid base64 content", false)),
         };
         if raw.len() > 10_000_000 {
-            return self.result("file too large (max 10MB)", false);
+            return Ok(self.result("file too large (max 10MB)", false));
         }
         let parent = pyos::dirname(&target);
         let r = if parent.is_empty() { Ok(()) } else { pyos::makedirs(&parent, true) };
         if let Err(e) = r.and_then(|_| pyos::write_file(&target, &raw)) {
-            return self.result(e, false);
+            return Ok(self.result(e, false));
         }
-        self.result(format!("uploaded {}", target_rel), true)
+        Ok(self.result(format!("uploaded {}", target_rel), true))
     }
 }
 
@@ -1939,7 +2057,7 @@ impl Module for Coder {
     }
 
     async fn ui_route(&self, path: &str, _method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
-        let b: Map<String, Value> = body.and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let b = body_dict(path, body, self.read_only())?;
         let q = &query;
         Ok(match path {
             "sandboxes" => self.route_sandboxes()?,
@@ -1971,7 +2089,7 @@ impl Module for Coder {
             "git_conflicts" => self.route_git_conflicts(q).await,
             "git_resolve" => self.route_git_resolve(&b).await,
             "git_revert_file" => self.route_git_revert_file(&b).await,
-            "upload" => self.route_upload(&b),
+            "upload" => self.route_upload(&b)?,
             "git_split_diff" => self.route_git_split_diff(q).await,
             _ => anyhow::bail!("route not found: {}", path),
         })
@@ -2125,6 +2243,25 @@ mod tests {
         assert_eq!(Coder::root_str(&Some("/x".into())).unwrap(), "/x");
     }
 
+    #[test]
+    fn blacklist_follows_python_in_operator() {
+        // python `name in folder_blacklist`: list = element equality, str = substring, dict = keys
+        let list = Blacklist::from_value(Some(json!(["venv", 5])));
+        assert!(list.contains("venv"));
+        assert!(!list.contains("5"));
+        let text = Blacklist::from_value(Some(json!("venv")));
+        assert!(text.contains("env"));
+        assert!(!text.contains("node_modules"));
+        let dict = Blacklist::from_value(Some(json!({"venv": true})));
+        assert!(dict.contains("venv"));
+        assert!(!dict.contains("ven"));
+        // falsy values are `or []`: an empty string must not match every name
+        for v in [json!(""), json!(0), json!(false), json!([]), json!({}), Value::Null] {
+            assert!(!Blacklist::from_value(Some(v)).contains("anything"));
+        }
+        assert!(!Blacklist::from_value(None).contains("anything"));
+    }
+
     /// one test owns the process-wide config (set_for_tests), so every tool check lives here
     #[test]
     fn tool_return_strings_match_python() {
@@ -2178,6 +2315,23 @@ mod tests {
         assert_eq!(out["truncated"], false);
         assert_eq!(out["results"][0], json!({"file": "a.py", "line": 2, "text": "# foo bar"}));
 
+        // webui upload: body .get first, then raw truthiness, regex.sub on filename, rstrip on path
+        let up = |body: Value| rt.block_on(c.ui_route("upload", "POST", Some(body), Map::new()));
+        assert_eq!(up(json!("x")).err().map(|e| e.to_string()).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(up(json!([1])).err().map(|e| e.to_string()).as_deref(), Some("'list' object has no attribute 'get'"));
+        let v = up(json!({"sandbox": 0, "path": "a", "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "sandbox, path and filename are all required");
+        let v = up(json!({"sandbox": "sb", "path": [], "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "sandbox, path and filename are all required");
+        let v = up(json!({"sandbox": 5, "path": "a", "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "startswith first arg must be str or a tuple of str, not int");
+        let e = up(json!({"sandbox": "sb", "path": "a", "filename": 5})).err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some("a bytes-like object is required, not 'int'"));
+        let e = up(json!({"sandbox": "sb", "path": 5, "filename": "f"})).err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some("'int' object has no attribute 'rstrip'"));
+        let v = up(json!({"sandbox": "sb", "path": "up/", "filename": "a/b.txt", "content": "aGk="})).unwrap();
+        assert_eq!(v["content"], "uploaded up/a_b.txt");
+        assert_eq!(std::fs::read_to_string(root.join("up").join("a_b.txt")).unwrap(), "hi");
         // no sandbox_paths: python's _git_root is None (git runs in the server's cwd), and
         // the repo listing dies on os.path.join(None, '.git') outside any try
         ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
@@ -2189,5 +2343,45 @@ mod tests {
         assert_eq!(c.git_root("sb", "repo").err().as_deref(), Some("'NoneType' object has no attribute 'replace'"));
         let q = Map::from_iter([("sandbox".to_string(), json!("sb"))]);
         assert_eq!(c.route_git_repos(&q).err().map(|e| e.to_string()).as_deref(), Some(NONE_ROOT_ERR));
+    }
+
+    #[test]
+    fn py_int_string_parsing_matches_python_int() {
+        let ok = |s: &str| py_int(Some(&json!(s)), 0).ok();
+        let bad = |s: &str| py_int(Some(&json!(s)), 0).err().map(|e| e.to_string());
+        // unicode decimal digits (Nd), including a non-BMP run
+        assert_eq!(ok(" \u{663} "), Some(3));
+        assert_eq!(ok("\u{661}\u{662}\u{663}"), Some(123));
+        assert_eq!(ok("\u{663}\u{663}\u{663}\u{663}\u{663}"), Some(33333));
+        assert_eq!(ok("\u{ff15}"), Some(5));
+        assert_eq!(ok("\u{1d7d5}"), Some(7));
+        assert_eq!(ok("\u{663}_\u{660}"), Some(30));
+        // single underscores between digits, signs, unicode whitespace
+        assert_eq!(ok(" 1_000 "), Some(1000));
+        assert_eq!(ok("+5"), Some(5));
+        assert_eq!(ok("-0012"), Some(-12));
+        assert_eq!(ok("\u{3000}5"), Some(5));
+        assert_eq!(ok("-9223372036854775808"), Some(i64::MIN));
+        // numeric but not decimal digits, and everything python rejects
+        for s in ["\u{bd}", "1__0", "_1", "1_", "", "-", "\u{1c}5", "1 2"] {
+            assert_eq!(bad(s).as_deref(), Some(format!("invalid literal for int() with base 10: {}", pyos::py_quote(s)).as_str()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn body_dict_refuses_non_dict_bodies_like_python_get() {
+        let str_err = |path: &str, read_only: bool| body_dict(path, Some(json!("x")), read_only).err().map(|e| e.to_string());
+        assert_eq!(str_err("upload", false).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(body_dict("upload", Some(json!([1])), false).err().map(|e| e.to_string()).as_deref(), Some("'list' object has no attribute 'get'"));
+        // falsy bodies are `or {}`
+        assert!(body_dict("upload", Some(json!(0)), false).unwrap().is_empty());
+        assert!(body_dict("upload", None, false).unwrap().is_empty());
+        // read-only refusal comes first, except for lint and search (no read-only check in python)
+        assert!(body_dict("upload", Some(json!("x")), true).unwrap().is_empty());
+        assert!(body_dict("save", Some(json!("x")), true).unwrap().is_empty());
+        assert_eq!(str_err("search", true).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(str_err("lint", true).as_deref(), Some("'str' object has no attribute 'get'"));
+        // routes that never read the body are unaffected
+        assert!(body_dict("tree", Some(json!("x")), false).unwrap().is_empty());
     }
 }
