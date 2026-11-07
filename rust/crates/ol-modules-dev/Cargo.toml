@@ -25,6 +25,7 @@ url.workspace = true
 reqwest.workspace = true
 libc = "0.2"
 fancy-regex = "0.16"
+unicode-properties = "0.1"
 # syntax checking / outlines (python: tree_sitter_language_pack)
 tree-sitter = "0.26"
 tree-sitter-python = "0.23"
@@ -40,6 +41,11 @@ tree-sitter-json = "0.24"
 tree-sitter-bash = "0.25"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.25"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-lua = "0.5"
+tree-sitter-html = "0.23"
 
 [dev-dependencies]
 tempfile.workspace = true

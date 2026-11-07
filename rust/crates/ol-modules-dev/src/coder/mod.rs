@@ -253,13 +253,11 @@ pub fn parse_porcelain_z(raw: &[u8]) -> Vec<Value> {
         let x = field[0] as char;
         let y = field[1] as char;
         let mut path = decode(&field[3..]);
-        if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
-            if idx < fields.len() {
-                let newp = fields[idx];
-                idx += 1;
-                if !newp.is_empty() {
-                    path = decode(newp);
-                }
+        if (matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C')) && idx < fields.len() {
+            let newp = fields[idx];
+            idx += 1;
+            if !newp.is_empty() {
+                path = decode(newp);
             }
         }
         entries.push(json!({
@@ -373,8 +371,139 @@ fn py_int(v: Option<&Value>, default: i64) -> anyhow::Result<i64> {
         None => Ok(default),
         Some(Value::Number(n)) => Ok(n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64)),
         Some(Value::Bool(b)) => Ok(*b as i64),
-        Some(Value::String(s)) => s.trim().parse::<i64>().map_err(|_| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
+        Some(Value::String(s)) => parse_py_int(s).ok_or_else(|| anyhow!("invalid literal for int() with base 10: {}", pyos::py_quote(s))),
         Some(other) => Err(anyhow!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(other))),
+    }
+}
+
+/// the value of a unicode decimal digit (general category Nd), or None. Nd digits come in
+/// contiguous runs of ten, 0 through 9, so the value is the offset from the start of the run
+fn unicode_decimal_value(c: char) -> Option<u32> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let is_nd = |c: char| c.general_category() == GeneralCategory::DecimalNumber;
+    if !is_nd(c) {
+        return None;
+    }
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).is_some_and(is_nd) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// python `int(s)` for a str: surrounding whitespace, an optional sign, Unicode decimal digits
+/// and single underscores between digits (`int(" ٣_0 ") == 30`). None where python raises.
+fn parse_py_int(s: &str) -> Option<i64> {
+    // python strips the White_Space code points (int("\u{3000}5") == 5), but not \x1c-\x1f
+    let t = s.trim_matches(char::is_whitespace);
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for c in body.chars().filter(|&c| c != '_') {
+        // char::is_numeric is too wide ('½' is numeric but not a digit): only Nd counts
+        let d = if c.is_ascii() { c.to_digit(10)? } else { unicode_decimal_value(c)? };
+        let d = i64::from(d);
+        value = value.checked_mul(10)?;
+        value = if neg { value.checked_sub(d)? } else { value.checked_add(d)? };
+    }
+    Some(value)
+}
+
+/// python's `folder_blacklist` on the right of `name in folder_blacklist`: a list or dict tests
+/// membership, a str tests substring, and any other value (None, numbers, bools) makes python
+/// raise TypeError at the first `in`. `from_value` is the raw config value (glob, folder_grep);
+/// `from_value_or_empty` is python's `(config.get(...) or [])`, where falsy values are empty.
+#[derive(Debug, PartialEq)]
+enum Blacklist {
+    Members(Vec<String>),
+    Substring(String),
+    /// the python type name of a value that `in` cannot test
+    NotContainer(&'static str),
+}
+
+impl Blacklist {
+    fn from_value(v: Option<Value>) -> Self {
+        match v {
+            Some(Value::String(s)) => Self::Substring(s),
+            Some(Value::Array(a)) => Self::Members(a.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
+            Some(Value::Object(m)) => Self::Members(m.keys().cloned().collect()),
+            Some(other) => Self::NotContainer(py_type(&other)),
+            None => Self::NotContainer("NoneType"),
+        }
+    }
+
+    fn from_value_or_empty(v: Option<Value>) -> Self {
+        match v {
+            Some(v) if truthy(&v) => Self::from_value(Some(v)),
+            _ => Self::Members(Vec::new()),
+        }
+    }
+
+    fn contains(&self, name: &str) -> anyhow::Result<bool> {
+        match self {
+            Self::Members(v) => Ok(v.iter().any(|x| x == name)),
+            Self::Substring(s) => Ok(s.contains(name)),
+            Self::NotContainer(t) => anyhow::bail!("argument of type '{t}' is not a container or iterable"),
+        }
+    }
+}
+
+/// python `[d for d in dirs if not d.startswith('.') and d not in blacklist]` applied in place.
+/// the `in` test only runs for non-hidden names, so the first name whose test raises stops it.
+fn prune_dirs(dirs: &mut Vec<String>, blacklist: &Blacklist) -> anyhow::Result<()> {
+    let mut kept = Vec::with_capacity(dirs.len());
+    for d in dirs.iter() {
+        if d.starts_with('.') {
+            continue;
+        }
+        if !blacklist.contains(d)? {
+            kept.push(d.clone());
+        }
+    }
+    *dirs = kept;
+    Ok(())
+}
+
+/// the coder's POST routes that read `(body or {}).get(...)` in python
+const BODY_ROUTES: &[&str] = &[
+    "save",
+    "lint",
+    "create",
+    "move",
+    "delete",
+    "duplicate",
+    "search",
+    "git_stage",
+    "git_unstage",
+    "git_commit",
+    "git_branch",
+    "git_push",
+    "git_fetch",
+    "git_pull",
+    "git_branch_create",
+    "git_branch_delete",
+    "git_resolve",
+    "git_revert_file",
+    "upload",
+];
+
+/// python's `(body or {}).get(...)` in the coder's POST routes: a truthy body that is not a dict
+/// makes `.get` raise AttributeError, which the webui reports with that exception text.
+/// python refuses in read-only mode before it reads the body (every BODY route except lint and
+/// search), so a read-only coder never reaches the error there.
+fn body_dict(path: &str, body: Option<Value>, read_only: bool) -> anyhow::Result<Map<String, Value>> {
+    let refuses_first = read_only && !matches!(path, "lint" | "search");
+    match body {
+        Some(Value::Object(m)) => Ok(m),
+        Some(v) if truthy(&v) && BODY_ROUTES.contains(&path) && !refuses_first => {
+            anyhow::bail!("'{}' object has no attribute 'get'", py_type(&v))
+        }
+        _ => Ok(Map::new()),
     }
 }
 
@@ -418,8 +547,14 @@ impl Coder {
         }
     }
 
-    fn blacklist(&self) -> Vec<String> {
-        self.cfg_list("folder_blacklist")
+    /// python `config.get("folder_blacklist")` tested with `in` directly (glob, folder_grep)
+    fn blacklist(&self) -> Blacklist {
+        Blacklist::from_value(self.cfg("folder_blacklist"))
+    }
+
+    /// python `config.get("folder_blacklist") or []` (tree, files, search, git_repos)
+    fn blacklist_or_empty(&self) -> Blacklist {
+        Blacklist::from_value_or_empty(self.cfg("folder_blacklist"))
     }
 
     fn read_only(&self) -> bool {
@@ -514,7 +649,19 @@ impl Coder {
         let mut total: i64 = 0;
         for m in matches {
             let rel = pyos::relpath(&m, &target_path);
-            if rel.split('/').any(|p| blacklist.iter().any(|b| b == p)) {
+            let mut skip = false;
+            for part in rel.split('/') {
+                match blacklist.contains(part) {
+                    Ok(true) => {
+                        skip = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    // python: the TypeError is caught by glob's try and returned as result text
+                    Err(e) => return Ok(self.result(e.to_string(), false)),
+                }
+            }
+            if skip {
                 continue;
             }
             total += 1;
@@ -571,8 +718,12 @@ impl Coder {
         };
 
         let mut matches: Vec<Value> = Vec::new();
+        let mut walk_err: Option<anyhow::Error> = None;
         let early = pyos::walk(&target_path, &mut |dirpath, folders, files| {
-            folders.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+            if let Err(e) = prune_dirs(folders, &blacklist) {
+                walk_err = Some(e);
+                return ControlFlow::Break(None);
+            }
             if matches.len() as i64 >= max_matches {
                 return ControlFlow::Break(None);
             }
@@ -611,6 +762,9 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
         if let Some(Some(v)) = early {
             return Ok(self.result(v, true));
         }
@@ -862,27 +1016,33 @@ impl Coder {
         if !pyos::isdir(&target) {
             return self.result("not a folder", false);
         }
-        let blacklist = self.blacklist();
+        let blacklist = self.blacklist_or_empty();
         let names = match pyos::listdir(&target) {
             Ok(n) => n,
             Err(e) => return self.result(e, false),
         };
-        let mut entries: Vec<(bool, String, Value)> = names
+        // python: `is_dir and name in blacklist` inside the listing try, so a raise becomes result text
+        let built: anyhow::Result<Vec<(bool, String, Value)>> = names
             .into_iter()
             .map(|name| {
                 let full = pyos::join(&target, &name);
                 let is_dir = pyos::isdir(&full);
                 let child_rel = pyos::normpath(&pyos::join(&rel_path, &name));
+                let blacklisted = is_dir && blacklist.contains(&name)?;
                 let v = json!({
                     "name": name,
                     "path": child_rel,
                     "is_dir": is_dir,
                     "hidden": name.starts_with('.'),
-                    "blacklisted": is_dir && blacklist.contains(&name),
+                    "blacklisted": blacklisted,
                 });
-                (is_dir, name.to_lowercase(), v)
+                Ok((is_dir, name.to_lowercase(), v))
             })
             .collect();
+        let mut entries = match built {
+            Ok(e) => e,
+            Err(e) => return self.result(e.to_string(), false),
+        };
         entries.sort_by(|a, b| (!a.0, &a.1).cmp(&(!b.0, &b.1)));
         json!({"path": rel_path, "entries": entries.into_iter().map(|e| e.2).collect::<Vec<_>>()})
     }
@@ -897,10 +1057,15 @@ impl Coder {
             Ok(_) => return self.result("sandbox not found", false),
             Err(e) => return self.result(e, false),
         };
-        let blacklist = self.blacklist();
+        let blacklist = self.blacklist_or_empty();
         let mut files: Vec<String> = Vec::new();
+        // python: the walk sits in a try, so a raise from the blacklist test becomes result text
+        let mut walk_err: Option<anyhow::Error> = None;
         pyos::walk::<()>(&target, &mut |dirpath, folders, filenames| {
-            folders.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+            if let Err(e) = prune_dirs(folders, &blacklist) {
+                walk_err = Some(e);
+                return ControlFlow::Break(());
+            }
             for name in filenames {
                 if name.starts_with('.') {
                     continue;
@@ -909,6 +1074,9 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = walk_err {
+            return self.result(e.to_string(), false);
+        }
         files.sort();
         json!({"files": files})
     }
@@ -1133,11 +1301,16 @@ impl Coder {
             return Err(err("expected str, bytes or os.PathLike object, not NoneType"));
         };
         let needle_lower = needle.to_lowercase();
-        let blacklist = self.blacklist();
+        let blacklist = self.blacklist_or_empty();
         let mut results: Vec<Value> = Vec::new();
         let mut truncated = false;
+        // python: the os.walk loop has no try, so a raise from the blacklist test escapes the route
+        let mut walk_err: Option<anyhow::Error> = None;
         pyos::walk::<()>(&root, &mut |dirpath, dirnames, filenames| {
-            dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+            if let Err(e) = prune_dirs(dirnames, &blacklist) {
+                walk_err = Some(e);
+                return ControlFlow::Break(());
+            }
             for fname in filenames {
                 if fname.starts_with('.') {
                     continue;
@@ -1176,6 +1349,9 @@ impl Coder {
                 ControlFlow::Continue(())
             }
         });
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
         Ok(json!({"results": results, "truncated": truncated}))
     }
 
@@ -1226,7 +1402,7 @@ impl Coder {
         let Some(root) = root else {
             return Err(err(NONE_ROOT_ERR));
         };
-        let blacklist = self.blacklist();
+        let blacklist = self.blacklist_or_empty();
         let max_depth = 6usize;
         let max_repos = 50usize;
         let is_repo = |p: &str| {
@@ -1237,10 +1413,19 @@ impl Coder {
         if is_repo(&root) {
             repos.push(String::new());
         }
+        // python: the os.walk loop has no try, so a raise from the blacklist test escapes the route
+        let mut walk_err: Option<anyhow::Error> = None;
         pyos::walk::<()>(&root, &mut |dirpath, dirnames, _| {
             let rel = pyos::relpath(dirpath, &root);
             let depth = if rel == "." { 0 } else { rel.split('/').count() };
-            dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d) && depth + 1 <= max_depth);
+            if let Err(e) = prune_dirs(dirnames, &blacklist) {
+                walk_err = Some(e);
+                return ControlFlow::Break(());
+            }
+            // python `depth + 1 <= max_depth` is the same for every child of this folder
+            if depth + 1 > max_depth {
+                dirnames.clear();
+            }
             if depth == 0 || depth > max_depth {
                 return ControlFlow::Continue(());
             }
@@ -1253,6 +1438,9 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
         Ok(json!({"repos": repos}))
     }
 
@@ -1773,15 +1961,36 @@ impl Coder {
         self.result(format!("reverted {} to HEAD", rel_path), true)
     }
 
-    fn route_upload(&self, b: &Map<String, Value>) -> Value {
+    fn route_upload(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let filename = sget(b, "filename");
-        if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
-            return self.result("sandbox, path and filename are all required", false);
+        // python tests the raw values, so 0, false, [] and {} are as missing as ""
+        let raw_of = |k: &str| b.get(k).cloned().unwrap_or_else(|| json!(""));
+        let (sandbox_v, path_v, filename_v) = (raw_of("sandbox"), raw_of("path"), raw_of("filename"));
+        if !truthy(&sandbox_v) || !truthy(&path_v) || !truthy(&filename_v) {
+            return Ok(self.result("sandbox, path and filename are all required", false));
+        }
+        // python: regex.sub(r"[/\\]", "_", filename) raises outside the try
+        let Value::String(filename) = &filename_v else {
+            anyhow::bail!("a bytes-like object is required, not '{}'", py_type(&filename_v));
+        };
+        let safe_name = filename.replace(['/', '\\'], "_");
+        // python: rel_path.rstrip("/") raises outside the try
+        let Value::String(rel_path) = &path_v else {
+            anyhow::bail!("'{}' object has no attribute 'rstrip'", py_type(&path_v));
+        };
+        let target_rel = format!("{}/{}", rel_path.trim_end_matches('/'), safe_name);
+        // python: _get_sandbox_subpath runs inside the try, so its errors become the result text
+        let Value::String(sandbox) = &sandbox_v else {
+            return Ok(self.result(format!("startswith first arg must be str or a tuple of str, not {}", py_type(&sandbox_v)), false));
+        };
+        let target = match self.get_sandbox_subpath(sandbox, &target_rel) {
+            Ok(t) => t,
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        if pyos::exists(&target) {
+            return Ok(self.result(format!("file already exists: {}", target_rel), false));
         }
         // python: body.get("content", ""); b64decode raises for any non-str value (None here)
         let content_b64: Option<String> = match b.get("content") {
@@ -1789,28 +1998,19 @@ impl Coder {
             Some(Value::String(s)) => Some(s.clone()),
             Some(_) => None,
         };
-        let safe_name = filename.replace(['/', '\\'], "_");
-        let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
-        let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
-            Ok(t) => t,
-            Err(e) => return self.result(e, false),
-        };
-        if pyos::exists(&target) {
-            return self.result(format!("file already exists: {}", target_rel), false);
-        }
         let raw = match content_b64.as_deref().and_then(py_b64decode) {
             Some(r) => r,
-            None => return self.result("invalid base64 content", false),
+            None => return Ok(self.result("invalid base64 content", false)),
         };
         if raw.len() > 10_000_000 {
-            return self.result("file too large (max 10MB)", false);
+            return Ok(self.result("file too large (max 10MB)", false));
         }
         let parent = pyos::dirname(&target);
         let r = if parent.is_empty() { Ok(()) } else { pyos::makedirs(&parent, true) };
         if let Err(e) = r.and_then(|_| pyos::write_file(&target, &raw)) {
-            return self.result(e, false);
+            return Ok(self.result(e, false));
         }
-        self.result(format!("uploaded {}", target_rel), true)
+        Ok(self.result(format!("uploaded {}", target_rel), true))
     }
 }
 
@@ -1939,7 +2139,7 @@ impl Module for Coder {
     }
 
     async fn ui_route(&self, path: &str, _method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
-        let b: Map<String, Value> = body.and_then(|v| v.as_object().cloned()).unwrap_or_default();
+        let b = body_dict(path, body, self.read_only())?;
         let q = &query;
         Ok(match path {
             "sandboxes" => self.route_sandboxes()?,
@@ -1971,7 +2171,7 @@ impl Module for Coder {
             "git_conflicts" => self.route_git_conflicts(q).await,
             "git_resolve" => self.route_git_resolve(&b).await,
             "git_revert_file" => self.route_git_revert_file(&b).await,
-            "upload" => self.route_upload(&b),
+            "upload" => self.route_upload(&b)?,
             "git_split_diff" => self.route_git_split_diff(q).await,
             _ => anyhow::bail!("route not found: {}", path),
         })
@@ -2125,6 +2325,77 @@ mod tests {
         assert_eq!(Coder::root_str(&Some("/x".into())).unwrap(), "/x");
     }
 
+    #[test]
+    fn blacklist_follows_python_in_operator() {
+        // python `name in folder_blacklist`: list = element equality, str = substring, dict = keys
+        let list = Blacklist::from_value(Some(json!(["venv", 5])));
+        assert!(list.contains("venv").unwrap());
+        assert!(!list.contains("5").unwrap());
+        let text = Blacklist::from_value(Some(json!("venv")));
+        assert!(text.contains("env").unwrap());
+        assert!(!text.contains("node_modules").unwrap());
+        let dict = Blacklist::from_value(Some(json!({"venv": true})));
+        assert!(dict.contains("venv").unwrap());
+        assert!(!dict.contains("ven").unwrap());
+        // `(config.get(..) or [])`: falsy values are an empty list, so nothing matches
+        for v in [json!(""), json!(0), json!(false), json!([]), json!({}), Value::Null] {
+            assert!(!Blacklist::from_value_or_empty(Some(v)).contains("anything").unwrap());
+        }
+        assert!(!Blacklist::from_value_or_empty(None).contains("anything").unwrap());
+        // a bare `in` (glob, folder_grep) keeps falsy values: "" is a substring test, and
+        // None/0/false raise TypeError like python
+        assert!(!Blacklist::from_value(Some(json!(""))).contains("anything").unwrap());
+        assert!(Blacklist::from_value(Some(json!(""))).contains("").unwrap());
+        assert!(!Blacklist::from_value(Some(json!([]))).contains("anything").unwrap());
+    }
+
+    #[test]
+    fn blacklist_non_container_raises_like_python() {
+        // python 3.14: `"x" in 5` -> TypeError "argument of type 'int' is not a container or iterable"
+        let cases = [
+            (json!(5), "int"),
+            (json!(0), "int"),
+            (json!(1.5), "float"),
+            (json!(0.0), "float"),
+            (json!(true), "bool"),
+            (json!(false), "bool"),
+        ];
+        for (v, ty) in cases {
+            let expected = format!("argument of type '{ty}' is not a container or iterable");
+            let bare = Blacklist::from_value(Some(v.clone())).contains("src").unwrap_err();
+            assert_eq!(bare.to_string(), expected);
+            // truthy non-containers raise through `or []` too; falsy ones are empty there
+            let or_empty = Blacklist::from_value_or_empty(Some(v.clone())).contains("src");
+            if truthy(&v) {
+                assert_eq!(or_empty.unwrap_err().to_string(), expected);
+            } else {
+                assert!(!or_empty.unwrap());
+            }
+        }
+        // a bare None (missing config) raises at the first `in`, not an empty list
+        let none = Blacklist::from_value(None).contains("src").unwrap_err();
+        assert_eq!(none.to_string(), "argument of type 'NoneType' is not a container or iterable");
+    }
+
+    #[test]
+    fn prune_dirs_only_tests_non_hidden_names() {
+        // hidden names short-circuit before `in`, so they are pruned without raising
+        let bad = Blacklist::from_value(Some(json!(5)));
+        let mut hidden = vec![".git".to_string()];
+        prune_dirs(&mut hidden, &bad).unwrap();
+        assert!(hidden.is_empty(), "hidden folders are pruned without an `in` test");
+        let mut visible = vec!["src".to_string()];
+        assert_eq!(
+            prune_dirs(&mut visible, &bad).unwrap_err().to_string(),
+            "argument of type 'int' is not a container or iterable"
+        );
+        // with a container the blacklisted and hidden names are removed in order
+        let list = Blacklist::from_value(Some(json!(["venv"])));
+        let mut dirs = vec![".git".to_string(), "venv".to_string(), "src".to_string()];
+        prune_dirs(&mut dirs, &list).unwrap();
+        assert_eq!(dirs, vec!["src".to_string()]);
+    }
+
     /// one test owns the process-wide config (set_for_tests), so every tool check lives here
     #[test]
     fn tool_return_strings_match_python() {
@@ -2178,6 +2449,23 @@ mod tests {
         assert_eq!(out["truncated"], false);
         assert_eq!(out["results"][0], json!({"file": "a.py", "line": 2, "text": "# foo bar"}));
 
+        // webui upload: body .get first, then raw truthiness, regex.sub on filename, rstrip on path
+        let up = |body: Value| rt.block_on(c.ui_route("upload", "POST", Some(body), Map::new()));
+        assert_eq!(up(json!("x")).err().map(|e| e.to_string()).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(up(json!([1])).err().map(|e| e.to_string()).as_deref(), Some("'list' object has no attribute 'get'"));
+        let v = up(json!({"sandbox": 0, "path": "a", "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "sandbox, path and filename are all required");
+        let v = up(json!({"sandbox": "sb", "path": [], "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "sandbox, path and filename are all required");
+        let v = up(json!({"sandbox": 5, "path": "a", "filename": "f"})).unwrap();
+        assert_eq!(v["content"], "startswith first arg must be str or a tuple of str, not int");
+        let e = up(json!({"sandbox": "sb", "path": "a", "filename": 5})).err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some("a bytes-like object is required, not 'int'"));
+        let e = up(json!({"sandbox": "sb", "path": 5, "filename": "f"})).err().map(|e| e.to_string());
+        assert_eq!(e.as_deref(), Some("'int' object has no attribute 'rstrip'"));
+        let v = up(json!({"sandbox": "sb", "path": "up/", "filename": "a/b.txt", "content": "aGk="})).unwrap();
+        assert_eq!(v["content"], "uploaded up/a_b.txt");
+        assert_eq!(std::fs::read_to_string(root.join("up").join("a_b.txt")).unwrap(), "hi");
         // no sandbox_paths: python's _git_root is None (git runs in the server's cwd), and
         // the repo listing dies on os.path.join(None, '.git') outside any try
         ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
@@ -2189,5 +2477,45 @@ mod tests {
         assert_eq!(c.git_root("sb", "repo").err().as_deref(), Some("'NoneType' object has no attribute 'replace'"));
         let q = Map::from_iter([("sandbox".to_string(), json!("sb"))]);
         assert_eq!(c.route_git_repos(&q).err().map(|e| e.to_string()).as_deref(), Some(NONE_ROOT_ERR));
+    }
+
+    #[test]
+    fn py_int_string_parsing_matches_python_int() {
+        let ok = |s: &str| py_int(Some(&json!(s)), 0).ok();
+        let bad = |s: &str| py_int(Some(&json!(s)), 0).err().map(|e| e.to_string());
+        // unicode decimal digits (Nd), including a non-BMP run
+        assert_eq!(ok(" \u{663} "), Some(3));
+        assert_eq!(ok("\u{661}\u{662}\u{663}"), Some(123));
+        assert_eq!(ok("\u{663}\u{663}\u{663}\u{663}\u{663}"), Some(33333));
+        assert_eq!(ok("\u{ff15}"), Some(5));
+        assert_eq!(ok("\u{1d7d5}"), Some(7));
+        assert_eq!(ok("\u{663}_\u{660}"), Some(30));
+        // single underscores between digits, signs, unicode whitespace
+        assert_eq!(ok(" 1_000 "), Some(1000));
+        assert_eq!(ok("+5"), Some(5));
+        assert_eq!(ok("-0012"), Some(-12));
+        assert_eq!(ok("\u{3000}5"), Some(5));
+        assert_eq!(ok("-9223372036854775808"), Some(i64::MIN));
+        // numeric but not decimal digits, and everything python rejects
+        for s in ["\u{bd}", "1__0", "_1", "1_", "", "-", "\u{1c}5", "1 2"] {
+            assert_eq!(bad(s).as_deref(), Some(format!("invalid literal for int() with base 10: {}", pyos::py_quote(s)).as_str()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn body_dict_refuses_non_dict_bodies_like_python_get() {
+        let str_err = |path: &str, read_only: bool| body_dict(path, Some(json!("x")), read_only).err().map(|e| e.to_string());
+        assert_eq!(str_err("upload", false).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(body_dict("upload", Some(json!([1])), false).err().map(|e| e.to_string()).as_deref(), Some("'list' object has no attribute 'get'"));
+        // falsy bodies are `or {}`
+        assert!(body_dict("upload", Some(json!(0)), false).unwrap().is_empty());
+        assert!(body_dict("upload", None, false).unwrap().is_empty());
+        // read-only refusal comes first, except for lint and search (no read-only check in python)
+        assert!(body_dict("upload", Some(json!("x")), true).unwrap().is_empty());
+        assert!(body_dict("save", Some(json!("x")), true).unwrap().is_empty());
+        assert_eq!(str_err("search", true).as_deref(), Some("'str' object has no attribute 'get'"));
+        assert_eq!(str_err("lint", true).as_deref(), Some("'str' object has no attribute 'get'"));
+        // routes that never read the body are unaffected
+        assert!(body_dict("tree", Some(json!("x")), false).unwrap().is_empty());
     }
 }
