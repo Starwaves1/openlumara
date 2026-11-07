@@ -316,10 +316,14 @@ fn str_for_lower(v: &Value) -> anyhow::Result<&str> {
 }
 
 /// python `self._find_char_name(name) or char.get("name")`: an empty stored key is falsy and falls back
-fn stored_name_or(found: Option<String>, fallback: Value) -> Value {
+/// to the card's own name. `char` is always truthy here, so a non-dict card raises python's `.get` error
+fn canonical_name(found: Option<String>, ch: &Value) -> anyhow::Result<Value> {
     match found.filter(|n| !n.is_empty()) {
-        Some(n) => json!(n),
-        None => fallback,
+        Some(n) => Ok(json!(n)),
+        None => match ch {
+            Value::Object(o) => Ok(o.get("name").cloned().unwrap_or(Value::Null)),
+            other => anyhow::bail!("'{}' object has no attribute 'get'", py_type(other)),
+        },
     }
 }
 
@@ -618,7 +622,7 @@ impl Characters {
         let Some(ch) = self.find_character(name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let char_name = stored_name_or(self.find_char_name(name), ch.get("name").cloned().unwrap_or(Value::Null));
+        let char_name = canonical_name(self.find_char_name(name), &ch)?;
         self.set_current_character(char_name.clone())?;
         let char_name = py_str(&char_name);
         let first = ch.get("first_message").cloned().unwrap_or(json!(""));
@@ -1048,8 +1052,8 @@ impl Characters {
 
     /// python `self._find_char_name(name) or char.get("name")`: the canonical stored key, or the card's name
     /// when the key is missing or empty
-    fn canonical_char_name(&self, name: &str, ch: &Value) -> Value {
-        stored_name_or(self.find_char_name(name), ch.get("name").cloned().unwrap_or(Value::Null))
+    fn canonical_char_name(&self, name: &str, ch: &Value) -> anyhow::Result<Value> {
+        canonical_name(self.find_char_name(name), ch)
     }
 
     fn route_apply(&self, body: &Option<Value>) -> anyhow::Result<Value> {
@@ -1061,7 +1065,7 @@ impl Characters {
         let Some(ch) = self.find_character(&name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let char_name = self.canonical_char_name(&name, &ch);
+        let char_name = self.canonical_char_name(&name, &ch)?;
         self.set_current_character(char_name.clone())?;
         Ok(self.base.result(char_name, true))
     }
@@ -1089,7 +1093,7 @@ impl Characters {
         let Some(ch) = self.find_character(&name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let key = self.canonical_char_name(&name, &ch);
+        let key = self.canonical_char_name(&name, &ch)?;
         // python `self.config.get("category") or "general"` is passed to chat.new() unchanged
         let category = self.base.config.get1("category").filter(truthy).unwrap_or_else(|| json!("general"));
         let channel = self.channel()?;
@@ -1454,9 +1458,15 @@ mod tests {
 
     #[test]
     fn empty_stored_key_falls_back_to_the_card_name_like_python_or() {
-        assert_eq!(stored_name_or(Some(String::new()), json!("Ann")), json!("Ann"));
-        assert_eq!(stored_name_or(Some("ann".into()), json!("Ann")), json!("ann"));
-        assert_eq!(stored_name_or(None, json!(5)), json!(5));
+        assert_eq!(canonical_name(Some(String::new()), &json!({"name": "Ann"})).unwrap(), json!("Ann"));
+        assert_eq!(canonical_name(Some("ann".into()), &json!({"name": "Ann"})).unwrap(), json!("ann"));
+        assert_eq!(canonical_name(None, &json!({"name": 5})).unwrap(), json!(5));
+        assert_eq!(canonical_name(Some(String::new()), &json!({})).unwrap(), Value::Null);
+        // python `char.get("name")` on a truthy non-dict card
+        assert_eq!(canonical_name(Some(String::new()), &json!("card")).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+        assert_eq!(canonical_name(Some(String::new()), &json!(["x"])).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+        // a non-empty stored key never reaches `.get`
+        assert_eq!(canonical_name(Some("Ann".into()), &json!("card")).unwrap(), json!("Ann"));
     }
 
     #[test]
