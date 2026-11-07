@@ -7,6 +7,7 @@ use ol_core::pyjson::py_str;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::path::Path;
+use std::sync::Arc;
 
 #[path = "../../../generated/modules/docs.rs"]
 pub(crate) mod meta;
@@ -19,6 +20,10 @@ pub struct Docs {
 const INSTRUCTION: &str = "You can call docs_list again with a subfolder to navigate deeper, or use docs_read to read a file.";
 
 impl Docs {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
@@ -198,5 +203,28 @@ impl Module for Docs {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_folder_drops_a_double_added_folder() {
+        assert_eq!(strip_folder("openlumara_docs/intro.md", "openlumara_docs"), "/intro.md");
+        assert_eq!(strip_folder("intro.md", "openlumara_docs"), "intro.md");
+    }
+
+    #[test]
+    fn list_level_splits_dirs_and_files_under_the_subfolder_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(dir.path().join("guide")).expect("mkdir");
+        std::fs::write(dir.path().join("a.md"), "x").expect("write");
+        std::fs::write(dir.path().join("guide").join("b.md"), "y").expect("write");
+        let base = dir.path().to_str().expect("utf-8 path");
+        assert_eq!(list_level(base, None).expect("list"), (vec!["guide".to_string()], vec!["a.md".to_string()]));
+        let sub = format!("{base}/guide");
+        assert_eq!(list_level(&sub, Some("guide")).expect("list"), (vec![], vec!["guide/b.md".to_string()]));
     }
 }

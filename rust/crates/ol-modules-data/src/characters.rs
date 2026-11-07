@@ -4,7 +4,7 @@
 #[path = "../../../generated/modules/characters.rs"]
 pub mod meta;
 
-use crate::util::{b64decode, body_get, body_str, eq_ci_strip};
+use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_type};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -207,6 +207,24 @@ fn clean_tags(raw: Option<&Value>) -> Vec<Value> {
 /// `str(x).lower()` sort key
 fn lower_key(v: &Value) -> String {
     py_str(v).to_lowercase()
+}
+
+/// python `a < b` for two category keys: str with str, numbers and bools with each other.
+/// any other pair raises TypeError, returned as its message
+fn category_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    fn num(v: &Value) -> Option<f64> {
+        match v {
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            other => other.as_f64(),
+        }
+    }
+    match (a, b) {
+        (Value::String(x), Value::String(y)) => Ok(x.cmp(y)),
+        _ => match (num(a), num(b)) {
+            (Some(x), Some(y)) => Ok(x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)),
+            _ => Err(format!("'<' not supported between instances of '{}' and '{}'", py_type(a), py_type(b))),
+        },
+    }
 }
 
 // ---------------------------------------------------------
@@ -588,17 +606,36 @@ impl Characters {
 
     // ---------------- webui routes ----------------
 
-    fn route_list(&self) -> Value {
-        let mut grouped: IndexMap<String, Vec<Value>> = IndexMap::new();
+    /// python `_route_list`: `char.get("category") or "general"` keeps a truthy category as its raw value
+    fn route_list(&self) -> anyhow::Result<Value> {
+        let mut grouped: IndexMap<String, (Value, Vec<Value>)> = IndexMap::new();
         for (name, ch) in self.all() {
-            let cat = ch.get("category").filter(|c| truthy(c)).map(py_str).unwrap_or_else(|| "general".into());
-            grouped.entry(cat).or_default().push(json!({
+            let cat = match ch.get("category") {
+                Some(c) if truthy(c) => c.clone(),
+                _ => json!("general"),
+            };
+            // python dict keys must be hashable
+            if matches!(cat, Value::Array(_) | Value::Object(_)) {
+                anyhow::bail!("unhashable type: '{}'", py_type(&cat));
+            }
+            grouped.entry(cat.to_string()).or_insert_with(|| (cat.clone(), Vec::new())).1.push(json!({
                 "name": or_value(ch.get("name"), json!(name)),
                 "tags": or_value(ch.get("tags"), json!([])),
             }));
         }
-        let mut cats: Vec<(String, Vec<Value>)> = grouped.into_iter().collect();
-        cats.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut cats: Vec<(Value, Vec<Value>)> = grouped.into_values().collect();
+        // python sorted(grouped.items()): categories compare with `<`, a mixed str/number pair raises
+        let mut order_err = None;
+        cats.sort_by(|a, b| match category_order(&a.0, &b.0) {
+            Ok(o) => o,
+            Err(e) => {
+                order_err.get_or_insert(e);
+                std::cmp::Ordering::Equal
+            }
+        });
+        if let Some(e) = order_err {
+            anyhow::bail!(e);
+        }
         let categories: Vec<Value> = cats
             .into_iter()
             .map(|(cat, mut chars)| {
@@ -606,7 +643,7 @@ impl Characters {
                 json!({"name": cat, "characters": chars})
             })
             .collect();
-        json!({"categories": categories})
+        Ok(json!({"categories": categories}))
     }
 
     fn route_all(&self) -> Value {
@@ -974,7 +1011,7 @@ impl Module for Characters {
 
     async fn ui_route(&self, path: &str, method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         match (path, method) {
-            ("list", "GET") => Ok(self.route_list()),
+            ("list", "GET") => self.route_list(),
             ("current", "GET") => {
                 let c = self.current_character()?;
                 Ok(if truthy(&c) { c } else { Value::Null })
@@ -987,10 +1024,20 @@ impl Module for Characters {
                 })
             }
             ("switch", "POST") => {
-                let name = body_get(&body, "name").filter(truthy);
-                match name {
-                    Some(n) => self.switch(&py_str(&n)).await,
+                // python: `(body or {}).get("name", "")`, then `if not name`
+                dict_body(&body)?;
+                match body_get(&body, "name").filter(truthy) {
                     None => Ok(self.base.result("error: no character name given", false)),
+                    Some(Value::String(name)) => self.switch(&name).await,
+                    // python switch() -> _find_character() calls `name.lower()` once per stored character,
+                    // so a non-string name only fails when there is a character to compare it with
+                    Some(other) => {
+                        if self.all().is_empty() {
+                            Ok(self.base.result("character not found", false))
+                        } else {
+                            anyhow::bail!("'{}' object has no attribute 'lower'", py_type(&other))
+                        }
+                    }
                 }
             }
             ("switch_default", "POST") => {

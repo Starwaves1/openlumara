@@ -205,9 +205,15 @@ pub fn b64decode(s: &[u8]) -> Result<Vec<u8>, String> {
     engine.decode(cut).map_err(|_| "Incorrect padding".to_string())
 }
 
-/// python `str.lower()` + `str.strip()` equality used by several lookups
+/// python `str.strip()`: strips every char for which `str.isspace()` is true. that set is rust's
+/// White_Space plus U+001C..=U+001F (python counts the file/group/record/unit separators as spaces)
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+}
+
+/// python `a.lower().strip() == b.lower().strip()` used by several lookups
 pub fn eq_ci_strip(a: &str, b: &str) -> bool {
-    a.to_lowercase().trim() == b.to_lowercase().trim()
+    py_strip(&a.to_lowercase()) == py_strip(&b.to_lowercase())
 }
 
 #[cfg(test)]
@@ -244,6 +250,14 @@ mod tests {
         assert_eq!(query_int(&q, "y", 100), 7);
         assert_eq!(round2(0.125), 0.12);
         assert_eq!(round2(1.0 / 3.0), 0.33);
+    }
+
+    #[test]
+    fn py_strip_and_name_compare_like_python() {
+        // \x1c..\x1f are isspace() in python, so str.strip() removes them
+        assert_eq!(py_strip("\u{1c}\u{1f} Ann \u{85}"), "Ann");
+        assert!(eq_ci_strip("\u{1c}Ann", "ann\u{1d}"));
+        assert!(!eq_ci_strip("Ann", "Anna"));
     }
 
     #[test]

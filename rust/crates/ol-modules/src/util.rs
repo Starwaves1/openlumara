@@ -55,15 +55,93 @@ pub fn read_text(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| os_error(&e, path))?;
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
-        Err(e) => {
-            let err = e.utf8_error();
-            let pos = err.valid_up_to();
-            let b = e.as_bytes()[pos];
-            let reason = if (0x80..0xc0).contains(&b) || b >= 0xf8 { "invalid start byte" } else { "invalid continuation byte" };
-            return Err(format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", b, pos, reason));
-        }
+        Err(e) => return Err(utf8_decode_error(e.as_bytes()).unwrap_or_else(|| "'utf-8' codec can't decode bytes".into())),
     };
     Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// str(UnicodeDecodeError) for a utf-8 decode of `data` (CPython's utf-8 decoder rules: the
+/// error span, the reason, and the single-byte or byte-range message form). None when `data` is valid.
+pub fn utf8_decode_error(data: &[u8]) -> Option<String> {
+    let end = data.len();
+    let cont = |b: u8| (0x80..=0xbf).contains(&b);
+    let mut s = 0usize;
+    // (start, end, reason) of the first bad sequence; the scan stops at a truncated tail
+    let failure: Option<(usize, usize, &str)> = loop {
+        if s >= end {
+            break None;
+        }
+        let ch = data[s];
+        if ch < 0x80 {
+            s += 1;
+        } else if ch < 0xe0 {
+            if ch < 0xc2 {
+                break Some((s, s + 1, "invalid start byte"));
+            }
+            if end - s < 2 {
+                break Some((s, end, "unexpected end of data"));
+            }
+            if !cont(data[s + 1]) {
+                break Some((s, s + 1, "invalid continuation byte"));
+            }
+            s += 2;
+        } else if ch < 0xf0 {
+            let ch2 = data.get(s + 1).copied();
+            let bad2 = ch2.is_some_and(|c| !cont(c) || (if c < 0xa0 { ch == 0xe0 } else { ch == 0xed }));
+            if end - s < 3 {
+                if end - s < 2 {
+                    break Some((s, end, "unexpected end of data"));
+                }
+                if bad2 {
+                    break Some((s, s + 1, "invalid continuation byte"));
+                }
+                break Some((s, end, "unexpected end of data"));
+            }
+            if bad2 {
+                break Some((s, s + 1, "invalid continuation byte"));
+            }
+            if !cont(data[s + 2]) {
+                break Some((s, s + 2, "invalid continuation byte"));
+            }
+            s += 3;
+        } else if ch < 0xf5 {
+            let ch2 = data.get(s + 1).copied();
+            let bad2 = ch2.is_some_and(|c| !cont(c) || (if c < 0x90 { ch == 0xf0 } else { ch == 0xf4 }));
+            if end - s < 4 {
+                if end - s < 2 {
+                    break Some((s, end, "unexpected end of data"));
+                }
+                if bad2 {
+                    break Some((s, s + 1, "invalid continuation byte"));
+                }
+                if end - s < 3 {
+                    break Some((s, end, "unexpected end of data"));
+                }
+                if !cont(data[s + 2]) {
+                    break Some((s, s + 2, "invalid continuation byte"));
+                }
+                break Some((s, end, "unexpected end of data"));
+            }
+            if bad2 {
+                break Some((s, s + 1, "invalid continuation byte"));
+            }
+            if !cont(data[s + 2]) {
+                break Some((s, s + 2, "invalid continuation byte"));
+            }
+            if !cont(data[s + 3]) {
+                break Some((s, s + 3, "invalid continuation byte"));
+            }
+            s += 4;
+        } else {
+            break Some((s, s + 1, "invalid start byte"));
+        }
+    };
+    let (start, stop, reason) = failure?;
+    Some(if stop == start + 1 {
+        format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", data[start], start, reason)
+    } else {
+        format!("'utf-8' codec can't decode bytes in position {}-{}: {}", start, stop - 1, reason)
+    })
 }
 
 /// python str.splitlines()
@@ -142,6 +220,22 @@ mod tests {
         assert_eq!(splitlines("a\n"), vec!["a"]);
         assert_eq!(splitlines("a\n\nb"), vec!["a", "", "b"]);
         assert!(splitlines("").is_empty());
+    }
+
+    #[test]
+    fn utf8_decode_errors_match_python_str() {
+        // expected strings are python's str(UnicodeDecodeError) for the same bytes
+        let msg = |b: &[u8]| utf8_decode_error(b).expect("invalid input");
+        assert_eq!(msg(b"\xff"), "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte");
+        assert_eq!(msg(b"ab\xc3"), "'utf-8' codec can't decode byte 0xc3 in position 2: unexpected end of data");
+        assert_eq!(msg(b"\xe4\xb8"), "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data");
+        assert_eq!(msg(b"\xf0\x9f\x98"), "'utf-8' codec can't decode bytes in position 0-2: unexpected end of data");
+        assert_eq!(msg(b"\xc3\x28"), "'utf-8' codec can't decode byte 0xc3 in position 0: invalid continuation byte");
+        assert_eq!(msg(b"\xe4\xb8\xe4"), "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte");
+        assert_eq!(msg(b"\xc0\x80"), "'utf-8' codec can't decode byte 0xc0 in position 0: invalid start byte");
+        assert_eq!(msg(b"\xf5\x80\x80\x80"), "'utf-8' codec can't decode byte 0xf5 in position 0: invalid start byte");
+        assert_eq!(msg(b"\xed\xa0\x80"), "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte");
+        assert!(utf8_decode_error("héllo ✓ 😀".as_bytes()).is_none());
     }
 
     #[test]

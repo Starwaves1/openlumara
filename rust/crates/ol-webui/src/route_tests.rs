@@ -1684,3 +1684,56 @@ async fn characters_routes_answer_wrong_methods_with_python_messages() {
     assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
 }
 
+#[tokio::test]
+async fn characters_list_keeps_a_non_string_category_as_its_raw_value() {
+    // python: `char.get("category") or "general"` keeps the imported number, so the JSON category is 5
+    let h = harness_with_characters().await;
+    let card = json!({"name": "Neo", "description": "The one", "category": 5}).to_string();
+    let imported = h.send(post_json("/api/ext/characters/import", &json!({"json_code": card}).to_string())).await;
+    assert_eq!(imported.json(), json!({"data": "character successfully imported", "success": true}), "{}", imported.body);
+
+    assert_eq!(
+        h.get("/api/ext/characters/list").await.json(),
+        json!({"data": {"categories": [{"name": 5, "characters": [{"name": "Neo", "tags": []}]}]}, "success": true})
+    );
+}
+
+#[tokio::test]
+async fn characters_switch_rejects_non_string_names_and_non_object_bodies_like_python() {
+    let h = harness_with_characters().await;
+    // with no characters, python never calls name.lower(), so the name is just not found
+    let empty = h.send(post_json("/api/ext/characters/switch", r#"{"name": 5}"#)).await;
+    assert_eq!(empty.json(), json!({"data": "character not found", "success": false}));
+
+    add_character(&h, "Ann", "", &[], "").await;
+    let number = h.send(post_json("/api/ext/characters/switch", r#"{"name": 5}"#)).await;
+    assert_eq!(number.json(), json!({"data": "'int' object has no attribute 'lower'", "success": false}));
+    let boolean = h.send(post_json("/api/ext/characters/switch", r#"{"name": true}"#)).await;
+    assert_eq!(boolean.json(), json!({"data": "'bool' object has no attribute 'lower'", "success": false}));
+    let list = h.send(post_json("/api/ext/characters/switch", r#"{"name": ["Ann"]}"#)).await;
+    assert_eq!(list.json(), json!({"data": "'list' object has no attribute 'lower'", "success": false}));
+
+    // a truthy non-object body fails on `.get`, before the name is looked at
+    let array = h.send(post_json("/api/ext/characters/switch", "[1]")).await;
+    assert_eq!(array.json(), json!({"data": "'list' object has no attribute 'get'", "success": false}));
+    let string = h.send(post_json("/api/ext/characters/switch", r#""Ann""#)).await;
+    assert_eq!(string.json(), json!({"data": "'str' object has no attribute 'get'", "success": false}));
+    // a falsy body is `{}`, so the missing name is reported as usual
+    let falsy = h.send(post_json("/api/ext/characters/switch", "0")).await;
+    assert_eq!(falsy.json(), json!({"data": "error: no character name given", "success": false}));
+}
+
+#[tokio::test]
+async fn characters_lookups_strip_python_separator_whitespace() {
+    // python str.strip() also removes U+001C..U+001F, which rust's trim() keeps
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "").await;
+
+    let found = h.get("/api/ext/characters/get?name=%1cANN%1f").await;
+    assert_eq!(found.json()["data"]["name"], json!("Ann"), "{}", found.body);
+
+    let switched = h.send(post_json("/api/ext/characters/switch", "{\"name\": \"\\u001cann\"}")).await;
+    assert_eq!(switched.json()["success"], json!(true), "{}", switched.body);
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "Ann", "success": true}));
+}
+
