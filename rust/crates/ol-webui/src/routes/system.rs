@@ -88,9 +88,35 @@ fn py_float(v: &Value) -> Option<f64> {
     match v {
         Value::Bool(b) => Some(f64::from(u8::from(*b))),
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse::<f64>().ok(),
+        Value::String(s) => py_float_str(s),
         _ => None,
     }
+}
+
+/// python `float(str)`: surrounding whitespace, and single underscores only between two digits (so '1_0' is 10.0)
+fn py_float_str(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let bytes = t.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'_' {
+            let digit_before = i > 0 && bytes[i - 1].is_ascii_digit();
+            let digit_after = bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+            if !(digit_before && digit_after) {
+                return None;
+            }
+        }
+    }
+    t.replace('_', "").parse::<f64>().ok()
+}
+
+/// `round(float(threshold) * 100, 1)` for the stored `model.context_compression_threshold`, or None where
+/// python would fail to answer: a value python's `float()` rejects, or a non-finite result. python's
+/// `round()` keeps inf/nan and starlette's JSONResponse (allow_nan=False) then raises, so the answer is a 500
+fn compression_threshold_percent(raw: &Value) -> Option<f64> {
+    // python: `threshold = config.get(...) or 0`
+    let threshold = if truthy(raw) { py_float(raw)? } else { 0.0 };
+    let pct = py_round1(threshold * 100.0);
+    pct.is_finite().then_some(pct)
 }
 
 /// `api_result(data)` as a json response
@@ -128,18 +154,10 @@ async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
     size["max_context"] = json!(max_context);
     size["percent_full"] = json!(py_round0((total as f64 / max_context as f64) * 100.0));
 
-    // python: `threshold = config.get(...) or 0`, then `round(float(threshold) * 100, 1)` outside any try,
-    // so a non-numeric stored value is an unhandled error (500)
+    // python: `round(float(threshold) * 100, 1)` outside any try, so a non-numeric or non-finite stored value is an unhandled error (500)
     let raw_threshold = ol_core::config::get(&["model", "context_compression_threshold"]).unwrap_or(Value::Null);
-    let threshold = if truthy(&raw_threshold) {
-        match py_float(&raw_threshold) {
-            Some(t) => t,
-            None => return internal_error(),
-        }
-    } else {
-        0.0
-    };
-    size["compression_threshold"] = json!(py_round1(threshold * 100.0));
+    let Some(percent) = compression_threshold_percent(&raw_threshold) else { return internal_error() };
+    size["compression_threshold"] = json!(percent);
     let auto = ol_core::config::get(&["model", "automatically_compress_context"]).unwrap_or(Value::Null);
     size["auto_compress"] = json!(truthy(&auto));
     reply(size)
@@ -163,7 +181,7 @@ async fn system_restart(State(app): State<Arc<Shared>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{py_float, py_int, py_round0, py_round1};
+    use super::{compression_threshold_percent, py_float, py_int, py_round0, py_round1};
     use serde_json::{json, Value};
 
     #[test]
@@ -210,5 +228,29 @@ mod tests {
         assert_eq!(py_float(&json!(true)), Some(1.0));
         assert_eq!(py_float(&json!("abc")), None);
         assert_eq!(py_float(&json!([1])), None);
+    }
+
+    #[test]
+    fn py_float_takes_underscores_only_between_digits() {
+        // python: float('1_0') == 10.0, float('1__0'), float('_1') and float('1_') raise
+        assert_eq!(py_float(&json!("1_0")), Some(10.0));
+        assert_eq!(py_float(&json!(" 0.5 ")), Some(0.5));
+        assert_eq!(py_float(&json!("1__0")), None);
+        assert_eq!(py_float(&json!("_1")), None);
+        assert_eq!(py_float(&json!("1_")), None);
+    }
+
+    #[test]
+    fn compression_threshold_percent_matches_python_round_and_refuses_non_finite() {
+        // python: round(float(0.25) * 100, 1) == 25.0; a falsy stored value is 0
+        assert_eq!(compression_threshold_percent(&json!(0.25)), Some(25.0));
+        assert_eq!(compression_threshold_percent(&json!("0.125")), Some(12.5));
+        assert_eq!(compression_threshold_percent(&json!(null)), Some(0.0));
+        assert_eq!(compression_threshold_percent(&json!("")), Some(0.0));
+        // python: float('nan') and float('inf') give non-finite results that starlette cannot serialise (500)
+        assert_eq!(compression_threshold_percent(&json!("nan")), None);
+        assert_eq!(compression_threshold_percent(&json!("inf")), None);
+        assert_eq!(compression_threshold_percent(&json!("1e308")), None);
+        assert_eq!(compression_threshold_percent(&json!("abc")), None);
     }
 }
