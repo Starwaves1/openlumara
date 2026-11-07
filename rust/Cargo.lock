@@ -1463,6 +1463,8 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tree-sitter",
+ "tree-sitter-yaml",
  "unicode-properties",
  "walkdir",
 ]

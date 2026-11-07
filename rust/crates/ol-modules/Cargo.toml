@@ -28,6 +28,8 @@ num-traits = "0.2"
 num-integer = "0.1"
 libc = "0.2"
 unicode-properties = "0.1"
+tree-sitter = "0.26"
+tree-sitter-yaml = "0.7"
 
 [dev-dependencies]
 tempfile.workspace = true

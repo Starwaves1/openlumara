@@ -3,6 +3,8 @@
 
 #[path = "../../../generated/modules/skills.rs"]
 pub mod meta;
+#[path = "skills_pyyaml.rs"]
+mod pyyaml;
 
 use crate::util::{self, expanduser, listdir, py_strip, read_text, rstrip_sep, splitlines};
 use anyhow::anyhow;
@@ -11,6 +13,7 @@ use indexmap::IndexMap;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, truthy};
 use parking_lot::Mutex;
+use pyyaml::PyObj;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,9 +38,10 @@ fn py_lstrip(s: &str) -> &str {
     s.trim_start_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 
-/// python `_parse_frontmatter`: splits a SKILL.md into (frontmatter mapping or None, body).
-/// the frontmatter is the yaml block between the first pair of --- lines.
-fn parse_frontmatter(text: &str) -> (Option<serde_yaml::Mapping>, String) {
+/// python `_parse_frontmatter`: splits a SKILL.md into (frontmatter or None, body).
+/// the frontmatter is the yaml block between the first pair of --- lines, read as `yaml.safe_load`
+/// reads it; None when that fails or does not give a mapping (python dict).
+fn parse_frontmatter(text: &str) -> (Option<PyObj>, String) {
     let stripped = py_lstrip(text);
     if !stripped.starts_with("---") {
         return (None, text.to_string());
@@ -48,16 +52,16 @@ fn parse_frontmatter(text: &str) -> (Option<serde_yaml::Mapping>, String) {
         return (None, text.to_string());
     };
     let rest = lines[end + 1..].join("\n");
-    match serde_yaml::from_str::<serde_yaml::Value>(&lines[1..end].join("\n")) {
-        Ok(serde_yaml::Value::Mapping(meta)) => (Some(meta), rest),
+    match pyyaml::load(&lines[1..end].join("\n")) {
+        Ok(meta @ PyObj::Dict(_)) => (Some(meta), rest),
         _ => (None, rest),
     }
 }
 
-/// python `meta.get("name")` made a string with str(): None when the key is missing or falsy
-fn frontmatter_name(meta: &serde_yaml::Mapping) -> Option<String> {
-    let value = serde_json::to_value(meta.get("name")?).ok()?;
-    truthy(&value).then(|| py_str(&value))
+/// python `if meta and meta.get("name")`: the name as str(), None when the key is missing or falsy
+fn frontmatter_name(meta: &PyObj) -> Option<String> {
+    let name = meta.get("name")?;
+    name.truthy().then(|| name.py_str())
 }
 
 /// python `_scan` body: every folder under `root` that holds a SKILL.md, keyed by skill name.
@@ -312,6 +316,12 @@ mod tests {
         assert_eq!(body, "hello");
         assert_eq!(frontmatter_name(&meta.unwrap()), Some("Foo".to_string()));
 
+        // yaml 1.1 words, which serde_yaml read as plain strings: python gives True / keeps the folder
+        let (meta, _) = parse_frontmatter("---\nname: yes\n---\nbody");
+        assert_eq!(frontmatter_name(&meta.unwrap()), Some("True".to_string()));
+        let (meta, _) = parse_frontmatter("---\nname: no\n---\nbody");
+        assert_eq!(frontmatter_name(&meta.unwrap()), None);
+
         // no opening delimiter, or no closing delimiter: the text comes back unchanged
         assert_eq!(parse_frontmatter("plain text"), (None, "plain text".to_string()));
         assert_eq!(parse_frontmatter("---\nname: x\n"), (None, "---\nname: x\n".to_string()));
@@ -366,3 +376,4 @@ mod tests {
         assert_eq!(res, json!({"status": "error", "content": "No skill named 'x'. Available skills: none installed"}));
     }
 }
+
