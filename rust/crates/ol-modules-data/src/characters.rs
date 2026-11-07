@@ -209,18 +209,59 @@ fn lower_key(v: &Value) -> String {
     py_str(v).to_lowercase()
 }
 
+/// python's numeric value of a number or bool (True is 1, False is 0)
+fn py_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        other => other.as_f64(),
+    }
+}
+
+/// python dict key for a truthy category: 1, 1.0 and true are one key (the first inserted value is
+/// kept), a str never equals a number
+fn category_key(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("s{s}"),
+        other => match py_number(other) {
+            Some(f) => format!("n{}", f.to_bits()),
+            None => format!("o{other}"),
+        },
+    }
+}
+
+/// python `name.lower()`: only a str has the method, so a truthy non-str receiver raises AttributeError
+fn str_for_lower(v: &Value) -> anyhow::Result<&str> {
+    match v {
+        Value::String(s) => Ok(s),
+        other => anyhow::bail!("'{}' object has no attribute 'lower'", py_type(other)),
+    }
+}
+
+/// python `self._find_char_name(name) or char.get("name")`: an empty stored key is falsy and falls back
+fn stored_name_or(found: Option<String>, fallback: Value) -> Value {
+    match found.filter(|n| !n.is_empty()) {
+        Some(n) => json!(n),
+        None => fallback,
+    }
+}
+
+/// python `_route_current`: `chat.get("metadata").get("character") or None`. a missing or non-dict
+/// metadata raises the `.get` AttributeError
+fn current_route_value(metadata: Option<Value>) -> anyhow::Result<Value> {
+    let meta = metadata.unwrap_or(Value::Null);
+    let Some(obj) = meta.as_object() else {
+        anyhow::bail!("'{}' object has no attribute 'get'", py_type(&meta));
+    };
+    let c = obj.get("character").cloned().unwrap_or(Value::Null);
+    Ok(if truthy(&c) { c } else { Value::Null })
+}
+
 /// python `a < b` for two category keys: str with str, numbers and bools with each other.
 /// any other pair raises TypeError, returned as its message
 fn category_order(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
-    fn num(v: &Value) -> Option<f64> {
-        match v {
-            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            other => other.as_f64(),
-        }
-    }
     match (a, b) {
         (Value::String(x), Value::String(y)) => Ok(x.cmp(y)),
-        _ => match (num(a), num(b)) {
+        _ => match (py_number(a), py_number(b)) {
             (Some(x), Some(y)) => Ok(x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)),
             _ => Err(format!("'<' not supported between instances of '{}' and '{}'", py_type(a), py_type(b))),
         },
@@ -297,6 +338,12 @@ impl Characters {
 
     fn channel(&self) -> anyhow::Result<Arc<Channel>> {
         self.base.channel().ok_or_else(|| anyhow!("'NoneType' object has no attribute 'context'"))
+    }
+
+    /// python `_route_current` (see `current_route_value`)
+    fn route_current(&self) -> anyhow::Result<Value> {
+        let ch = self.channel()?;
+        current_route_value(ch.chat.get("metadata"))
     }
 
     /// `chat.get("metadata").get("character")`
@@ -474,7 +521,7 @@ impl Characters {
         self.switch(&char_name).await?;
         let first = character.get("first_message").cloned().unwrap_or(json!(""));
         if truthy(&first) && self.base.config.get_bool("use_first_messages") {
-            let first = self.replace(&char_name, &py_str(&first));
+            let first = self.replace(&char_name, str_for_lower(&first)?);
             return Ok(format!("character switched to {}\n\n{}", char_name, first));
         }
         Ok(format!("character switched to {}", char_name))
@@ -484,15 +531,12 @@ impl Characters {
         let Some(ch) = self.find_character(name) else {
             return Ok(self.base.result("character not found", false));
         };
-        let char_name = match self.find_char_name(name) {
-            Some(n) => json!(n),
-            None => ch.get("name").cloned().unwrap_or(Value::Null),
-        };
+        let char_name = stored_name_or(self.find_char_name(name), ch.get("name").cloned().unwrap_or(Value::Null));
         self.set_current_character(char_name.clone())?;
         let char_name = py_str(&char_name);
         let first = ch.get("first_message").cloned().unwrap_or(json!(""));
         if truthy(&first) && self.base.config.get_bool("use_first_messages") {
-            let first = self.replace(&char_name, &py_str(&first));
+            let first = self.replace(&char_name, str_for_lower(&first)?);
             return Ok(self.base.result(
                 format!("Switched to {}. Begin your reply now with this exact greeting, verbatim, and add nothing else:\n\n{}", char_name, first),
                 true,
@@ -618,7 +662,7 @@ impl Characters {
             if matches!(cat, Value::Array(_) | Value::Object(_)) {
                 anyhow::bail!("unhashable type: '{}'", py_type(&cat));
             }
-            grouped.entry(cat.to_string()).or_insert_with(|| (cat.clone(), Vec::new())).1.push(json!({
+            grouped.entry(category_key(&cat)).or_insert_with(|| (cat.clone(), Vec::new())).1.push(json!({
                 "name": or_value(ch.get("name"), json!(name)),
                 "tags": or_value(ch.get("tags"), json!([])),
             }));
@@ -636,13 +680,19 @@ impl Characters {
         if let Some(e) = order_err {
             anyhow::bail!(e);
         }
-        let categories: Vec<Value> = cats
-            .into_iter()
-            .map(|(cat, mut chars)| {
-                chars.sort_by_key(|c| lower_key(&c["name"]));
-                json!({"name": cat, "characters": chars})
-            })
-            .collect();
+        // python computes every member's sort key (`c["name"].lower()`) before sorting, so a
+        // non-str name raises even in a one-member category
+        let mut categories = Vec::with_capacity(cats.len());
+        for (cat, chars) in cats {
+            let mut keyed = Vec::with_capacity(chars.len());
+            for c in chars {
+                let key = str_for_lower(&c["name"])?.to_lowercase();
+                keyed.push((key, c));
+            }
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            let chars: Vec<Value> = keyed.into_iter().map(|(_, c)| c).collect();
+            categories.push(json!({"name": cat, "characters": chars}));
+        }
         Ok(json!({"categories": categories}))
     }
 
@@ -1012,10 +1062,7 @@ impl Module for Characters {
     async fn ui_route(&self, path: &str, method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         match (path, method) {
             ("list", "GET") => self.route_list(),
-            ("current", "GET") => {
-                let c = self.current_character()?;
-                Ok(if truthy(&c) { c } else { Value::Null })
-            }
+            ("current", "GET") => self.route_current(),
             ("get", "GET") => {
                 let name = query.get("name").map(py_str).unwrap_or_default();
                 Ok(match self.find_character(&name) {
@@ -1173,5 +1220,36 @@ mod tests {
         assert_eq!(clean_tags(Some(&json!("a, b,, c "))), vec![json!("a"), json!("b"), json!("c")]);
         assert_eq!(clean_tags(Some(&json!([" x ", 1, ""]))), vec![json!("x"), json!("1")]);
         assert!(clean_tags(None).is_empty());
+    }
+
+    #[test]
+    fn category_keys_follow_python_dict_equality() {
+        assert_eq!(category_key(&json!(1)), category_key(&json!(1.0)));
+        assert_eq!(category_key(&json!(1)), category_key(&json!(true)));
+        assert_ne!(category_key(&json!(1)), category_key(&json!("1")));
+        assert_ne!(category_key(&json!("general")), category_key(&json!(2)));
+    }
+
+    #[test]
+    fn lower_needs_a_str_receiver_like_python() {
+        assert_eq!(str_for_lower(&json!("Ann")).unwrap(), "Ann");
+        assert_eq!(str_for_lower(&json!(5)).unwrap_err().to_string(), "'int' object has no attribute 'lower'");
+        assert_eq!(str_for_lower(&json!(["x"])).unwrap_err().to_string(), "'list' object has no attribute 'lower'");
+    }
+
+    #[test]
+    fn empty_stored_key_falls_back_to_the_card_name_like_python_or() {
+        assert_eq!(stored_name_or(Some(String::new()), json!("Ann")), json!("Ann"));
+        assert_eq!(stored_name_or(Some("ann".into()), json!("Ann")), json!("ann"));
+        assert_eq!(stored_name_or(None, json!(5)), json!(5));
+    }
+
+    #[test]
+    fn current_route_follows_the_python_get_chain() {
+        assert_eq!(current_route_value(Some(json!({"character": "Ann"}))).unwrap(), json!("Ann"));
+        assert_eq!(current_route_value(Some(json!({"character": 0}))).unwrap(), Value::Null);
+        assert_eq!(current_route_value(Some(json!({}))).unwrap(), Value::Null);
+        assert_eq!(current_route_value(None).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
+        assert_eq!(current_route_value(Some(json!("x"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
     }
 }
