@@ -7,7 +7,7 @@ pub mod meta;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Datelike, Offset, Timelike, Utc};
-use chrono_tz::OffsetName;
+use chrono_tz::{OffsetComponents, OffsetName};
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
 use serde_json::{json, Map, Value};
 use std::ffi::{CStr, CString};
@@ -70,10 +70,14 @@ pub struct Stamp {
     pub micros: u32,
     pub offset_secs: i32,
     pub tzname: String,
+    /// the timetuple `tm_isdst` flag: -1 for the local zone, else 1 or 0 from dst()
+    pub isdst: i32,
 }
 
 /// python `datetime.datetime.now().astimezone()`: the device's local zone. The zone abbreviation is
 /// the libc `tm_zone`, which is what python's `tzname()` reports for an `astimezone()` result.
+/// python's `astimezone()` result has a fixed-offset tzinfo, so its `dst()` is None and the
+/// timetuple flag is -1 (let mktime decide).
 fn local_stamp() -> Stamp {
     let now = chrono::Local::now();
     let secs = now.timestamp() as libc::time_t;
@@ -89,22 +93,73 @@ fn local_stamp() -> Stamp {
         micros: now.timestamp_subsec_micros(),
         offset_secs: now.offset().local_minus_utc(),
         tzname,
+        isdst: -1,
     }
 }
 
 /// python `zoneinfo.ZoneInfo(key)` + `datetime.now(tz=...)`
 fn zone_stamp(key: &str) -> anyhow::Result<Stamp> {
+    validate_zone_key(key)?;
     let tz: chrono_tz::Tz = key
         .parse()
         .map_err(|_| anyhow!("'No time zone found with key {}'", key))?;
     let now = Utc::now().with_timezone(&tz);
     let tzname = now.offset().abbreviation().unwrap_or("").to_string();
+    // python's timetuple() flag: 1 when dst() is non-zero, else 0
+    let isdst = if now.offset().dst_offset().num_seconds() != 0 { 1 } else { 0 };
     Ok(Stamp {
         naive: now.naive_local(),
         micros: now.timestamp_subsec_micros(),
         offset_secs: now.offset().fix().local_minus_utc(),
         tzname,
+        isdst,
     })
+}
+
+/// the base python's `zoneinfo._tzpath._validate_tzfile_path` checks keys against (`_TEST_PATH`)
+const ZONE_KEY_BASE: &str = "_/";
+
+/// python `zoneinfo._tzpath._validate_tzfile_path`: the ValueError for a malformed key, raised
+/// before any lookup. A well-formed key that names no zone is handled by `zone_stamp`.
+fn validate_zone_key(key: &str) -> anyhow::Result<()> {
+    if key.starts_with('/') {
+        return Err(anyhow!("ZoneInfo keys may not be absolute paths, got: {}", key));
+    }
+    if posix_normpath(key).len() != key.len() {
+        return Err(anyhow!("ZoneInfo keys must be normalized relative paths, got: {}", key));
+    }
+    let resolved = posix_normpath(&format!("{}{}", ZONE_KEY_BASE, key));
+    if !resolved.starts_with(ZONE_KEY_BASE) {
+        return Err(anyhow!("ZoneInfo keys must refer to subdirectories of TZPATH, got: {}", key));
+    }
+    Ok(())
+}
+
+/// python `os.path.normpath` for posix paths: drops empty and "." parts and resolves ".."
+fn posix_normpath(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(last) if *last != ".." => {
+                    parts.pop();
+                }
+                _ if !absolute => parts.push(".."),
+                _ => {}
+            },
+            other => parts.push(other),
+        }
+    }
+    let body = parts.join("/");
+    if absolute {
+        format!("/{}", body)
+    } else if body.is_empty() {
+        ".".to_string()
+    } else {
+        body
+    }
 }
 
 /// python `_get_current_time()`: `timezone` == "local" is the device zone, anything else is an IANA key
@@ -167,7 +222,7 @@ fn c_strftime(fmt: &str, stamp: &Stamp) -> anyhow::Result<String> {
     tm.tm_year = (naive.year() - 1900) as _;
     tm.tm_wday = naive.weekday().num_days_from_sunday() as _;
     tm.tm_yday = naive.ordinal0() as _;
-    tm.tm_isdst = 0;
+    tm.tm_isdst = stamp.isdst as _;
     tm.tm_gmtoff = stamp.offset_secs as _;
     tm.tm_zone = zone_c.as_ptr() as *const c_char;
     let mut size = 1024usize;
@@ -260,6 +315,7 @@ mod tests {
             micros: 500_000,
             offset_secs: 3600,
             tzname: "CET".into(),
+            isdst: 0,
         }
     }
 
@@ -288,6 +344,55 @@ mod tests {
         let err = current_stamp(Some("Nope/Nowhere")).unwrap_err();
         assert_eq!(err.to_string(), "'No time zone found with key Nope/Nowhere'");
         assert!(current_stamp(None).is_err());
+    }
+
+    #[test]
+    fn malformed_zone_keys_raise_python_value_errors() {
+        // python ZoneInfo raises ValueError (no KeyError quoting) for these keys
+        let cases = [
+            ("", "ZoneInfo keys must be normalized relative paths, got: "),
+            ("/abs", "ZoneInfo keys may not be absolute paths, got: /abs"),
+            ("../x", "ZoneInfo keys must refer to subdirectories of TZPATH, got: ../x"),
+            ("a/../b", "ZoneInfo keys must be normalized relative paths, got: a/../b"),
+            ("America/", "ZoneInfo keys must be normalized relative paths, got: America/"),
+        ];
+        for (key, msg) in cases {
+            assert_eq!(current_stamp(Some(key)).unwrap_err().to_string(), msg, "key {key:?}");
+        }
+        // "../_/x" normalizes back under the validation base, so it is a well-formed but unknown key
+        assert_eq!(
+            current_stamp(Some("../_/x")).unwrap_err().to_string(),
+            "'No time zone found with key ../_/x'"
+        );
+    }
+
+    extern "C" {
+        fn tzset();
+    }
+
+    #[test]
+    fn strftime_seconds_honours_the_dst_flag() {
+        let _g = crate::util::CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // %s calls mktime on the tm struct, so the isdst flag picks the zone offset in effect
+        let saved = std::env::var_os("TZ");
+        std::env::set_var("TZ", "Europe/Berlin");
+        unsafe { tzset() };
+        let mut summer = fixed_stamp();
+        summer.naive = chrono::NaiveDate::from_ymd_opt(2026, 7, 12).unwrap().and_hms_opt(12, 0, 0).unwrap();
+        summer.offset_secs = 7200;
+        summer.tzname = "CEST".into();
+        summer.isdst = 1;
+        let with_dst = c_strftime("%s", &summer).unwrap();
+        summer.isdst = 0;
+        let without_dst = c_strftime("%s", &summer).unwrap();
+        match saved {
+            Some(v) => std::env::set_var("TZ", v),
+            None => std::env::remove_var("TZ"),
+        }
+        unsafe { tzset() };
+        // python: datetime(2026,7,12,12,0,tzinfo=ZoneInfo("Europe/Berlin")).timestamp() == 1783850400
+        assert_eq!(with_dst, "1783850400");
+        assert_eq!(without_dst, "1783854000");
     }
 
     #[test]
