@@ -6,7 +6,7 @@ pub mod meta;
 #[path = "skills_pyyaml.rs"]
 mod pyyaml;
 
-use crate::util::{self, expanduser, listdir, py_strip, read_text, rstrip_sep, splitlines};
+use crate::util::{self, expanduser, listdir, py_strip, rstrip_sep, splitlines};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -15,6 +15,7 @@ use ol_core::pyjson::{py_str, truthy};
 use parking_lot::Mutex;
 use pyyaml::PyObj;
 use serde_json::Value;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,20 +65,29 @@ fn frontmatter_name(meta: &PyObj) -> Option<String> {
     name.truthy().then(|| name.py_str())
 }
 
+/// the order python's `sorted()` gives a listed name: its code points, where python decodes each
+/// byte that is not utf-8 to U+DC80..U+DCFF (surrogateescape)
+fn python_str_key(name: &OsStr) -> Vec<u32> {
+    let mut key = Vec::new();
+    for chunk in name.as_encoded_bytes().utf8_chunks() {
+        key.extend(chunk.valid().chars().map(u32::from));
+        key.extend(chunk.invalid().iter().map(|&b| 0xDC00 + u32::from(b)));
+    }
+    key
+}
+
 /// python `_scan` body: every folder under `root` that holds a SKILL.md, keyed by skill name.
 /// the name comes from the frontmatter when present, otherwise the folder name is used.
+/// a folder name that is not utf-8 is found and read by its real path; its index key is the
+/// lossy name, since a Rust string cannot hold python's surrogateescape characters.
 fn scan_root(root: &Path) -> anyhow::Result<Index> {
     let mut index = Index::new();
     if !root.is_dir() {
         return Ok(index);
     }
     let root_str = root.to_string_lossy().into_owned();
-    let mut entries: Vec<String> = listdir(&root_str)
-        .map_err(|e| anyhow!(e))?
-        .into_iter()
-        .map(|n| n.to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
+    let mut entries = listdir(&root_str).map_err(|e| anyhow!(e))?;
+    entries.sort_by_key(|n| python_str_key(n));
     for entry in entries {
         let skill_path = root.join(&entry);
         if !skill_path.is_dir() {
@@ -87,9 +97,9 @@ fn scan_root(root: &Path) -> anyhow::Result<Index> {
         if !skill_file.is_file() {
             continue;
         }
-        let mut name = entry.clone();
+        let mut name = entry.to_string_lossy().into_owned();
         // python: a SKILL.md that cannot be read or parsed keeps the folder name
-        if let Ok(text) = read_text(&skill_file.to_string_lossy()) {
+        if let Ok(text) = util::read_file_text(&skill_file, &skill_file.to_string_lossy()) {
             if let Some(from_meta) = parse_frontmatter(&text).0.as_ref().and_then(frontmatter_name) {
                 name = from_meta;
             }
@@ -106,7 +116,8 @@ fn load_body(index: &Index, name: &str) -> Result<String, LoadError> {
     let Some(skill_path) = index.get(name) else {
         return Err(LoadError::NotFound);
     };
-    let text = read_text(&skill_path.join("SKILL.md").to_string_lossy()).map_err(LoadError::Read)?;
+    let skill_file = skill_path.join("SKILL.md");
+    let text = util::read_file_text(&skill_file, &skill_file.to_string_lossy()).map_err(LoadError::Read)?;
     let (_, body) = parse_frontmatter(&text);
     Ok(py_strip(&body).to_string())
 }
@@ -374,6 +385,36 @@ mod tests {
         );
         let res = block_on(empty.call_tool("use", ToolArgs::new(json!({"name": "x"}).as_object().unwrap().clone()))).unwrap();
         assert_eq!(res, json!({"status": "error", "content": "No skill named 'x'. Available skills: none installed"}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_folder_is_indexed_and_read_by_its_real_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(OsStr::from_bytes(b"caf\xe9"));
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "Latin body\n").unwrap();
+
+        // python lists the folder (surrogateescape name); the index key is its lossy name, and the
+        // SKILL.md is read through the real folder, so the skill is not dropped
+        let index = scan_root(dir.path()).unwrap();
+        assert_eq!(index.keys().cloned().collect::<Vec<_>>(), vec!["caf\u{fffd}".to_string()]);
+        let m = Skills::new(ModuleBase::detached("skills"));
+        *m.index.lock() = Some(index);
+        let res = block_on(m.call_tool("use", ToolArgs::new(json!({"name": "caf\u{fffd}"}).as_object().unwrap().clone()))).unwrap();
+        assert_eq!(res, json!({"status": "success", "content": "Latin body"}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listed_names_sort_by_python_code_point_order() {
+        use std::os::unix::ffi::OsStrExt;
+        // python: "b" (U+0062) sorts before the surrogateescape of b"\xff" (U+DCFF), and "é" (U+00E9)
+        // sorts after "b" but before that escape
+        assert!(python_str_key(OsStr::new("b")) < python_str_key(OsStr::from_bytes(b"\xff")));
+        assert_eq!(python_str_key(OsStr::from_bytes(b"\xc3\xa9")), vec![0xE9]);
+        assert_eq!(python_str_key(OsStr::from_bytes(b"\xff")), vec![0xDCFF]);
     }
 }
 

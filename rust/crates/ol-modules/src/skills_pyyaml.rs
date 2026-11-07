@@ -6,8 +6,9 @@
 //! the frontmatter is read here instead: tree-sitter-yaml supplies the syntax tree (scalar style,
 //! tags, anchors), and every node is constructed the way PyYAML's SafeConstructor builds it.
 //!
-//! Known gaps: `!!binary`, `!!omap`, `!!pairs` and `!!set` are rejected (python builds them), and
-//! custom `!tags` are rejected (python raises for them too).
+//! `!!binary`, `!!omap`, `!!pairs` and `!!set` are built as python builds them. Known gap: a set of
+//! several elements is listed in insertion order, while python orders it by string hash, which is
+//! randomised per process. Custom `!tags` are rejected (python raises for them too).
 
 use crate::util::repr_str;
 use num_bigint::BigInt;
@@ -31,6 +32,12 @@ pub enum PyObj {
     List(Vec<PyObj>),
     /// python dict: insertion ordered, keys compared with python equality
     Dict(Vec<(PyObj, PyObj)>),
+    /// python set (from `!!set`): unhashable, so never a dict key
+    Set(Vec<PyObj>),
+    /// python bytes (from `!!binary`)
+    Bytes(Vec<u8>),
+    /// python tuple (the (key, value) pairs of `!!omap` and `!!pairs`)
+    Tuple(Vec<PyObj>),
 }
 
 /// python datetime.date
@@ -84,8 +91,10 @@ impl PyObj {
             PyObj::Float(f) => *f != 0.0,
             PyObj::Str(s) => !s.is_empty(),
             PyObj::Date(_) | PyObj::DateTime(_) => true,
-            PyObj::List(v) => !v.is_empty(),
+            PyObj::List(v) | PyObj::Tuple(v) => !v.is_empty(),
             PyObj::Dict(v) => !v.is_empty(),
+            PyObj::Set(v) => !v.is_empty(),
+            PyObj::Bytes(v) => !v.is_empty(),
         }
     }
 
@@ -115,6 +124,23 @@ impl PyObj {
                 "{{{}}}",
                 v.iter().map(|(k, v)| format!("{}: {}", k.repr(), v.repr())).collect::<Vec<_>>().join(", ")
             ),
+            PyObj::Set(v) if v.is_empty() => "set()".into(),
+            PyObj::Set(v) => format!("{{{}}}", v.iter().map(PyObj::repr).collect::<Vec<_>>().join(", ")),
+            PyObj::Bytes(b) => bytes_repr(b),
+            PyObj::Tuple(v) => match v.as_slice() {
+                [one] => format!("({},)", one.repr()),
+                _ => format!("({})", v.iter().map(PyObj::repr).collect::<Vec<_>>().join(", ")),
+            },
+        }
+    }
+
+    /// python hashability: a dict key or set element. lists, dicts and sets are not, and a tuple is
+    /// only when all its items are
+    fn hashable(&self) -> bool {
+        match self {
+            PyObj::List(_) | PyObj::Dict(_) | PyObj::Set(_) => false,
+            PyObj::Tuple(v) => v.iter().all(PyObj::hashable),
+            _ => true,
         }
     }
 
@@ -212,6 +238,8 @@ fn py_eq(a: &PyObj, b: &PyObj) -> bool {
         (PyObj::Str(x), PyObj::Str(y)) => x == y,
         (PyObj::Date(x), PyObj::Date(y)) => x == y,
         (PyObj::DateTime(x), PyObj::DateTime(y)) => x == y,
+        (PyObj::Bytes(x), PyObj::Bytes(y)) => x == y,
+        (PyObj::Tuple(x), PyObj::Tuple(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q)),
         _ => match (num_of(a), num_of(b)) {
             (Some(x), Some(y)) => num_eq(x, y),
             _ => false,
@@ -245,7 +273,7 @@ fn num_eq(a: Num, b: Num) -> bool {
 
 /// python dict assignment `d[key] = value`: an equal key keeps its position and takes the new value
 fn dict_set(dict: &mut Vec<(PyObj, PyObj)>, key: PyObj, value: PyObj) -> Result<(), String> {
-    if matches!(key, PyObj::List(_) | PyObj::Dict(_)) {
+    if !key.hashable() {
         return Err("found unhashable key".into());
     }
     match dict.iter_mut().find(|(k, _)| py_eq(k, &key)) {
@@ -263,6 +291,11 @@ pub fn load(text: &str) -> Result<PyObj, String> {
     let root = tree.root_node();
     if has_syntax_error(root) {
         return Err("syntax error".into());
+    }
+    // PyYAML's scanner skips only spaces between tokens, so a tab is an error anywhere outside a
+    // quoted scalar, a block scalar or a comment (`name:\tfoo`, `name: a\tb`, a trailing tab)
+    if tab_outside_verbatim(root, text) {
+        return Err("found character '\\t' that cannot start any token".into());
     }
     let mut contents = Vec::new();
     for doc in named_children(root).into_iter().filter(|n| n.kind() == "document") {
@@ -326,14 +359,20 @@ impl<'s> Loader<'s> {
                 let decoded: String = serde_yaml::from_str(self.text(node)).map_err(|e| e.to_string())?;
                 scalar(decoded, true, tag)
             }
-            "flow_sequence" | "block_sequence" => {
-                check_collection_tag(tag, "!!seq")?;
-                self.sequence(node)
-            }
-            "flow_mapping" | "block_mapping" => {
-                check_collection_tag(tag, "!!map")?;
-                self.mapping(node)
-            }
+            "flow_sequence" | "block_sequence" => match tag {
+                Some("!!omap") | Some("!!pairs") => self.pairs_list(node),
+                _ => {
+                    check_collection_tag(tag, "!!seq")?;
+                    self.sequence(node)
+                }
+            },
+            "flow_mapping" | "block_mapping" => match tag {
+                Some("!!set") => self.set(node),
+                _ => {
+                    check_collection_tag(tag, "!!map")?;
+                    self.mapping(node)
+                }
+            },
             other => Err(format!("unsupported YAML node {}", other)),
         }
     }
@@ -351,30 +390,57 @@ impl<'s> Loader<'s> {
                     });
                 }
                 "flow_node" | "block_node" => items.push(self.node(child)?),
-                "flow_pair" => items.push(self.build_dict(vec![pair_of(child)])?),
+                "flow_pair" => items.push(PyObj::Dict(self.build_dict(vec![pair_of(child)])?)),
                 other => return Err(format!("unexpected {} in a sequence", other)),
             }
         }
         Ok(PyObj::List(items))
     }
 
-    fn mapping(&mut self, node: Node<'_>) -> Result<PyObj, String> {
-        let mut pairs = Vec::new();
+    /// `!!omap` and `!!pairs`: a list of (key, value) tuples, each item a sequence entry holding
+    /// exactly one mapping pair. PyYAML does not merge `<<` here and keeps repeated keys.
+    fn pairs_list(&mut self, node: Node<'_>) -> Result<PyObj, String> {
+        let mut items = Vec::new();
         for child in named_children(node) {
-            match child.kind() {
-                "block_mapping_pair" | "flow_pair" => pairs.push(pair_of(child)),
-                // a flow mapping entry with no `:` is a key with a None value
-                "flow_node" | "block_node" => pairs.push((Some(child), None)),
-                "comment" => {}
-                other => return Err(format!("unexpected {} in a mapping", other)),
-            }
+            let item = match child.kind() {
+                "comment" => continue,
+                "block_sequence_item" => match named_children(child).into_iter().find(|c| c.kind() != "comment") {
+                    Some(item) => item,
+                    None => return Err("expected a single mapping item".into()),
+                },
+                "flow_node" | "block_node" | "flow_pair" => child,
+                other => return Err(format!("unexpected {} in a sequence", other)),
+            };
+            let entries = mapping_of_item(item)?;
+            let [(key, value)] = entries.as_slice() else {
+                return Err("expected a single mapping item".into());
+            };
+            let key = match key {
+                Some(k) => self.key(*k)?,
+                None => PyObj::None,
+            };
+            let value = match value {
+                Some(v) => self.node(*v)?,
+                None => PyObj::None,
+            };
+            items.push(PyObj::Tuple(vec![key, value]));
         }
-        self.build_dict(pairs)
+        Ok(PyObj::List(items))
+    }
+
+    /// `!!set`: the keys of the mapping, the values are ignored (PyYAML `construct_yaml_set`)
+    fn set(&mut self, node: Node<'_>) -> Result<PyObj, String> {
+        let dict = self.build_dict(mapping_entries(node)?)?;
+        Ok(PyObj::Set(dict.into_iter().map(|(k, _)| k).collect()))
+    }
+
+    fn mapping(&mut self, node: Node<'_>) -> Result<PyObj, String> {
+        Ok(PyObj::Dict(self.build_dict(mapping_entries(node)?)?))
     }
 
     /// PyYAML `flatten_mapping` + `construct_mapping`: merge keys (`<<`) come first, then the
     /// mapping's own pairs; a repeated key keeps the last value
-    fn build_dict(&mut self, pairs: Vec<Pair<'_>>) -> Result<PyObj, String> {
+    fn build_dict(&mut self, pairs: Vec<Pair<'_>>) -> Result<Vec<(PyObj, PyObj)>, String> {
         let mut merged: Vec<(PyObj, PyObj)> = Vec::new();
         let mut own: Vec<(PyObj, PyObj)> = Vec::new();
         for (key, value) in pairs {
@@ -411,7 +477,7 @@ impl<'s> Loader<'s> {
         for (k, v) in merged.into_iter().chain(own) {
             dict_set(&mut dict, k, v)?;
         }
-        Ok(PyObj::Dict(dict))
+        Ok(dict)
     }
 
     /// a mapping key. PyYAML gives a bare `=` key the str tag, unlike a `=` value
@@ -441,6 +507,53 @@ impl<'s> Loader<'s> {
 
 fn pair_of(node: Node<'_>) -> Pair<'_> {
     (node.child_by_field_name("key"), node.child_by_field_name("value"))
+}
+
+/// the pairs of a block or flow mapping. a flow mapping entry with no `:` is a key with a None value.
+fn mapping_entries(node: Node<'_>) -> Result<Vec<Pair<'_>>, String> {
+    let mut pairs = Vec::new();
+    for child in named_children(node) {
+        match child.kind() {
+            "block_mapping_pair" | "flow_pair" => pairs.push(pair_of(child)),
+            "flow_node" | "block_node" => pairs.push((Some(child), None)),
+            "comment" => {}
+            other => return Err(format!("unexpected {} in a mapping", other)),
+        }
+    }
+    Ok(pairs)
+}
+
+/// the pairs of one `!!omap` / `!!pairs` item, which must be a mapping (PyYAML `construct_yaml_omap`)
+fn mapping_of_item(item: Node<'_>) -> Result<Vec<Pair<'_>>, String> {
+    match item.kind() {
+        "flow_pair" | "block_mapping_pair" => Ok(vec![pair_of(item)]),
+        "flow_node" | "block_node" => match named_children(item).into_iter().find(|c| matches!(c.kind(), "flow_mapping" | "block_mapping")) {
+            Some(mapping) => mapping_entries(mapping),
+            None => Err("expected a mapping node".into()),
+        },
+        _ => Err("expected a mapping node".into()),
+    }
+}
+
+/// true when a tab sits outside every quoted scalar, block scalar and comment of the frontmatter
+fn tab_outside_verbatim(root: Node<'_>, text: &str) -> bool {
+    let mut verbatim = Vec::new();
+    collect_verbatim(root, &mut verbatim);
+    text.bytes()
+        .enumerate()
+        .any(|(i, b)| b == b'\t' && !verbatim.iter().any(|&(start, end)| start <= i && i < end))
+}
+
+fn collect_verbatim(node: Node<'_>, out: &mut Vec<(usize, usize)>) {
+    if matches!(node.kind(), "double_quote_scalar" | "single_quote_scalar" | "block_scalar" | "comment") {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
+    for i in 0..node.child_count() as u32 {
+        if let Some(child) = node.child(i) {
+            collect_verbatim(child, out);
+        }
+    }
 }
 
 fn check_collection_tag(tag: Option<&str>, want: &str) -> Result<(), String> {
@@ -473,6 +586,7 @@ fn scalar(text: String, quoted: bool, tag: Option<&str>) -> Result<PyObj, String
             },
             Some("null") => Ok(PyObj::None),
             Some("timestamp") => construct_timestamp(&text),
+            Some("binary") => decode_binary(&text).map(PyObj::Bytes),
             _ => Err(format!("could not determine a constructor for the tag '{}'", t)),
         },
     }
@@ -644,12 +758,80 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     }
 }
 
-/// PyYAML's plain-scalar folding: a line break becomes a space, and each blank line a newline
+/// PyYAML `construct_yaml_binary`: `base64.decodebytes` of the scalar's ascii text. Whitespace and
+/// other non-alphabet characters are skipped, data must be a whole number of quads once the `=`
+/// padding is counted, and any alphabet character after the padding is an error.
+fn decode_binary(text: &str) -> Result<Vec<u8>, String> {
+    if !text.is_ascii() {
+        return Err("'ascii' codec can't encode character".into());
+    }
+    let (data_part, pad_part) = match text.find('=') {
+        Some(i) => (&text[..i], &text[i..]),
+        None => (text, ""),
+    };
+    if pad_part.bytes().any(|b| b != b'=' && b64_value(b).is_some()) {
+        return Err("Incorrect padding".into());
+    }
+    let data: Vec<u8> = data_part.bytes().filter_map(b64_value).collect();
+    let pads = pad_part.bytes().filter(|&b| b == b'=').count();
+    let rem = data.len() % 4;
+    if rem == 1 {
+        return Err("Invalid base64-encoded string: number of data characters cannot be 1 more than a multiple of 4".into());
+    }
+    if rem != 0 && pads < 4 - rem {
+        return Err("Incorrect padding".into());
+    }
+    let mut out = Vec::with_capacity(data.len() / 4 * 3 + 2);
+    for quad in data.chunks(4) {
+        let acc = quad.iter().enumerate().fold(0u32, |acc, (i, &v)| acc | (u32::from(v) << (18 - 6 * i)));
+        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&bytes[..quad.len() - 1]);
+    }
+    Ok(out)
+}
+
+/// the value of one base64 alphabet character
+fn b64_value(b: u8) -> Option<u8> {
+    match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// python `repr(bytes)`: single quotes unless the value holds a single quote and no double quote
+fn bytes_repr(b: &[u8]) -> String {
+    let quote = if b.contains(&b'\'') && !b.contains(&b'"') { '"' } else { '\'' };
+    let mut out = String::from("b");
+    out.push(quote);
+    for &c in b {
+        match c {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            c if c == quote as u8 => {
+                out.push('\\');
+                out.push(quote);
+            }
+            0x20..=0x7e => out.push(c as char),
+            _ => out.push_str(&format!("\\x{:02x}", c)),
+        }
+    }
+    out.push(quote);
+    out
+}
+
+/// PyYAML's plain-scalar folding: a line break becomes a space, and each blank line a newline.
+/// PyYAML strips only spaces around a line break, so a non-breaking space stays in the scalar.
 fn fold_plain(text: &str) -> String {
     let mut out = String::new();
     let mut pending_breaks = 0usize;
     for (i, line) in text.split('\n').enumerate() {
-        let t = line.trim();
+        let t = line.trim_matches(' ');
         if i == 0 {
             out.push_str(t);
         } else if t.is_empty() {
@@ -753,6 +935,41 @@ mod tests {
         assert_eq!(name_of("base: &b {name: From Base}\n<<: *b").as_deref(), Some("From Base"));
         assert_eq!(name_of("=: x\nname: y").as_deref(), Some("y"));
         assert_eq!(name_of("name: x\nother: =").as_deref(), None);
+    }
+
+    #[test]
+    fn tabs_are_scanner_errors_outside_quotes_and_comments() {
+        assert_eq!(name_of("name:\tfoo"), None);
+        assert_eq!(name_of("name: a\tb"), None);
+        assert_eq!(name_of("name: a \tb"), None);
+        assert_eq!(name_of("name: foo\t"), None);
+        assert_eq!(name_of("name: \"a\tb\"").as_deref(), Some("a\tb"));
+        assert_eq!(name_of("name: x # a\tb").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn only_spaces_are_folded_out_of_plain_scalars() {
+        // PyYAML keeps a non-breaking space at a line end and inside a folded line
+        assert_eq!(name_of("name: ca\u{a0}\nother: 1").as_deref(), Some("ca\u{a0}"));
+        assert_eq!(name_of("name: foo \u{a0}\n bar").as_deref(), Some("foo \u{a0} bar"));
+    }
+
+    #[test]
+    fn binary_set_omap_and_pairs_build_like_pyyaml() {
+        assert_eq!(name_of("name: !!binary aGk=").as_deref(), Some("b'hi'"));
+        assert_eq!(name_of("name: !!binary aG==").as_deref(), Some("b'h'"));
+        assert_eq!(name_of("name: !!binary J2E=").as_deref(), Some("b\"'a\""));
+        assert_eq!(name_of("name: !!binary \"\""), None);
+        assert_eq!(name_of("name: !!binary aGk"), None);
+        assert_eq!(name_of("name: !!binary aGé"), None);
+        assert_eq!(name_of("name: !!set {a: null}").as_deref(), Some("{'a'}"));
+        assert_eq!(name_of("name: !!set {}"), None);
+        assert_eq!(name_of("name: !!set {[a]: null}"), None);
+        assert_eq!(name_of("name: !!omap [a: 1, b: 2]").as_deref(), Some("[('a', 1), ('b', 2)]"));
+        assert_eq!(name_of("name: !!pairs [a: 1, a: 2]").as_deref(), Some("[('a', 1), ('a', 2)]"));
+        assert_eq!(name_of("name: !!omap []"), None);
+        assert_eq!(name_of("name: !!omap [a]"), None);
+        assert_eq!(name_of("name: !!omap {a: 1}"), None);
     }
 
     /// expected `str(meta["name"])` (None = folder name) for frontmatter blocks, generated by running

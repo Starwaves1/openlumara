@@ -172,7 +172,9 @@ pub fn read_listed_text(path: &str) -> Result<String, String> {
     read_file_text(&resolve_listed_entry(path), path)
 }
 
-fn read_file_text(file: &Path, shown: &str) -> Result<String, String> {
+/// reads a file at a real path (a listed name, not a lossy one) as python `open(path, encoding="utf-8")`
+/// does, with `shown` as the path in the error text
+pub fn read_file_text(file: &Path, shown: &str) -> Result<String, String> {
     let bytes = std::fs::read(file).map_err(|e| os_error(&e, shown))?;
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
