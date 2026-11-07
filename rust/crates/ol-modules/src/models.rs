@@ -58,7 +58,8 @@ impl Models {
         Ok(Some(models))
     }
 
-    async fn switch(&self, name: &str) -> anyhow::Result<Value> {
+    /// python switch(name): `name` is whatever the caller passed (a JSON value for the tool, a str for the command)
+    async fn switch(&self, name: &Value) -> anyhow::Result<Value> {
         let models = match self.loaded() {
             Some(m) => m,
             None => {
@@ -70,9 +71,14 @@ impl Models {
                 models
             }
         };
+        // python calls name.strip() inside the loop, so a non-str name fails once there is a model to compare against
+        let wanted = match name {
+            Value::String(s) => s.trim().to_lowercase(),
+            other => anyhow::bail!("'{}' object has no attribute 'strip'", util::py_type_name(other)),
+        };
         let mut found_id = None;
         for model_id in &models {
-            if model_id.trim().to_lowercase() == name.trim().to_lowercase() {
+            if model_id.trim().to_lowercase() == wanted {
                 found_id = Some(model_id.clone());
             }
         }
@@ -152,7 +158,11 @@ impl Module for Models {
                 let Some(models) = self.load_models().await? else { anyhow::bail!("'NoneType' object is not iterable") };
                 Ok(self.base.result(json!(models), true))
             }
-            "switch" => self.switch(&args.str("name").unwrap_or_default()).await,
+            "switch" => {
+                // python passes the raw argument through; a JSON null arrives as None
+                let name = args.raw("name").cloned().unwrap_or(Value::Null);
+                self.switch(&name).await
+            }
             _ => anyhow::bail!("'Models' object has no attribute '{}'", method),
         }
     }
@@ -163,7 +173,7 @@ impl Module for Models {
                 if args.is_empty() {
                     return Ok(Some(format!("Current model: {}", py_opt(&self.current_model()?))));
                 }
-                let r = self.switch(args.join(" ").trim()).await?;
+                let r = self.switch(&json!(args.join(" ").trim())).await?;
                 Ok(match r {
                     Value::Null => None,
                     other => Some(ol_core::pyjson::py_str(&other)),
@@ -237,6 +247,16 @@ mod tests {
         let (mgr, m) = setup("llama-3", false, Some(vec!["Qwen3.5-9B", "llama-3"]));
         let out = block_on(m.run_command("model", vec!["gpt-9".into()])).unwrap();
         assert_eq!(out.as_deref(), Some("model does not exist. use models_get_available() first"));
+        assert_eq!(mgr.api().get_model().as_deref(), Some("llama-3"));
+    }
+
+    #[test]
+    fn switch_with_non_string_name_fails_like_python_strip() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mgr, m) = setup("llama-3", false, Some(vec!["Qwen3.5-9B", "llama-3"]));
+        let args = ToolArgs::new(json!({"name": 7}).as_object().unwrap().clone());
+        let err = block_on(m.call_tool("switch", args)).unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'strip'");
         assert_eq!(mgr.api().get_model().as_deref(), Some("llama-3"));
     }
 
