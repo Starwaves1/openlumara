@@ -244,7 +244,12 @@ async fn icon_512(State(app): State<Arc<Shared>>, req: Request) -> Response {
 }
 
 async fn favicon(State(app): State<Arc<Shared>>, req: Request) -> Response {
-    serve_static_file(app.webui_dir.join("favicon.ico"), req).await
+    let mut resp = serve_static_file(app.webui_dir.join("favicon.ico"), req).await;
+    // python mimetypes maps .ico to image/vnd.microsoft.icon; mime_guess says image/x-icon
+    if resp.status().is_success() {
+        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("image/vnd.microsoft.icon"));
+    }
+    resp
 }
 
 #[cfg(test)]

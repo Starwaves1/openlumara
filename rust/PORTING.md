@@ -167,18 +167,17 @@ Legend: **ported** = feature-complete port; **partial** = works with documented 
 
 ### Channels and modules
 
-(updated as the port progresses)
+| Python | Rust | Status | Notes |
+|---|---|---|---|
+| channels/webui | ol-webui | ported | all 122 routes + WS; templates rendered by minijinja with jinja2 include scoping and markupsafe escaping; side-by-side diff vs python: WS sequence, storage and ~70 routes identical. Asset URLs are relative (python emits absolute); utils/stores `<script>` order is sorted (python: filesystem order) |
+| channels/cli, cli_lite, logger, ntfy, api_bridge, simple_webui | ol-channels | ported | |
+| channels/telegram, discord_bot, matrix | ol-channels-chat | ported | not live-tested against the real services |
+| modules/auto_backup, calendar, characters, memory, scheduler | ol-modules-data | ported | NaN/Infinity and ints beyond i64/u64 in imported JSON can't be represented by serde_json and are not preserved |
+| modules/identity, tutorial, webui_extension_example, token_threshold, replacer, notes, lists, chats, models, modules, channel, docs, writing_style, time, skills | ol-modules | ported | time: zones come from chrono-tz, python uses host tzdata first |
+| modules/calculator | ol-modules | partial | own simpleeval-compatible evaluator; no f-strings, no str methods / `%` formatting, no `\N{...}` escapes, big ints serialised as strings |
+| modules/coder | ol-modules-dev | partial | 18 compiled-in tree-sitter grammars (python, js, ts/tsx, rust, go, c, c++, java, c#, ruby, php, lua, bash, html, css, json, yaml, toml) instead of tree-sitter-language-pack's full set; regex via fancy_regex (python uses `regex`); non-UTF-8 file names are converted lossily |
+| modules/shell, mcp | ol-modules-dev | ported | mcp: stdio, HTTP and SSE transports; posix shlex.split ported |
+| modules/http, file_manager, web_reader, unsafe_shell, web_search | ol-modules-web | ported | http: no ~/.netrc lookup; header names are sent lower-case (hyper) |
+| ddgs (pip package used by web_search) | ol-modules-web/src/ddgs | ported | only the code paths web_search calls; socks5/socks5h proxies supported |
 
-| Python file | Status | Notes |
-|---|---|---|
-| channels/webui | in progress | |
-| channels/cli | in progress | |
-| channels/cli_lite | in progress | |
-| channels/logger | in progress | |
-| channels/ntfy | in progress | |
-| channels/api_bridge | in progress | |
-| channels/simple_webui | in progress | |
-| channels/telegram | in progress | |
-| channels/discord_bot | in progress | |
-| channels/matrix | in progress | |
-| modules/* | in progress | |
+Python fidelity reference: the port tracks the upstream `dev` snapshot at `7a7b506` (2026-10-14). Python changes after that are not yet reflected.

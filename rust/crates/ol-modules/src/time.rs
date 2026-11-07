@@ -894,7 +894,7 @@ mod tests {
         odd.offset_secs = -(5 * 3600 + 29 * 60 + 53);
         assert_eq!(time_info(&odd, "%:z|%z", false).unwrap(), "-05:29:53|-052953");
         // python 3.14 keeps a NUL in the output and formats each side on its own
-        assert_eq!(time_info(&s, "%Y\0%m", false).unwrap(), "2026\011");
+        assert_eq!(time_info(&s, "%Y\0%m", false).unwrap(), "2026\x0011");
         assert_eq!(time_info(&s, "a\0%Y\0", false).unwrap(), "a\x002026\x00");
         assert_eq!(time_info(&s, "x%%\0%%Y", false).unwrap(), "x%\0%Y");
     }

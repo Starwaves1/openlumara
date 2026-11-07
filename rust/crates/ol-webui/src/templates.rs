@@ -40,7 +40,26 @@ fn load_file(base: &Path, name: &str) -> Option<String> {
     if !path.is_file() {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path).ok().map(|s| scope_include(&s))
+}
+
+/// jinja2 renders an `{% include %}` in a child context, so a `{% set %}` inside it never leaks
+/// back to the includer; minijinja evaluates includes in the caller's frame. Wrapping the body in
+/// a bare `{% with %}` gives it its own frame. Templates that define macros/blocks or extend are
+/// left alone: their top-level names must stay visible to importers.
+fn scope_include(src: &str) -> String {
+    let defines = ["extends", "macro", "block", "import", "from"]
+        .iter()
+        .any(|kw| src.contains(&format!("{{% {kw} ")) || src.contains(&format!("{{%- {kw} ")));
+    if defines {
+        return src.to_string();
+    }
+    // keep a single trailing newline outside the block so trim_trailing_newline still drops it
+    let (body, tail) = match src.strip_suffix('\n') {
+        Some(b) => (b, "\n"),
+        None => (src, ""),
+    };
+    format!("{{% with %}}{body}{{% endwith %}}{tail}")
 }
 
 fn sorted_html_files(dir: &Path) -> Vec<String> {
@@ -643,5 +662,25 @@ mod tests {
         assert_eq!(render("{{ a }}", minijinja::context! { a => true }), "True");
         assert_eq!(render("{{ a }}", minijinja::context! { a => 42 }), "42");
         assert_eq!(render("{{ missing }}", minijinja::context! {}), "");
+    }
+
+    #[test]
+    fn include_set_does_not_leak_to_includer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+        write(&base.join("page.html"), "{% include 'a.html' %}|{% include 'b.html' %}\n");
+        write(&base.join("a.html"), "{% set flag = True %}A{{ flag }}\n");
+        write(&base.join("b.html"), "B{% if flag %}leaked{% else %}clean{% endif %}\n");
+        let mut env = minijinja::Environment::new();
+        env.set_loader(move |name: &str| Ok(load_file(&base, name)));
+        // jinja2: "A" + "True" + "|" + "B" + "clean" (each file's single trailing newline is trimmed)
+        assert_eq!(env.get_template("page.html").unwrap().render(()).unwrap(), "ATrue|Bclean");
+    }
+
+    #[test]
+    fn templates_defining_macros_are_not_wrapped() {
+        let src = "{% macro top() %}x{% endmacro %}\n";
+        assert_eq!(scope_include(src), src);
+        assert_eq!(scope_include("a\n"), "{% with %}a{% endwith %}\n");
     }
 }
