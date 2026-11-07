@@ -4,7 +4,7 @@ use crate::util::{make_snippets, py_type_name, read_text};
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
-use ol_core::pyjson::py_str;
+use ol_core::pyjson::{py_str, truthy};
 use ol_core::storage::{temporary, StorageDict, StorageType};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
@@ -201,6 +201,12 @@ fn key_arg(args: &ToolArgs, k: &str) -> anyhow::Result<String> {
     }
 }
 
+/// python's stored keys are all str, so a lookup by None, a number or a bool can never find one:
+/// key_arg's string form ("None", "5") must not be matched against stored keys
+fn is_str_key(args: &ToolArgs, k: &str) -> bool {
+    matches!(args.raw(k), Some(Value::String(_)))
+}
+
 /// the notes tools, operating on a storage dict
 pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolArgs) -> anyhow::Result<Value> {
     match method {
@@ -222,24 +228,25 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
         }
         "read" => {
             let category = key_arg(args, "category")?;
-            if !data.data.contains_key(&category) {
+            if !is_str_key(args, "category") || !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
             let name = key_arg(args, "name")?;
             let cat = as_dict(&data.data[&category])?;
-            match cat.get(&name) {
+            match cat.get(&name).filter(|_| is_str_key(args, "name")) {
                 None => Ok(base.result(json!("note does not exist"), false)),
                 Some(v) => Ok(base.result(v.clone(), true)),
             }
         }
         "edit" => {
             let category = key_arg(args, "category")?;
-            if !data.data.contains_key(&category) {
+            if !is_str_key(args, "category") || !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
             let name = key_arg(args, "name")?;
             let content = args.raw("content").cloned().unwrap_or(Value::Null);
-            if !as_dict(&data.data[&category])?.contains_key(&name) {
+            let exists = is_str_key(args, "name") && as_dict(&data.data[&category])?.contains_key(&name);
+            if !exists {
                 return Ok(base.result(json!("note does not exist"), false));
             }
             data.data[&category].as_object_mut().unwrap().insert(name, content);
@@ -249,7 +256,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
         "get_categories" => Ok(base.result(json!(data.data.keys().collect::<Vec<_>>()), true)),
         "list" => {
             let category = key_arg(args, "category")?;
-            if !data.data.contains_key(&category) {
+            if !is_str_key(args, "category") || !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
             // python: self.data.get(category, {}) (StorageDict.get reloads from disk)
@@ -259,7 +266,10 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             Ok(base.result(json!(keys), true))
         }
         "search" => {
-            let query = args.str("query").unwrap_or_else(|| "None".into());
+            // python: search(None) or any falsy query returns [] (`not query`), so nothing is searched;
+            // the message still shows str(query)
+            let raw_query = args.0.get("query").cloned().unwrap_or(Value::Null);
+            let query = args.str_or("query", "None");
             reload(data)?;
             let mut items = Vec::new();
             recursive_items(&data.data, "", &mut items);
@@ -267,7 +277,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             let mut weights = IndexMap::new();
             weights.insert("path".to_string(), 2.0);
             weights.insert("content".to_string(), 1.0);
-            let results = ol_core::search::search(&entries, &query, "id", Some(&weights), 10);
+            let results = if truthy(&raw_query) { ol_core::search::search(&entries, &query, "id", Some(&weights), 10) } else { Vec::new() };
             if results.is_empty() {
                 return Ok(base.result(json!(format!("no notes found matching '{}'", query)), true));
             }
@@ -285,11 +295,12 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
         }
         "delete" => {
             let category = key_arg(args, "category")?;
-            if !data.data.contains_key(&category) {
+            if !is_str_key(args, "category") || !data.data.contains_key(&category) {
                 return Ok(base.result(json!(NO_CATEGORY), false));
             }
             let name = key_arg(args, "name")?;
-            if !as_dict(&data.data[&category])?.contains_key(&name) {
+            let exists = is_str_key(args, "name") && as_dict(&data.data[&category])?.contains_key(&name);
+            if !exists {
                 return Ok(base.result(json!("note does not exist"), false));
             }
             data.data[&category].as_object_mut().unwrap().shift_remove(&name);
@@ -340,6 +351,39 @@ mod tests {
 
     fn args(v: Value) -> ToolArgs {
         ToolArgs::new(v.as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn null_and_non_str_keys_never_match_and_null_query_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let mut d = StorageDict::new("notes", StorageType::Markdown, Some(&p)).unwrap();
+        let base = ModuleBase::detached("notes");
+        // a category literally named "None" and a note whose text contains "None"
+        run(&base, &mut d, "create", &args(json!({"category": "None", "name": "x", "content": "None of this"}))).unwrap();
+        // python: `None not in self.data.keys()` is True, so a null category is the missing-category path
+        let r = run(&base, &mut d, "read", &args(json!({"category": null, "name": "x"}))).unwrap();
+        assert_eq!(r["content"], json!(NO_CATEGORY));
+        let r = run(&base, &mut d, "list", &args(json!({"category": null}))).unwrap();
+        assert_eq!(r["content"], json!(NO_CATEGORY));
+        // python: a number key is not a str key, so it cannot match a category named "5"
+        run(&base, &mut d, "create", &args(json!({"category": "5", "name": "n", "content": "c"}))).unwrap();
+        let r = run(&base, &mut d, "read", &args(json!({"category": 5, "name": "n"}))).unwrap();
+        assert_eq!(r["content"], json!(NO_CATEGORY));
+        // python: a null name is `None not in keys()`, so it is "note does not exist" even though "None" exists
+        let r = run(&base, &mut d, "read", &args(json!({"category": "None", "name": null}))).unwrap();
+        assert_eq!(r["content"], json!("note does not exist"));
+        let r = run(&base, &mut d, "delete", &args(json!({"category": "None", "name": null}))).unwrap();
+        assert_eq!(r["content"], json!("note does not exist"));
+        // python: search(None) returns [] (`not query`), so the text "None" in a note is not searched for
+        let r = run(&base, &mut d, "search", &args(json!({"query": null}))).unwrap();
+        assert_eq!(r["content"], json!("no notes found matching 'None'"));
+        // python: any falsy query (here "") returns [] and shows str(query) in the message
+        let r = run(&base, &mut d, "search", &args(json!({"query": ""}))).unwrap();
+        assert_eq!(r["content"], json!("no notes found matching ''"));
+        // a real query still finds the note
+        let r = run(&base, &mut d, "search", &args(json!({"query": "none"}))).unwrap();
+        assert!(r["content"].as_str().unwrap().starts_with("None/x (score "), "{}", r);
     }
 
     #[test]

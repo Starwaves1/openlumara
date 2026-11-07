@@ -170,7 +170,7 @@ impl Skills {
         let Some(folder) = folder.as_str() else {
             anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(&folder));
         };
-        let p = rstrip_sep(&ol_core::paths::get_path(&expanduser(folder))?);
+        let p = rstrip_sep(&ol_core::paths::get_path(&expanduser(folder)?)?);
         Ok(p)
     }
 

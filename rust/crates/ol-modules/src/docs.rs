@@ -79,7 +79,7 @@ impl Docs {
         for item in self.folder_items()? {
             let f = item.as_str().ok_or_else(|| anyhow::anyhow!("'{}' object has no attribute 'rstrip'", util::py_type_name(&item)))?;
             if util::basename(&util::rstrip_sep(f)) == wanted {
-                return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(f))?)));
+                return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(f)?)?)));
             }
         }
         Ok(None)
@@ -152,7 +152,7 @@ impl Module for Docs {
             let Some(folder) = item.as_str() else {
                 anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(&item));
             };
-            let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(folder))?);
+            let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(folder)?)?);
             // a folder at the filesystem root is rstripped to ''; python os.makedirs('') raises ENOENT, std does not
             if p.is_empty() {
                 anyhow::bail!("[Errno 2] No such file or directory: {}", util::repr_str(""));

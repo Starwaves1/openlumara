@@ -21,16 +21,16 @@ pub fn ui_extension_enabled(configured: Option<&Value>, declared_default: Option
     }
 }
 
-/// os.path.expanduser
-pub fn expanduser(p: &str) -> String {
+/// os.path.expanduser; a `~user` name with a NUL byte raises python's ValueError
+pub fn expanduser(p: &str) -> anyhow::Result<String> {
     expanduser_with(p, std::env::var_os("HOME"), passwd_home)
 }
 
 /// os.path.expanduser with the environment and the passwd database injected.
 /// `passwd_home(None)` is the home of the current uid, `passwd_home(Some(name))` the home of `name`.
-fn expanduser_with(p: &str, home_env: Option<OsString>, passwd_home: impl Fn(Option<&str>) -> Option<String>) -> String {
+fn expanduser_with(p: &str, home_env: Option<OsString>, passwd_home: impl Fn(Option<&str>) -> Option<String>) -> anyhow::Result<String> {
     let Some(rest) = p.strip_prefix('~') else {
-        return p.to_string();
+        return Ok(p.to_string());
     };
     // python: i = path.find(sep, 1); the user name is path[1:i], the remainder is path[i:]
     let i = rest.find('/').unwrap_or(rest.len());
@@ -39,22 +39,26 @@ fn expanduser_with(p: &str, home_env: Option<OsString>, passwd_home: impl Fn(Opt
             Some(h) => h.to_string_lossy().into_owned(),
             None => match passwd_home(None) {
                 Some(h) => h,
-                None => return p.to_string(),
+                None => return Ok(p.to_string()),
             },
         }
     } else {
+        // python: pwd.getpwnam(name) raises ValueError for a name with a NUL byte (only KeyError is caught)
+        if rest[..i].contains('\0') {
+            anyhow::bail!("embedded null byte");
+        }
         match passwd_home(Some(&rest[..i])) {
             Some(h) => h,
-            None => return p.to_string(),
+            None => return Ok(p.to_string()),
         }
     };
     let joined = format!("{}{}", userhome.trim_end_matches('/'), &rest[i..]);
     // python: (userhome + path[i:]) or sep
-    if joined.is_empty() {
+    Ok(if joined.is_empty() {
         "/".to_string()
     } else {
         joined
-    }
+    })
 }
 
 /// home directory from the passwd database: of the user `name`, or of the current uid when `name` is None
@@ -403,31 +407,37 @@ mod tests {
     #[test]
     fn expanduser_follows_python_rules() {
         let home = |h: &str| Some(OsString::from(h));
-        assert_eq!(expanduser_with("/abs/x", home("/h"), fake_passwd), "/abs/x");
-        assert_eq!(expanduser_with("~/notes.md", home("/h/"), fake_passwd), "/h/notes.md");
-        assert_eq!(expanduser_with("~", home("/h"), fake_passwd), "/h");
+        let ex = |p: &str, h: Option<OsString>| expanduser_with(p, h, fake_passwd).unwrap();
+        assert_eq!(ex("/abs/x", home("/h")), "/abs/x");
+        assert_eq!(ex("~/notes.md", home("/h/")), "/h/notes.md");
+        assert_eq!(ex("~", home("/h")), "/h");
         // HOME='/' or '' with '~' gives '/', not '' (an empty path would mean the project root)
-        assert_eq!(expanduser_with("~", home("/"), fake_passwd), "/");
-        assert_eq!(expanduser_with("~", home(""), fake_passwd), "/");
-        assert_eq!(expanduser_with("~/x", home("/"), fake_passwd), "/x");
+        assert_eq!(ex("~", home("/")), "/");
+        assert_eq!(ex("~", home("")), "/");
+        assert_eq!(ex("~/x", home("/")), "/x");
         // HOME unset falls back to the passwd entry of the current uid
-        assert_eq!(expanduser_with("~/docs", None, fake_passwd), "/home/uid/docs");
-        assert_eq!(expanduser_with("~/docs", None, |_| None), "~/docs");
+        assert_eq!(ex("~/docs", None), "/home/uid/docs");
+        assert_eq!(expanduser_with("~/docs", None, |_| None).unwrap(), "~/docs");
         // ~user expands through the passwd database; unknown users stay literal
-        assert_eq!(expanduser_with("~root/x", home("/h"), fake_passwd), "/root/x");
-        assert_eq!(expanduser_with("~nobody_here/x", home("/h"), fake_passwd), "~nobody_here/x");
+        assert_eq!(ex("~root/x", home("/h")), "/root/x");
+        assert_eq!(ex("~nobody_here/x", home("/h")), "~nobody_here/x");
+        // python: pwd.getpwnam('a\0b') raises ValueError('embedded null byte'), the NUL is not a KeyError
+        let err = expanduser_with("~a\0b/x", home("/h"), fake_passwd).unwrap_err();
+        assert_eq!(err.to_string(), "embedded null byte");
+        // python: a NUL after the user name is not looked up, so the path is just joined
+        assert_eq!(ex("~/a\0b", home("/h")), "/h/a\0b");
     }
 
     #[test]
     fn expanduser_and_basename_against_real_environment() {
-        assert_eq!(expanduser("/abs/x"), "/abs/x");
+        assert_eq!(expanduser("/abs/x").unwrap(), "/abs/x");
         if let Ok(home) = std::env::var("HOME") {
-            assert_eq!(expanduser("~/notes.md"), format!("{}/notes.md", home.trim_end_matches('/')));
+            assert_eq!(expanduser("~/notes.md").unwrap(), format!("{}/notes.md", home.trim_end_matches('/')));
         }
         if let Some(root) = passwd_home(Some("root")) {
-            assert_eq!(expanduser("~root/x"), format!("{}/x", root.trim_end_matches('/')));
+            assert_eq!(expanduser("~root/x").unwrap(), format!("{}/x", root.trim_end_matches('/')));
         }
-        assert_eq!(expanduser("~no_such_user_olmods/x"), "~no_such_user_olmods/x");
+        assert_eq!(expanduser("~no_such_user_olmods/x").unwrap(), "~no_such_user_olmods/x");
         assert_eq!(basename("a/b/c.txt"), "c.txt");
         assert_eq!(basename("a/b/"), "");
         assert_eq!(basename("plain"), "plain");

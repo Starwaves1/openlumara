@@ -324,8 +324,9 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             if !args.0.contains_key("query") {
                 anyhow::bail!("Lists.search() missing 1 required positional argument: 'query'");
             }
-            // python's search() returns [] for a None query (`not query`), but the message still shows 'None'
-            let query_is_null = matches!(args.0.get("query"), Some(Value::Null));
+            // python's search() returns [] for any falsy query (`not query`: None, False, 0, 0.0, "", [], {}),
+            // but the message still shows str(query), e.g. 'None'
+            let query_is_falsy = !truthy(&args.0.get("query").cloned().unwrap_or(Value::Null));
             let query = args.str_or("query", "None");
             data.load();
             let mut list_entries = Vec::new();
@@ -358,7 +359,7 @@ pub fn run(base: &ModuleBase, data: &mut StorageDict, method: &str, args: &ToolA
             w_name.insert("name".to_string(), 1.0);
             let mut w_item = IndexMap::new();
             w_item.insert("item".to_string(), 1.0);
-            let (list_results, item_results) = if query_is_null {
+            let (list_results, item_results) = if query_is_falsy {
                 (Vec::new(), Vec::new())
             } else {
                 (
@@ -710,6 +711,15 @@ mod tests {
         // python: search(None) returns [] because `not query` is true, so the literal word "none" in an item does not match
         let r = run(&base, &mut d, "search", &args(json!({"query": null}))).unwrap();
         assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching 'None'"}));
+        // python: every falsy query returns [] too, and the message shows str(query)
+        let r = run(&base, &mut d, "search", &args(json!({"query": false}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching 'False'"}));
+        let r = run(&base, &mut d, "search", &args(json!({"query": 0}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching '0'"}));
+        let r = run(&base, &mut d, "search", &args(json!({"query": 0.0}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching '0.0'"}));
+        let r = run(&base, &mut d, "search", &args(json!({"query": ""}))).unwrap();
+        assert_eq!(r, json!({"status": "success", "content": "no lists or list items found matching ''"}));
         // the same item is found by a real query
         let r = run(&base, &mut d, "search", &args(json!({"query": "none"}))).unwrap();
         assert!(r["content"].as_str().unwrap().starts_with("list items matching the query:\n- [home] notes: none of this"), "{}", r);
