@@ -197,15 +197,23 @@ impl Module for Docs {
                     Ok(None) => "None".to_string(),
                     Err(v) => py_str(v),
                 };
-                let subfolder = args.str("subfolder");
+                // python `if subfolder and subfolder.startswith(folder)` and `subfolder or ""`: a falsy
+                // non-str value is no subfolder, a truthy non-str one fails on startswith (caught by python's try)
+                let subfolder: Result<Option<String>, Value> = match args.0.get("subfolder") {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(other) if !truthy(other) => Ok(None),
+                    Some(other) => Err(other.clone()),
+                };
                 let attempt = || -> Result<(Vec<String>, Vec<String>), Result<String, String>> {
                     let folder_path = self.folder_path_of(&folder).map_err(|e| Err(e.to_string()))?;
                     let Some(folder_path) = folder_path.filter(|p| !p.is_empty()) else {
                         return Err(Ok(format!("Folder '{}' does not exist within the docs module configuration.", folder_name)));
                     };
                     let subfolder = match &subfolder {
-                        Some(s) if !s.is_empty() && s.starts_with(&folder_name) => Some(strip_folder(s, &folder_name)),
-                        other => other.clone(),
+                        Ok(Some(s)) if !s.is_empty() && s.starts_with(&folder_name) => Some(strip_folder(s, &folder_name)),
+                        Ok(other) => other.clone(),
+                        Err(v) => return Err(Ok(format!("'{}' object has no attribute 'startswith'", util::py_type_name(v)))),
                     };
                     let base_path = ol_core::paths::sandbox_path(&folder_path, Some(subfolder.as_deref().unwrap_or(""))).map_err(|e| Err(e.to_string()))?;
                     list_level(&base_path, subfolder.as_deref()).map_err(Err)
@@ -413,6 +421,24 @@ mod tests {
         // list with no folders is not an error in python: it reports the not-found text with str(folder)
         let out = block_on(m.call_tool("list", args(json!({"folder": 7})))).unwrap();
         assert_eq!(out, json!({"status": "error", "content": "Folder '7' does not exist within the docs module configuration."}));
+    }
+
+    #[test]
+    fn list_subfolder_that_is_not_a_str_follows_python_truthiness() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, _dir) = setup(true);
+        // python: `if subfolder and subfolder.startswith(folder)` is inside the try, so a truthy non-str
+        // subfolder returns the AttributeError text as an error result
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide", "subfolder": 5})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "'int' object has no attribute 'startswith'"}));
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide", "subfolder": true})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "'bool' object has no attribute 'startswith'"}));
+        // falsy non-str values (0, false, []) are no subfolder, so python lists the folder root
+        for falsy in [json!(0), json!(false), json!([]), json!(0.0)] {
+            let out = block_on(m.call_tool("list", args(json!({"folder": "guide", "subfolder": falsy})))).unwrap();
+            assert_eq!(out["content"]["files"], json!(["a.md"]));
+            assert_eq!(out["content"]["subfolders"], json!(["sub"]));
+        }
     }
 
     #[test]
