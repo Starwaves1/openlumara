@@ -129,7 +129,8 @@ pub fn lookup(map: &[(&str, &str)], key: &str) -> Result<String, DdgsError> {
     map.iter()
         .find(|(k, _)| *k == key)
         .map(|(_, v)| (*v).to_string())
-        .ok_or_else(|| DdgsError::Failed(format!("KeyError: {key:?}")))
+        // str(KeyError(key)) is repr(key)
+        .ok_or_else(|| DdgsError::Failed(ol_core::pyjson::py_repr(&serde_json::Value::String(key.to_string()))))
 }
 
 /// every engine that is enabled in ddgs 9.16.1 (`ENGINES` after the disabled ones are dropped)
@@ -349,7 +350,7 @@ impl Ddgs {
     }
 
     /// `DDGS._search_sync`
-    async fn search_sync(&self, cat: Category, query: &str, args: &SearchArgs) -> Result<Vec<Record>, DdgsError> {
+    pub async fn search_sync(&self, cat: Category, query: &str, args: &SearchArgs) -> Result<Vec<Record>, DdgsError> {
         if query.is_empty() {
             return Err(DdgsError::Failed("query is mandatory.".into()));
         }

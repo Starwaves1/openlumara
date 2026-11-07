@@ -53,13 +53,14 @@ pub async fn extract(session: &mut Session, lang: &str, text: &str) -> Result<Ve
 
     // quote(result.title): the normalised title
     let title_text = rec.get("title").and_then(Value::as_str).ok_or_else(|| DdgsError::Failed("title is not a str".into()))?.to_string();
-    if let Some(resp) = session.request_text(Method::Get, &extract_url(lang, &title_text), &[]).await? {
+    // python `if resp_data:` skips an empty body (falsy), keeping body=''
+    if let Some(resp) = session.request_text(Method::Get, &extract_url(lang, &title_text), &[]).await?.filter(|r| !r.is_empty()) {
         let data: Value = serde_json::from_str(&resp).map_err(json_error)?;
         let pages = data
             .get("query")
             .and_then(|q| q.get("pages"))
             .and_then(Value::as_object)
-            .ok_or_else(|| DdgsError::Failed("KeyError: 'pages'".into()))?;
+            .ok_or_else(|| DdgsError::Failed("'pages'".into()))?;
         let first = pages.values().next().ok_or_else(|| DdgsError::Failed("StopIteration".into()))?;
         let extract = first
             .as_object()

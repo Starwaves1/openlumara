@@ -189,7 +189,10 @@ pub fn extract_vqd(html: &[u8], query: &str) -> Result<String, DdgsError> {
         if let Some(i) = find(html, c1, 0) {
             let start = i + c1_len;
             if let Some(end) = find(html, c2, start) {
-                return String::from_utf8(html[start..end].to_vec()).map_err(fail);
+                // `.decode()` raising UnicodeDecodeError (a ValueError) is suppressed by python
+                if let Ok(vqd) = String::from_utf8(html[start..end].to_vec()) {
+                    return Ok(vqd);
+                }
             }
         }
     }
@@ -205,6 +208,15 @@ pub async fn get_vqd(session: &mut Session, query: &str) -> Result<String, DdgsE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vqd_with_invalid_utf8_falls_through_to_the_next_pattern() {
+        // python suppresses the UnicodeDecodeError (a ValueError) and tries vqd=' next
+        let html = b"vqd=\xff& vqd='abc'";
+        assert_eq!(extract_vqd(html, "q").unwrap(), "abc");
+        // no pattern left: the python error text
+        assert!(extract_vqd(b"vqd=\xff&", "q").is_err());
+    }
 
     #[test]
     fn vqd_is_taken_from_the_first_pattern_that_closes() {

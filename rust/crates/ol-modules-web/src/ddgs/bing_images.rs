@@ -82,7 +82,12 @@ pub fn extract(html_text: &str) -> Result<Vec<Record>, DdgsError> {
             let dim = dimension.replace('×', "x");
             let parts: Vec<&str> = dim.split('x').collect();
             let [width, height] = parts.as_slice() else {
-                return Err(DdgsError::Failed(format!("too many values to unpack (expected 2, got {})", parts.len())));
+                let msg = if parts.len() < 2 {
+                    format!("not enough values to unpack (expected 2, got {})", parts.len())
+                } else {
+                    format!("too many values to unpack (expected 2, got {})", parts.len())
+                };
+                return Err(DdgsError::Failed(msg));
             };
             // height.split()[0].strip()
             let height_token = py_split(height)
@@ -118,6 +123,15 @@ pub async fn search(net: &Net, query: &str, args: &SearchArgs) -> Result<Vec<Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_part_dimension_is_python_not_enough_values_error() {
+        let html = r#"<div class="item"><div class="imgpt"><a class="iusc" m='{"t":"T","murl":"https://i/x.jpg","turl":"https://t/x.jpg","purl":"https://p/x"}'></a></div>
+            <div class="infopt"><div class="img_info"><span class="nowrap">1024</span></div></div></div>"#;
+        assert_eq!(extract(html).unwrap_err().message(), "not enough values to unpack (expected 2, got 1)");
+        let two_x = html.replace("1024", "1x2x3");
+        assert_eq!(extract(&two_x).unwrap_err().message(), "too many values to unpack (expected 2, got 3)");
+    }
 
     #[test]
     fn payload_uses_count_35_and_python_qft_table() {

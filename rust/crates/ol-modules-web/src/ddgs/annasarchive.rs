@@ -34,14 +34,16 @@ pub fn extract(html_text: &str) -> Result<Vec<Record>, DdgsError> {
     let doc = html::parse(&pre_process(html_text));
     let mut out = Vec::new();
     // //div[contains(@class, 'record-list-outer')]/div
-    let mut items = Vec::new();
-    for outer in all_elements(&doc).into_iter().filter(|e| named(*e, "div") && class_has(*e, "record-list-outer")) {
-        for child in child_named(outer, "div") {
-            if !items.iter().any(|seen: &scraper::ElementRef<'_>| seen.id() == child.id()) {
-                items.push(child);
-            }
-        }
-    }
+    // one pass in document order: every div whose parent is a record-list-outer div
+    let items: Vec<scraper::ElementRef<'_>> = all_elements(&doc)
+        .into_iter()
+        .filter(|e| {
+            named(*e, "div")
+                && e.parent()
+                    .and_then(scraper::ElementRef::wrap)
+                    .is_some_and(|p| named(p, "div") && class_has(p, "record-list-outer"))
+        })
+        .collect();
     for item in items {
         let title = collapse_ws(&text_of(&desc_where(item, |e| named(e, "a") && class_has(e, "text-lg"))));
         let author = collapse_ws(&text_of(&desc_where(item, |e| named(e, "a") && has_child_where(e, |c| named(c, "span") && class_has(c, "user")))));
@@ -88,6 +90,17 @@ pub async fn search(net: &Net, query: &str, args: &SearchArgs) -> Result<Vec<Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_record_lists_keep_document_order() {
+        // the nested outer div is itself an item, and its child comes before the later sibling
+        let page = r#"<div class="record-list-outer">
+            <div class="record-list-outer"><div><a class="text-lg" href="/y">Y</a></div></div>
+            <div><a class="text-lg" href="/x">X</a></div>
+        </div>"#;
+        let urls: Vec<String> = extract(page).unwrap().iter().map(|r| r["url"].as_str().unwrap().to_string()).collect();
+        assert_eq!(urls, vec!["".to_string(), "/y".to_string(), "/x".to_string()]);
+    }
 
     #[test]
     fn payload_and_mirror_base() {

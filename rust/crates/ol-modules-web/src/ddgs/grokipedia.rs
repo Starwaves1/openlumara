@@ -47,7 +47,7 @@ pub fn extract(text: &str) -> Result<Vec<Record>, DdgsError> {
         None => snippet,
     };
     // items[0]['slug']
-    let slug = first.get("slug").ok_or_else(|| DdgsError::Failed("KeyError: 'slug'".into()))?;
+    let slug = first.get("slug").ok_or_else(|| DdgsError::Failed("'slug'".into()))?;
     let href = format!("https://grokipedia.com/page/{}", py_str(slug));
 
     Ok(vec![build(

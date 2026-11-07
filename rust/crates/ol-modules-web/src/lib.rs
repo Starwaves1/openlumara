@@ -12,6 +12,7 @@ pub mod sanitize;
 mod util;
 pub mod unsafe_shell;
 pub mod web_reader;
+pub mod web_search;
 
 use ol_core::registry::{ModuleDescriptor, Registry};
 
@@ -44,6 +45,15 @@ pub fn register(r: &mut Registry) {
         unsafe_: web_reader::meta::UNSAFE,
         category: web_reader::meta::CATEGORY,
         factory: web_reader::WebReader::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "web_search",
+        class_name: web_search::meta::CLASS_NAME,
+        doc: web_search::meta::DOC,
+        settings: web_search::meta::settings,
+        unsafe_: web_search::meta::UNSAFE,
+        category: web_search::meta::CATEGORY,
+        factory: web_search::WebSearch::factory,
     });
     r.add_module(ModuleDescriptor {
         name: "unsafe_shell",
