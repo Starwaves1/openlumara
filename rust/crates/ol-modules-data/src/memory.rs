@@ -31,6 +31,36 @@ fn weights(search_in_content: bool) -> IndexMap<String, f64> {
     w
 }
 
+/// python's `_extract` keeps booleans in list fields (`str(True)` is "True"), but ol_core's extract drops them. The
+/// ranking runs over copies with boolean list items spelled the python way; hits map back to the stored entries.
+fn python_spelled_bools(entry: &Value) -> Value {
+    let Value::Object(obj) = entry else { return entry.clone() };
+    let mut obj = obj.clone();
+    for value in obj.values_mut() {
+        if let Value::Array(items) = value {
+            for item in items.iter_mut() {
+                if let Value::Bool(b) = item {
+                    *item = Value::String(if *b { "True" } else { "False" }.into());
+                }
+            }
+        }
+    }
+    Value::Object(obj)
+}
+
+/// `core.search.search(entries, query, field_weights=..., top_n=...)`: the ranked stored entries with their scores
+fn search_entries(entries: &[Value], query: &str, search_in_content: bool, top_n: usize) -> Vec<(Value, f64)> {
+    if entries.is_empty() || query.trim().is_empty() {
+        return vec![];
+    }
+    let spelled: Vec<Value> = entries.iter().map(python_spelled_bools).collect();
+    let w = weights(search_in_content);
+    ol_core::search::bm25_rank(&spelled, query, Some(&w), top_n)
+        .into_iter()
+        .map(|(i, score)| (entries[i].clone(), score))
+        .collect()
+}
+
 /// `str(query.get("search_content", "true")).lower() not in ("false", "0", "no")`
 fn search_content_flag(query: &Map<String, Value>) -> bool {
     !matches!(query_str(query, "search_content", "true").to_lowercase().as_str(), "false" | "0" | "no")
@@ -64,31 +94,57 @@ fn tag_items(mem: &Value) -> anyhow::Result<Vec<Value>> {
     })
 }
 
+static UNICODE_DECIMAL: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
+
+/// value of a decimal digit as python's int() reads it: ASCII or any unicode Nd char. unicode lays every run of
+/// ten digits out as 0..=9 in order, so the value is the length of the Nd run before the char, modulo ten
+fn decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - '0' as u32);
+    }
+    let is_nd = |c: char| UNICODE_DECIMAL.is_match(&c.to_string());
+    if !is_nd(c) {
+        return None;
+    }
+    let mut run = 0u32;
+    let mut cp = c as u32;
+    while let Some(prev) = cp.checked_sub(1).and_then(char::from_u32) {
+        if !is_nd(prev) {
+            break;
+        }
+        run += 1;
+        cp -= 1;
+    }
+    Some(run % 10)
+}
+
 /// python `int(s)` for a query string: surrounding whitespace, one sign and single underscores between digits
-/// are accepted, anything else is a ValueError (None). magnitudes saturate, so every clamp and comparison the
-/// routes make comes out the same as with python's arbitrary-precision int
+/// are accepted, anything else is a ValueError (None). digits may be any unicode decimal digit. magnitudes
+/// saturate, so every clamp and comparison the routes make comes out the same as with python's arbitrary-precision int
 fn py_int_query(s: &str) -> Option<i128> {
-    let t = s.trim();
-    let (neg, digits) = match t.as_bytes().first() {
-        Some(b'-') => (true, &t[1..]),
-        Some(b'+') => (false, &t[1..]),
-        _ => (false, t),
+    let t = s.trim_matches(|c: char| c.is_whitespace() || ('\x1c'..='\x1f').contains(&c));
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    let b = digits.as_bytes();
-    if !b.first()?.is_ascii_digit() || !b.last()?.is_ascii_digit() {
+    let chars: Vec<char> = digits.chars().collect();
+    if decimal_value(*chars.first()?).is_none() || decimal_value(*chars.last()?).is_none() {
         return None;
     }
     let mut v: i128 = 0;
     let mut prev_underscore = false;
-    for &c in b {
-        match c {
-            b'_' if !prev_underscore => prev_underscore = true,
-            b'0'..=b'9' => {
-                prev_underscore = false;
-                v = v.saturating_mul(10).saturating_add(i128::from(c - b'0'));
+    for c in chars {
+        if c == '_' {
+            if prev_underscore {
+                return None;
             }
-            _ => return None,
+            prev_underscore = true;
+            continue;
         }
+        prev_underscore = false;
+        let d = decimal_value(c)?;
+        v = v.saturating_mul(10).saturating_add(i128::from(d));
     }
     Some(if neg { -v } else { v })
 }
@@ -135,14 +191,19 @@ impl Memory {
         self.with_mem(|m| m.load())
     }
 
-    /// checks if a memory with ID exists in memories
-    fn get_index(data: &[Value], id: &str) -> i64 {
+    /// checks if a memory with ID exists in memories. python calls `mem.get("id").strip()` on every memory it
+    /// scans, so a stored id that is not a string raises as soon as the scan reaches that memory
+    fn get_index(data: &[Value], id: &str) -> anyhow::Result<i64> {
         for (i, mem) in data.iter().enumerate() {
-            if id.trim() == py_str_opt(mem.get("id")).trim() {
-                return i as i64;
+            let stored = match mem.get("id") {
+                Some(Value::String(s)) => s.as_str(),
+                other => anyhow::bail!("'{}' object has no attribute 'strip'", other.map_or("NoneType", py_type)),
+            };
+            if id.trim() == stored.trim() {
+                return Ok(i as i64);
             }
         }
-        -1
+        Ok(-1)
     }
 
     /// python `_get_index(ulid)` calls `ulid.strip()` once per memory, so a non-string id only fails when memories
@@ -176,10 +237,10 @@ impl Memory {
     }
 
     pub async fn edit(&self, id: &str, content: Option<Value>, tags: Option<Value>) -> anyhow::Result<Value> {
-        let found = self.with_mem(|m| {
-            let index = Self::get_index(&m.data, id);
+        let found = self.with_mem(|m| -> anyhow::Result<bool> {
+            let index = Self::get_index(&m.data, id)?;
             if index == -1 {
-                return false;
+                return Ok(false);
             }
             let entry = &mut m.data[index as usize];
             if let Some(c) = content.filter(truthy) {
@@ -189,8 +250,8 @@ impl Memory {
                 entry["tags"] = t;
             }
             m.save();
-            true
-        })?;
+            Ok(true)
+        })??;
         if !found {
             return Ok(self.not_found());
         }
@@ -198,13 +259,13 @@ impl Memory {
     }
 
     pub async fn delete(&self, id: &str) -> anyhow::Result<Value> {
-        let removed = self.with_mem(|m| {
-            let index = Self::get_index(&m.data, id);
+        let removed = self.with_mem(|m| -> anyhow::Result<Option<Value>> {
+            let index = Self::get_index(&m.data, id)?;
             if index == -1 {
-                return None;
+                return Ok(None);
             }
-            Some(m.data[index as usize].clone())
-        })?;
+            Ok(Some(m.data[index as usize].clone()))
+        })??;
         let Some(removed) = removed else { return Ok(self.not_found()) };
         {
             let mut g = self.deleted.lock();
@@ -212,26 +273,27 @@ impl Memory {
             d.data.push(removed);
             d.save();
         }
-        self.with_mem(|m| {
-            let index = Self::get_index(&m.data, id);
+        self.with_mem(|m| -> anyhow::Result<()> {
+            let index = Self::get_index(&m.data, id)?;
             if index >= 0 {
                 m.data.remove(index as usize);
             }
             m.save();
-        })?;
+            Ok(())
+        })??;
         Ok(self.base.result(format!("memory {} deleted", id), true))
     }
 
     async fn set_pinned(&self, id: &str, pinned: bool) -> anyhow::Result<Value> {
-        let found = self.with_mem(|m| {
-            let index = Self::get_index(&m.data, id);
+        let found = self.with_mem(|m| -> anyhow::Result<bool> {
+            let index = Self::get_index(&m.data, id)?;
             if index == -1 {
-                return false;
+                return Ok(false);
             }
             m.data[index as usize]["pinned"] = Value::Bool(pinned);
             m.save();
-            true
-        })?;
+            Ok(true)
+        })??;
         if !found {
             return Ok(self.not_found());
         }
@@ -241,19 +303,17 @@ impl Memory {
 
     pub async fn search(&self, query: &str, search_in_content: bool) -> anyhow::Result<Value> {
         let entries = self.entries()?;
-        let w = weights(search_in_content);
-        let results = ol_core::search::search(&entries, query, "id", Some(&w), 10);
+        let results = search_entries(&entries, query, search_in_content, 10);
         if results.is_empty() {
             return Ok(self.base.result(format!("No memories found matching '{}'.", query), true));
         }
         let lines: Vec<String> = results
             .iter()
-            .map(|hit| {
-                let mem = &hit.entry;
+            .map(|(mem, score)| {
                 format!(
                     "ID: {} | Score: {:.2} | Tags: {} | Content: {}",
                     py_str_opt(mem.get("id")),
-                    hit.score,
+                    score,
                     py_str_opt(mem.get("tags")),
                     py_str_opt(mem.get("content"))
                 )
@@ -303,10 +363,9 @@ impl Memory {
         let entries: Vec<Value> = if tab == "pinned" {
             all.into_iter().filter(|m| truthy_opt(m.get("pinned"))).collect()
         } else if tab == "search" && !q.is_empty() {
-            let w = weights(search_content_flag(query));
-            ol_core::search::search(&all, &q, "id", Some(&w), limit as usize)
+            search_entries(&all, &q, search_content_flag(query), limit as usize)
                 .into_iter()
-                .map(|h| h.entry)
+                .map(|(entry, _)| entry)
                 .filter(truthy)
                 .collect()
         } else {
@@ -363,11 +422,10 @@ impl Memory {
         if entries.is_empty() {
             return Ok(json!([]));
         }
-        let w = weights(search_content_flag(query));
-        let items: Vec<Value> = ol_core::search::search(&entries, &q, "id", Some(&w), limit as usize)
+        let items: Vec<Value> = search_entries(&entries, &q, search_content_flag(query), limit as usize)
             .into_iter()
-            .filter(|h| truthy(&h.entry))
-            .map(|h| ui_item(&h.entry, Some(h.score)))
+            .filter(|(entry, _)| truthy(entry))
+            .map(|(entry, score)| ui_item(&entry, Some(score)))
             .collect();
         Ok(Value::Array(items))
     }
@@ -387,17 +445,17 @@ impl Memory {
         let Some(id) = self.lookup_id(mem_id)? else {
             return Ok(self.base.result("memory with that ID not found!", false));
         };
-        let found = self.with_mem(|m| {
-            let index = Self::get_index(&m.data, &id);
+        let found = self.with_mem(|m| -> anyhow::Result<bool> {
+            let index = Self::get_index(&m.data, &id)?;
             if index == -1 {
-                return false;
+                return Ok(false);
             }
             let e = &mut m.data[index as usize];
             e["content"] = json!(content);
             e["tags"] = Value::Array(tags);
             m.save();
-            true
-        })?;
+            Ok(true)
+        })??;
         if !found {
             return Ok(self.base.result("memory with that ID not found!", false));
         }
@@ -544,8 +602,40 @@ mod tests {
     #[test]
     fn index_lookup_strips() {
         let data = vec![json!({"id": "01ABC "}), json!({"id": "02"})];
-        assert_eq!(Memory::get_index(&data, " 01ABC"), 0);
-        assert_eq!(Memory::get_index(&data, "03"), -1);
+        assert_eq!(Memory::get_index(&data, " 01ABC").unwrap(), 0);
+        assert_eq!(Memory::get_index(&data, "03").unwrap(), -1);
+    }
+
+    #[test]
+    fn index_lookup_raises_on_a_stored_id_that_is_not_a_string() {
+        // python: mem.get("id").strip() raises when the scan reaches the memory with no id
+        let data = vec![json!({"id": "01"}), json!({"content": "no id"})];
+        assert_eq!(Memory::get_index(&data, "01").unwrap(), 0);
+        let err = Memory::get_index(&data, "02").unwrap_err();
+        assert_eq!(err.to_string(), "'NoneType' object has no attribute 'strip'");
+        let err = Memory::get_index(&[json!({"id": 7})], "7").unwrap_err();
+        assert_eq!(err.to_string(), "'int' object has no attribute 'strip'");
+    }
+
+    #[test]
+    fn python_int_reads_unicode_decimal_digits() {
+        // Arabic-Indic 5, 0 and fullwidth 5, 0 are Nd digits, so python's int() reads them as 50
+        assert_eq!(py_int_query("\u{665}\u{660}"), Some(50));
+        assert_eq!(py_int_query("\u{ff15}\u{ff10}"), Some(50));
+        assert_eq!(py_int_query("\u{665}_\u{660}"), Some(50));
+        // a non-digit letter is still a ValueError
+        assert_eq!(py_int_query("\u{e9}"), None);
+    }
+
+    #[test]
+    fn search_ranks_boolean_tags_the_python_way() {
+        // python str(True) is "True", so the query "true" finds the memory whose tag is the boolean true
+        let entries = vec![json!({"id": "A", "content": "unrelated", "tags": [true]}), json!({"id": "B", "content": "other", "tags": ["x"]})];
+        let hits = search_entries(&entries, "true", false, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0["id"], json!("A"));
+        // the stored entry keeps its boolean tag
+        assert_eq!(hits[0].0["tags"], json!([true]));
     }
 }
 
