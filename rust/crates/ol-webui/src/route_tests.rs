@@ -904,3 +904,234 @@ async fn search_tags_filter_only_fails_for_non_iterable_tags_when_there_are_resu
     let not_all = h.send(post_json("/api/chats/search", r#"{"query": "budget", "tags": "money"}"#)).await;
     assert_eq!(not_all.json()["data"], json!([]));
 }
+
+// ------------------
+// chat prompt / new / rename / delete / set-category / input history (channels/webui/channel.py api-4)
+// ------------------
+
+/// a module named like the agentic-free `time` module, so its system prompt is listed without tools
+struct PromptModule {
+    base: ModuleBase,
+}
+
+#[async_trait]
+impl Module for PromptModule {
+    fn base(&self) -> &ModuleBase {
+        &self.base
+    }
+
+    async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
+        Ok(Some("PROMPT BODY".to_string()))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// a local stand-in for the OpenAI-style API: every request is answered with an empty model list.
+/// returns the api url to put in the config
+async fn mock_api() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock api");
+    let addr = listener.local_addr().expect("mock api address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"data": []}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// points the live api client at `url`
+fn set_api_url(url: &str) {
+    ol_core::config::update(|c| {
+        c.insert("api".to_string(), json!({"url": url}));
+    });
+}
+
+/// the index entry of chat `id`
+fn index_entry(h: &Harness, id: &str) -> Value {
+    h.ch.chat.data().into_iter().find(|c| c["id"] == json!(id)).expect("chat in index")
+}
+
+#[tokio::test]
+async fn chat_prompt_reports_the_api_error_object_when_the_api_is_not_set_up() {
+    let h = harness(false).await;
+    set_api_url("http://API_URL_HERE/v1");
+    let resp = h.get("/api/chat/prompt").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    // python returns the APIError itself as data: its vars() are message, then exc (None here)
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": {
+                "message": "The API connection has not been set up yet! Please set up your API connection by either using the WebUI, the /config command, or editing the config file",
+                "exc": null,
+            },
+            "success": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn chat_prompt_returns_the_system_prompt_once_the_api_is_connected() {
+    let h = harness(false).await;
+    h.manager.insert_module(Arc::new(PromptModule { base: ModuleBase::new("time", false, Arc::downgrade(&h.manager)) }));
+    set_api_url(&mock_api().await);
+    let expected = h.ch.chat.get_system_prompt().await;
+    assert!(expected.contains("PROMPT BODY"), "system prompt: {expected}");
+    let resp = h.get("/api/chat/prompt").await;
+    assert_eq!(resp.json(), json!({"data": expected, "success": true}));
+}
+
+#[tokio::test]
+async fn chat_prompt_is_the_plain_500_when_no_system_prompt_is_built() {
+    let h = harness(false).await;
+    set_api_url(&mock_api().await);
+    // with no module contributing a prompt the context is empty, and python's `[][-1]` raises
+    let resp = h.get("/api/chat/prompt").await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.body, "Internal Server Error");
+}
+
+#[tokio::test]
+async fn chat_new_opens_a_chat_in_the_posted_category_or_general() {
+    let h = harness(false).await;
+    let created = h.send(post_json("/api/chat/new", r#"{"category": "  Travel  "}"#)).await;
+    assert_eq!(created.status, StatusCode::OK);
+    assert_eq!(created.json()["success"], json!(true));
+    let id = created.json()["data"]["id"].as_str().expect("new chat id").to_string();
+    let entry = index_entry(&h, &id);
+    assert_eq!(entry["category"], json!("travel"));
+    assert_eq!(entry["title"], json!("New chat"));
+
+    // the reserved separator is refused by the shared category validator, and no chat is created
+    let reserved = h.send(post_json("/api/chat/new", r#"{"category": "a:b"}"#)).await;
+    assert_eq!(reserved.json(), json!({"data": "':' is reserved for subcategories", "success": false}));
+    assert_eq!(h.ch.chat.data().len(), 1);
+
+    // a body that is not a json object, or a category that is not a string, falls back to general
+    for body in ["not json", "[]", r#"{"category": 5}"#, r#"{"category": "   "}"#] {
+        let plain = h.send(post_json("/api/chat/new", body)).await;
+        assert_eq!(plain.json()["success"], json!(true), "body {body}");
+        let id = plain.json()["data"]["id"].as_str().expect("new chat id").to_string();
+        assert_eq!(index_entry(&h, &id)["category"], json!("general"), "body {body}");
+    }
+}
+
+#[tokio::test]
+async fn chat_rename_retitles_the_chat_and_reports_each_failure() {
+    let h = harness(false).await;
+    let id = chat_at(&h, "general", "old", "2026-11-01T10:00:00", &[]).await;
+    let renamed = h.send(post_json(&format!("/api/chat/rename/{id}"), r#"{"title": "  Fresh title  "}"#)).await;
+    assert_eq!(renamed.json(), json!({"data": {}, "success": true}));
+    assert_eq!(index_entry(&h, &id)["title"], json!("Fresh title"));
+
+    let cases = [
+        (r#"{"title": "   "}"#, "Title cannot be empty"),
+        ("{}", "Title cannot be empty"),
+        (r#"{"title": null}"#, "'NoneType' object has no attribute 'strip'"),
+        (r#"{"title": 5}"#, "'int' object has no attribute 'strip'"),
+        ("[]", "'list' object has no attribute 'get'"),
+        ("", "Expecting value: line 1 column 1 (char 0)"),
+    ];
+    for (body, message) in cases {
+        let resp = h.send(post_json(&format!("/api/chat/rename/{id}"), body)).await;
+        assert_eq!(resp.json(), json!({"data": message, "success": false}), "body {body}");
+    }
+    assert_eq!(index_entry(&h, &id)["title"], json!("Fresh title"));
+
+    let missing = h.send(post_json("/api/chat/rename/missing", r#"{"title": "x"}"#)).await;
+    assert_eq!(missing.json(), json!({"data": "Chat not found", "success": false}));
+}
+
+#[tokio::test]
+async fn chat_delete_removes_the_chat_and_answers_the_empty_envelope() {
+    let h = harness(false).await;
+    let doomed = chat_at(&h, "general", "gone", "2026-11-01T10:00:00", &[]).await;
+    let kept = chat_at(&h, "general", "kept", "2026-11-01T10:00:00", &[]).await;
+    let resp = h.send(request(Method::POST, &format!("/api/chat/delete/{doomed}"), None, None, "")).await;
+    assert_eq!(resp.json(), json!({"data": {}, "success": true}));
+    let ids: Vec<String> = h.ch.chat.data().iter().map(|c| py_str(&c["id"])).collect();
+    assert!(!ids.contains(&doomed));
+    assert!(ids.contains(&kept));
+    // python does not look the id up first, so deleting an unknown chat still succeeds
+    let unknown = h.send(request(Method::POST, "/api/chat/delete/missing", None, None, "")).await;
+    assert_eq!(unknown.json(), json!({"data": {}, "success": true}));
+}
+
+#[tokio::test]
+async fn chat_set_category_moves_the_chat_and_reports_each_failure() {
+    let h = harness(false).await;
+    let id = chat_at(&h, "work", "w", "2026-11-01T10:00:00", &[]).await;
+    // python stores the stripped name as typed: no lowercasing and no subcategory validation on this path
+    let moved = h.send(post_json(&format!("/api/chat/set-category/{id}"), r#"{"category": "  Home  "}"#)).await;
+    assert_eq!(moved.json(), json!({"data": {}, "success": true}));
+    assert_eq!(index_entry(&h, &id)["category"], json!("Home"));
+
+    let cases = [
+        ("{}", "Category cannot be empty"),
+        (r#"{"category": "   "}"#, "Category cannot be empty"),
+        (r#"{"category": 5}"#, "'int' object has no attribute 'strip'"),
+        ("[]", "'list' object has no attribute 'get'"),
+        ("", "Expecting value: line 1 column 1 (char 0)"),
+    ];
+    for (body, message) in cases {
+        let resp = h.send(post_json(&format!("/api/chat/set-category/{id}"), body)).await;
+        assert_eq!(resp.json(), json!({"data": message, "success": false}), "body {body}");
+    }
+    assert_eq!(index_entry(&h, &id)["category"], json!("Home"));
+
+    let missing = h.send(post_json("/api/chat/set-category/missing", r#"{"category": "x"}"#)).await;
+    assert_eq!(missing.json(), json!({"data": "Chat not found", "success": false}));
+}
+
+#[tokio::test]
+async fn input_history_get_returns_the_saved_entries_oldest_first() {
+    let h = harness(false).await;
+    assert_eq!(h.get("/api/input_history").await.json(), json!({"data": [], "success": true}));
+    for message in ["ls -la", "cd /tmp"] {
+        let added = h.send(post_json("/api/input_history", &json!({"message": message}).to_string())).await;
+        assert_eq!(added.status, StatusCode::OK);
+    }
+    assert_eq!(h.get("/api/input_history").await.json(), json!({"data": ["ls -la", "cd /tmp"], "success": true}));
+}
+
+#[tokio::test]
+async fn chat_prompt_and_input_history_answer_head_and_other_methods_with_405_allow_get() {
+    let h = harness(false).await;
+    for uri in ["/api/chat/prompt", "/api/input_history"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "HEAD {uri}");
+        assert!(resp.body.is_empty(), "HEAD {uri} body: {}", resp.body);
+    }
+    let resp = h.send(request(Method::PUT, "/api/input_history", None, None, "")).await;
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "PUT input_history");
+    let resp = h.send(request(Method::POST, "/api/chat/prompt", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "POST prompt");
+}
+
+#[tokio::test]
+async fn chat_write_routes_answer_get_with_405_allow_post() {
+    let h = harness(false).await;
+    for uri in ["/api/chat/new", "/api/chat/rename/x", "/api/chat/delete/x", "/api/chat/set-category/x"] {
+        let resp = h.get(uri).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "GET {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "POST", "GET {uri}");
+        assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "GET {uri}");
+    }
+}

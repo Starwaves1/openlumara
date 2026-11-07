@@ -11,8 +11,8 @@ use crate::listing::{
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
-    export_chat_text, get_strip, or_strip, py_contains, py_int, py_int_str, py_iter, py_slice, py_sorted_unique, py_strip,
-    py_type_name,
+    export_chat_text, get_strip, json_decode_error, or_strip, py_contains, py_int, py_int_str, py_iter, py_slice,
+    py_sorted_unique, py_strip, py_type_name,
 };
 use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
@@ -46,12 +46,12 @@ pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
         .route("/api/chats/categories/create", post(create_chat_category))
         .route("/api/chats/categories/delete", post(delete_chat_category))
         .route("/api/chats/search", post(search_chats))
-        .route("/api/chat/prompt", get(get_prompt))
+        .route("/api/chat/prompt", get_only(get_prompt))
         .route("/api/chat/new", post(chat_new))
         .route("/api/chat/rename/{chat_id}", post(chat_rename))
         .route("/api/chat/delete/{chat_id}", post(chat_delete_by_id))
         .route("/api/chat/set-category/{chat_id}", post(chat_set_category))
-        .route("/api/input_history", get(input_history_get).post(input_history_add))
+        .route("/api/input_history", get_only(input_history_get).post(input_history_add))
         .route("/api/settings/load", get(settings_load))
         .route("/api/check_connection", get(check_connection))
         .route("/api/models", get(models_get))
@@ -585,7 +585,8 @@ async fn get_prompt(State(app): State<Arc<Shared>>) -> Response {
             None => internal_error(),
         },
         Ok(None) => internal_error(),
-        Err(e) => reply(json!(e.to_string()), false),
+        // python returns the APIError object itself as `data`; fastapi encodes its vars(): message, then exc
+        Err(e) => reply(json!({"message": e.message, "exc": e.exc}), false),
     }
 }
 
@@ -612,7 +613,7 @@ async fn chat_rename(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>
     let Some(ch) = app.ch() else { return internal_error() };
     let data = match serde_json::from_slice::<Value>(&body) {
         Ok(v) => v,
-        Err(e) => return reply(json!(e.to_string()), false),
+        Err(_) => return reply(json!(json_decode_error(&body)), false),
     };
     let Some(obj) = data.as_object() else {
         return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);
@@ -641,7 +642,7 @@ async fn chat_set_category(State(app): State<Arc<Shared>>, Path(chat_id): Path<S
     let Some(ch) = app.ch() else { return internal_error() };
     let data = match serde_json::from_slice::<Value>(&body) {
         Ok(v) => v,
-        Err(e) => return reply(json!(e.to_string()), false),
+        Err(_) => return reply(json!(json_decode_error(&body)), false),
     };
     let Some(obj) = data.as_object() else {
         return reply(json!(format!("'{}' object has no attribute 'get'", py_type_name(&data))), false);

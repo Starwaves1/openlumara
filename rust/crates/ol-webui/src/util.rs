@@ -8,6 +8,25 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
+/// the text python's `json.loads` puts in the error of a body that does not parse (starlette's
+/// `request.json()`, whose `str(e)` the webui sends to the client). an empty or whitespace-only body is
+/// python's `Expecting value` at the end of the input; other syntax errors keep serde_json's wording.
+pub fn json_decode_error(body: &[u8]) -> String {
+    if body.iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+        let pos = body.len();
+        let lineno = body.iter().filter(|&&b| b == b'\n').count() + 1;
+        let colno = match body.iter().rposition(|&b| b == b'\n') {
+            Some(newline) => pos - newline,
+            None => pos + 1,
+        };
+        return format!("Expecting value: line {lineno} column {colno} (char {pos})");
+    }
+    match serde_json::from_slice::<Value>(body) {
+        Err(e) => e.to_string(),
+        Ok(_) => String::new(),
+    }
+}
+
 /// python `type(x).__name__` for json values (used in python-style error strings)
 pub fn py_type_name(v: &Value) -> &'static str {
     match v {
@@ -629,5 +648,13 @@ mod tests {
         assert_eq!(bind_host(Some("lan"), Some("10.0.0.5")), Some("127.0.0.1".to_string()));
         assert_eq!(bind_host(None, None), Some("127.0.0.1".to_string()));
         assert_eq!(channel_url(bind_host(Some("local"), None).as_deref(), 8080), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn empty_bodies_get_pythons_expecting_value_position() {
+        assert_eq!(json_decode_error(b""), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(json_decode_error(b"  "), "Expecting value: line 1 column 3 (char 2)");
+        assert_eq!(json_decode_error(b"\n\n"), "Expecting value: line 3 column 1 (char 2)");
+        assert!(json_decode_error(b" \n a").contains("line 2 column"));
     }
 }
