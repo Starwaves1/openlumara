@@ -5,6 +5,7 @@ use ol_core::module::CommandSpec;
 use ol_core::pyjson::truthy;
 use serde_json::Value;
 use std::ffi::{CStr, CString, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
@@ -158,7 +159,21 @@ pub fn read_text(path: &str) -> Result<String, String> {
     if path.contains('\0') {
         return Err("embedded null byte".to_string());
     }
-    let bytes = std::fs::read(path).map_err(|e| os_error(&e, path))?;
+    read_file_text(Path::new(path), path)
+}
+
+/// read_text for a path built from a listing (docs_list). A name that is not valid utf-8 is listed
+/// with U+FFFD (a JSON string cannot carry python's surrogateescape bytes), so the entry is found by
+/// that lossy name and the real file is read, the way python opens its surrogateescape name.
+pub fn read_listed_text(path: &str) -> Result<String, String> {
+    if path.contains('\0') {
+        return Err("embedded null byte".to_string());
+    }
+    read_file_text(&resolve_listed_entry(path), path)
+}
+
+fn read_file_text(file: &Path, shown: &str) -> Result<String, String> {
+    let bytes = std::fs::read(file).map_err(|e| os_error(&e, shown))?;
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
         Err(e) => {
@@ -167,6 +182,31 @@ pub fn read_text(path: &str) -> Result<String, String> {
         }
     };
     Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// the real path of the entry whose lossy name is the last component of `path`. A path that exists
+/// is returned unchanged. A symlink entry is not followed, so the sandbox rule for symlinks still holds.
+fn resolve_listed_entry(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if std::fs::symlink_metadata(p).is_ok() {
+        return p.to_path_buf();
+    }
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+        return p.to_path_buf();
+    };
+    let want = name.to_string_lossy();
+    if let Ok(rd) = std::fs::read_dir(parent) {
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy() != want {
+                continue;
+            }
+            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+                break;
+            }
+            return entry.path();
+        }
+    }
+    p.to_path_buf()
 }
 
 /// str(UnicodeDecodeError) for a strict utf-8 decode of `bytes` that failed with `err`.
@@ -311,9 +351,9 @@ fn find_chars(hay: &[char], needle: &[char], start: usize) -> Option<usize> {
     (start..=hay.len() - needle.len()).find(|&i| hay[i..i + needle.len()] == *needle)
 }
 
-/// os.listdir: names only. a read error part way through fails the whole listing, like python.
-/// names that are not valid utf-8 are lossy (python keeps them via surrogateescape).
-pub fn listdir(path: &str) -> Result<Vec<String>, String> {
+/// os.listdir: names only, as raw OS names so callers can test each entry on disk. a read error part
+/// way through fails the whole listing, like python.
+pub fn listdir(path: &str) -> Result<Vec<OsString>, String> {
     if path.contains('\0') {
         return Err("listdir: embedded null character in path".to_string());
     }
@@ -321,7 +361,7 @@ pub fn listdir(path: &str) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for entry in rd {
         let entry = entry.map_err(|e| os_error(&e, path))?;
-        names.push(entry.file_name().to_string_lossy().into_owned());
+        names.push(entry.file_name());
     }
     Ok(names)
 }
@@ -450,11 +490,27 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let mut names = listdir(dir.path().to_str().unwrap()).unwrap();
         names.sort();
-        assert_eq!(names, vec!["a.md", "sub"]);
+        assert_eq!(names, vec![OsString::from("a.md"), OsString::from("sub")]);
 
         let missing = dir.path().join("nope");
         assert_eq!(
             listdir(missing.to_str().unwrap()).unwrap_err(),
+            format!("[Errno 2] No such file or directory: {}", repr_str(missing.to_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn listed_non_utf8_name_reads_the_real_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"raw\xff.md")), b"raw\r\nbytes").unwrap();
+        // the listing shows the lossy name; reading that name opens the real entry
+        let lossy = dir.path().join("raw\u{fffd}.md");
+        assert_eq!(read_listed_text(lossy.to_str().unwrap()).unwrap(), "raw\nbytes");
+        // a name that matches nothing still fails with the python OSError text
+        let missing = dir.path().join("nope.md");
+        assert_eq!(
+            read_listed_text(missing.to_str().unwrap()).unwrap_err(),
             format!("[Errno 2] No such file or directory: {}", repr_str(missing.to_str().unwrap()))
         );
     }

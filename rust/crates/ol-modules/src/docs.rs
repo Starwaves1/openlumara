@@ -60,8 +60,18 @@ fn list_level(base_path: &str, subfolder: Option<&str>) -> Result<(Vec<String>, 
         Some(s) if !s.is_empty() => format!("{}/", s),
         _ => String::new(),
     };
-    let mut dirs: Vec<String> = contents.iter().filter(|d| Path::new(base_path).join(d).is_dir()).map(|d| format!("{}{}", prefix, d)).collect();
-    let mut files: Vec<String> = contents.iter().filter(|f| Path::new(base_path).join(f).is_file()).map(|f| format!("{}{}", prefix, f)).collect();
+    // each entry is tested by its real OS name; only the text shown to the AI is lossy
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for name in &contents {
+        let entry = Path::new(base_path).join(name);
+        let shown = format!("{}{}", prefix, name.to_string_lossy());
+        if entry.is_dir() {
+            dirs.push(shown);
+        } else if entry.is_file() {
+            files.push(shown);
+        }
+    }
     dirs.sort();
     files.sort();
     Ok((dirs, files))
@@ -145,7 +155,7 @@ impl Module for Docs {
                     return Ok(self.base.result(json!(format!("Folder '{}' does not exist within the docs module configuration.", folder)), false));
                 };
                 let target_path = ol_core::paths::sandbox_path(&folder_path, Some(&path))?;
-                match util::read_text(&target_path) {
+                match util::read_listed_text(&target_path) {
                     Ok(t) => Ok(self.base.result(json!(t), true)),
                     Err(e) => Ok(self.base.result(json!(e), false)),
                 }
@@ -191,7 +201,7 @@ impl Module for Docs {
                     return Ok(self.base.result(json!(format!("folder '{}' does not exist", folder)), false));
                 };
                 let path = strip_folder(&path, &folder);
-                let read = ol_core::paths::sandbox_path(&folder_path, Some(&path)).map_err(|e| e.to_string()).and_then(|t| util::read_text(&t));
+                let read = ol_core::paths::sandbox_path(&folder_path, Some(&path)).map_err(|e| e.to_string()).and_then(|t| util::read_listed_text(&t));
                 match read {
                     Ok(content) => Ok(json!({"path": path, "content": content})),
                     Err(e) => Ok(self.base.result(json!(e), false)),
@@ -309,6 +319,22 @@ mod tests {
         let (m2, _dir2) = setup(false);
         block_on(m2.on_ready()).unwrap();
         assert!(m2.disabled_tools().is_empty());
+    }
+
+    #[test]
+    fn non_utf8_file_names_are_listed_and_readable() {
+        use std::os::unix::ffi::OsStrExt;
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, dir) = setup(true);
+        let raw = std::ffi::OsStr::from_bytes(b"raw\xff.md");
+        std::fs::write(dir.path().join("guide").join(raw), "raw bytes").unwrap();
+        // python lists the surrogateescape name as a file; here it is listed with U+FFFD and still counts as a file
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide"})))).unwrap();
+        assert_eq!(out["content"]["files"], json!(["a.md", "raw\u{fffd}.md"]));
+        assert_eq!(out["content"]["subfolders"], json!(["sub"]));
+        // reading the listed name opens the real file
+        let read = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": "raw\u{fffd}.md"})))).unwrap();
+        assert_eq!(read, json!({"status": "success", "content": "raw bytes"}));
     }
 
     #[test]
