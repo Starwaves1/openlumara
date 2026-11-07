@@ -893,9 +893,40 @@ async fn libraries_install(State(app): State<Arc<Shared>>, body: Bytes) -> Respo
     };
     let manager = ch.manager();
     match manager.module_manager().install(&library, &name) {
-        Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
+        Ok(message) => {
+            // python: install_module_deps on the copied folder; a failure is logged, the response still succeeds
+            let dir = std::path::PathBuf::from(&message);
+            let dep_name = name.clone();
+            let outcome = run_module_deps(manager.clone(), move |logs| {
+                crate::util::install_module_deps(&dir, &dep_name, logs)
+            })
+            .await;
+            if let Err(detail) = outcome {
+                ch.log("libraries", &format!("dependency install failed for {name}: {detail}"));
+            }
+            reply(json!({"restart_required": true, "message": message}), true)
+        }
         Err(message) => reply(json!(message), false),
     }
+}
+
+/// runs a blocking module-dependency step (pip, interpreter calls) off the async runtime. The log lines
+/// it collects go through the manager, as python's manager.log does; its error is returned to the caller.
+async fn run_module_deps<F>(manager: std::sync::Arc<ol_core::manager::Manager>, job: F) -> Result<bool, String>
+where
+    F: FnOnce(&mut Vec<(String, String)>) -> Result<bool, String> + Send + 'static,
+{
+    let (logs, result) = tokio::task::spawn_blocking(move || {
+        let mut logs = Vec::new();
+        let result = job(&mut logs);
+        (logs, result)
+    })
+    .await
+    .unwrap_or_else(|e| (Vec::new(), Err(e.to_string())));
+    for (category, message) in logs {
+        manager.log(&category, &message);
+    }
+    result
 }
 
 async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
@@ -906,7 +937,19 @@ async fn libraries_update(State(app): State<Arc<Shared>>, body: Bytes) -> Respon
     };
     let manager = ch.manager();
     match manager.module_manager().update(&library, &name).await {
-        Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
+        Ok(message) => {
+            // python: install_module_deps on the updated folder; a failure is logged, the response still succeeds
+            let dir = std::path::PathBuf::from(&message);
+            let dep_name = name.clone();
+            let outcome = run_module_deps(manager.clone(), move |logs| {
+                crate::util::install_module_deps(&dir, &dep_name, logs)
+            })
+            .await;
+            if let Err(detail) = outcome {
+                ch.log("libraries", &format!("dependency install failed for {name}: {detail}"));
+            }
+            reply(json!({"restart_required": true, "message": message}), true)
+        }
         Err(message) => reply(json!(message), false),
     }
 }
@@ -916,6 +959,20 @@ async fn libraries_uninstall(State(app): State<Arc<Shared>>, body: Bytes) -> Res
     let Some(obj) = json_object(&body) else { return internal_error() };
     let Ok(name) = or_strip(obj.get("name"), "") else { return internal_error() };
     let manager = ch.manager();
+    // python: dependency cleanup for user_modules then user_channels runs before the folder is removed,
+    // even when the module is not installed (then it is a no-op)
+    for sub in ["user_modules", "user_channels"] {
+        let dir = ol_core::paths::project_root().join(sub).join(&name);
+        let dep_name = name.clone();
+        let outcome = run_module_deps(manager.clone(), move |logs| {
+            let still_needed = crate::util::deps_still_needed();
+            crate::util::uninstall_module_deps(&dir, &dep_name, &still_needed, logs)
+        })
+        .await;
+        if let Err(detail) = outcome {
+            ch.log("libraries", &format!("dependency cleanup failed for {name}: {detail}"));
+        }
+    }
     match manager.module_manager().uninstall(&name) {
         Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
         Err(message) => reply(json!(message), false),

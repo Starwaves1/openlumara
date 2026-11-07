@@ -739,10 +739,233 @@ pub fn export_turns_text(turns: &[Value]) -> Result<String, String> {
     Ok(turn_export.join("\n\n"))
 }
 
+// ------------------
+// module dependencies (core/modules.py install_module_deps / uninstall_module_deps)
+// ------------------
+
+/// python `_check_missing_deps` runs importlib.metadata.version() on each dependency's project name.
+/// This is the same split chain, run by the interpreter; it prints the dependencies that are missing.
+const MISSING_DEPS_SCRIPT: &str = r#"import sys
+from importlib.metadata import PackageNotFoundError, version
+for dep in sys.argv[1:]:
+    name = dep.split('>=')[0].split('==')[0].split('<')[0].split('>')[0].strip().split('[')[0].strip()
+    try:
+        version(name)
+    except PackageNotFoundError:
+        print(dep)
+"#;
+
+/// python `_extract_deps_from_file`: the string items of a `dependencies = [...]` assignment.
+/// python reads only class bodies through ast; this takes the first indented assignment, and
+/// skips comments and non-string items.
+pub fn extract_module_deps(source: &str) -> Vec<String> {
+    static DEPS_START: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^[ \t]+dependencies[ \t]*=[ \t]*\[").unwrap());
+    let Some(m) = DEPS_START.find(source) else { return Vec::new() };
+    let mut deps = Vec::new();
+    let mut chars = source[m.end()..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => break,
+            '#' => {
+                for c2 in chars.by_ref() {
+                    if c2 == '\n' {
+                        break;
+                    }
+                }
+            }
+            '\'' | '"' => {
+                let mut item = String::new();
+                let mut escaped = false;
+                for c2 in chars.by_ref() {
+                    if escaped {
+                        item.push(c2);
+                        escaped = false;
+                    } else if c2 == '\\' {
+                        escaped = true;
+                    } else if c2 == c {
+                        break;
+                    } else {
+                        item.push(c2);
+                    }
+                }
+                deps.push(item);
+            }
+            _ => {}
+        }
+    }
+    deps
+}
+
+/// python `_get_module_file_path` for one folder: module.py, else channel.py. A folder with an
+/// __init__.py is not a module folder.
+pub fn module_entry_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !dir.is_dir() || dir.join("__init__.py").exists() {
+        return None;
+    }
+    ["module.py", "channel.py"].iter().map(|f| dir.join(f)).find(|p| p.is_file())
+}
+
+/// the declared dependencies of the module/channel folder `dir` (empty when there is no entry file)
+pub fn module_deps_of_folder(dir: &std::path::Path) -> Vec<String> {
+    match module_entry_file(dir) {
+        Some(entry) => std::fs::read_to_string(entry).map(|s| extract_module_deps(&s)).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// python `_check_missing_deps`: the declared dependencies that are not installed, asked of the
+/// `python3` interpreter. Err when the interpreter cannot be run.
+pub fn missing_module_deps(deps: &[String]) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(MISSING_DEPS_SCRIPT)
+        .args(deps)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
+}
+
+#[derive(Clone, Copy)]
+enum PipOp {
+    Install,
+    Uninstall,
+}
+
+/// python `_install_deps` / `_uninstall_deps`: one pip call with its output discarded. A non-zero exit
+/// is logged under the module's category and does not fail the caller (python catches only
+/// CalledProcessError); a failure to run the interpreter is returned as Err.
+/// `logs` collects the (category, message) lines python writes through manager.log.
+fn run_pip(op: PipOp, module_name: &str, packages: &[String], logs: &mut Vec<(String, String)>) -> Result<(), String> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let (gerund, verb, flags, failed): (&str, &str, &[&str], &str) = match op {
+        PipOp::Install => ("installing", "install", &["--quiet"], "install failed"),
+        PipOp::Uninstall => ("uninstalling", "uninstall", &["-y", "--quiet"], "uninstall failed"),
+    };
+    logs.push(("core".to_string(), format!("{gerund} dependencies for {module_name}: {}", packages.join(", "))));
+    let mut argv: Vec<String> = ["python3", "-m", "pip", verb].iter().map(|s| s.to_string()).collect();
+    argv.extend(flags.iter().map(|s| s.to_string()));
+    argv.extend(packages.iter().cloned());
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        let repr: Vec<String> = argv.iter().map(|a| format!("'{a}'")).collect();
+        logs.push((
+            module_name.to_string(),
+            format!(
+                "dependency {failed}: Command '[{}]' returned non-zero exit status {}.",
+                repr.join(", "),
+                status.code().unwrap_or(-1)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// python `install_module_deps` for the folder `dir`: installs the declared dependencies that are
+/// missing. Ok(true) when a pip install was run.
+pub fn install_module_deps(dir: &std::path::Path, name: &str, logs: &mut Vec<(String, String)>) -> Result<bool, String> {
+    let deps = module_deps_of_folder(dir);
+    if deps.is_empty() {
+        return Ok(false);
+    }
+    let missing = missing_module_deps(&deps)?;
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    run_pip(PipOp::Install, name, &missing, logs)?;
+    Ok(true)
+}
+
+/// python `uninstall_module_deps` for the folder `dir`: removes the declared dependencies that are
+/// installed, not in `still_needed` and not in requirements.txt. Ok(true) when a pip uninstall was run.
+/// The python on_uninstall hook is not run here: the Rust binary cannot execute python module code.
+pub fn uninstall_module_deps(
+    dir: &std::path::Path,
+    name: &str,
+    still_needed: &std::collections::HashSet<String>,
+    logs: &mut Vec<(String, String)>,
+) -> Result<bool, String> {
+    let deps = module_deps_of_folder(dir);
+    if deps.is_empty() {
+        return Ok(false);
+    }
+    let missing = missing_module_deps(&deps)?;
+    let base = base_requirements();
+    let installed: Vec<String> = deps
+        .into_iter()
+        .filter(|d| !missing.contains(d) && !still_needed.contains(d) && !base.contains(d))
+        .collect();
+    if installed.is_empty() {
+        return Ok(false);
+    }
+    run_pip(PipOp::Uninstall, name, &installed, logs)?;
+    Ok(true)
+}
+
+/// python `uninstall_module_deps` exclusion: the dependencies of every enabled module and channel
+pub fn deps_still_needed() -> std::collections::HashSet<String> {
+    let mut needed = std::collections::HashSet::new();
+    let root = ol_core::paths::project_root();
+    for section in ["modules", "user_modules", "channels", "user_channels"] {
+        for name in ol_core::config::get_str_list(&[section, "enabled"]) {
+            needed.extend(module_deps_of_folder(&root.join(section).join(name)));
+        }
+    }
+    needed
+}
+
+/// core.get_path("requirements.txt"): the lines openlumara always needs
+fn base_requirements() -> Vec<String> {
+    std::fs::read_to_string(ol_core::paths::project_root().join("requirements.txt"))
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn module_deps_are_read_from_the_class_list_like_python_ast() {
+        let src = "class Hello(Module):\n    \"\"\"doc\"\"\"\n    dependencies = [\n        \"requests>=2.0\",  # http\n        'python-telegram-bot[ext]',\n    ]\n";
+        assert_eq!(extract_module_deps(src), vec!["requests>=2.0", "python-telegram-bot[ext]"]);
+        // no class-level list: nothing to install
+        assert!(extract_module_deps("class Hello(Module):\n    pass\n").is_empty());
+        assert!(extract_module_deps("dependencies = [\"top_level_only\"]\n").is_empty());
+    }
+
+    #[test]
+    fn module_folder_entry_rejects_init_and_prefers_module_py() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("m");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("channel.py"), "").unwrap();
+        std::fs::write(folder.join("module.py"), "").unwrap();
+        assert_eq!(module_entry_file(&folder), Some(folder.join("module.py")));
+        std::fs::write(folder.join("__init__.py"), "").unwrap();
+        assert_eq!(module_entry_file(&folder), None);
+    }
+
+    #[test]
+    fn missing_deps_are_the_ones_python_metadata_cannot_find() {
+        let deps = vec!["ol_test_surely_missing_dist_zz>=1.0".to_string()];
+        assert_eq!(missing_module_deps(&deps).unwrap(), deps);
+        // a folder with no entry file has no deps, so no interpreter call is needed
+        let tmp = tempfile::tempdir().unwrap();
+        let mut logs = Vec::new();
+        assert_eq!(install_module_deps(tmp.path(), "x", &mut logs), Ok(false));
+        assert!(logs.is_empty());
+    }
 
     #[test]
     fn py_iteration_and_membership_follow_python() {
