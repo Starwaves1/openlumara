@@ -1183,3 +1183,143 @@ async fn chat_write_routes_answer_get_with_405_allow_post() {
         assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "GET {uri}");
     }
 }
+
+// ------------------
+// reconnect and module libraries (channels/webui/channel.py api-6)
+// ------------------
+
+#[tokio::test]
+async fn reconnect_without_an_api_setup_reports_the_api_error_envelope() {
+    // python: API.reconnect() returns the APIError from connect(); the route answers success=False with its str().
+    // a fresh python config merges the default api.url placeholder, so the test sets it explicitly
+    let h = harness(false).await;
+    set_api_url("http://API_URL_HERE/v1");
+    let resp = h.send(request(Method::POST, "/api/reconnect", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": "The API connection has not been set up yet! Please set up your API connection by either using the WebUI, the /config command, or editing the config file",
+            "success": false,
+        })
+    );
+    // @app.post only: GET gets starlette's 405 with the detail body and Allow: POST
+    let resp = h.get("/api/reconnect").await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "POST");
+    assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}));
+}
+
+#[tokio::test]
+async fn libraries_status_lists_cloned_libraries_and_their_installable_modules() {
+    // python: {"repos": list_repos(), "libraries": sorted library names, "modules": list_available()}
+    let h = harness(false).await;
+    let libs = h.ch.manager().module_manager().library_folder();
+    let repo = libs.join("demo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let module = repo.join("ol_test_lib_hello_zz");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("module.py"), "class Hello(Module):\n    \"\"\"Says hello to people\"\"\"\n    pass\n").unwrap();
+    // a folder without .git is not a library
+    std::fs::create_dir_all(libs.join("not_a_repo")).unwrap();
+
+    let resp = h.get("/api/libraries/status").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": {
+                "repos": [],
+                "libraries": ["demo"],
+                "modules": [{
+                    "library": "demo",
+                    "name": "ol_test_lib_hello_zz",
+                    "type": "module",
+                    "doc": "Says hello to people",
+                    "installed": false,
+                }],
+            },
+            "success": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn libraries_status_is_get_only_like_python() {
+    // @app.get: HEAD is starlette's 405 with Allow: GET and an empty body, POST gets the detail body
+    let h = harness(false).await;
+    let resp = h.send(request(Method::HEAD, "/api/libraries/status", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET");
+    assert!(resp.body.is_empty(), "HEAD body: {}", resp.body);
+    let resp = h.send(request(Method::POST, "/api/libraries/status", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET");
+    assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}));
+}
+
+#[tokio::test]
+async fn libraries_sync_without_repos_reports_the_no_libraries_message() {
+    // python returns this failure before any clone is attempted
+    let h = harness(false).await;
+    let resp = h.send(request(Method::POST, "/api/libraries/sync", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": "No module libraries configured. Add github repo urls under Core settings first.",
+            "success": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn libraries_install_and_update_report_unknown_libraries_and_reject_bad_bodies() {
+    let h = harness(false).await;
+    let resp = h.send(post_json("/api/libraries/install", r#"{"library": "nope", "name": "x"}"#)).await;
+    assert_eq!(resp.json(), json!({"data": "library 'nope' not found - sync it first", "success": false}));
+
+    // python strips library/name; a missing or blank library is '' and reaches the same message
+    let resp = h.send(post_json("/api/libraries/install", r#"{"name": "  "}"#)).await;
+    assert_eq!(resp.json(), json!({"data": "library '' not found - sync it first", "success": false}));
+
+    // update: a library that is not a configured repo
+    let resp = h.send(post_json("/api/libraries/update", r#"{"library": "nope", "name": "x"}"#)).await;
+    assert_eq!(
+        resp.json(),
+        json!({"data": "library 'nope' is not a configured repo - cannot update", "success": false})
+    );
+
+    // a non-object body, invalid json, or a non-string library are python's plain 500s
+    for body in ["[1]", "not json", r#"{"library": 5, "name": "x"}"#] {
+        for uri in ["/api/libraries/install", "/api/libraries/update"] {
+            let resp = h.send(post_json(uri, body)).await;
+            assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR, "{uri} {body}");
+            assert_eq!(resp.body, "Internal Server Error", "{uri} {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn libraries_uninstall_reports_a_module_that_is_not_installed() {
+    let h = harness(false).await;
+    let resp = h.send(post_json("/api/libraries/uninstall", r#"{"name": "ol_test_not_installed_zz"}"#)).await;
+    assert_eq!(
+        resp.json(),
+        json!({"data": "'ol_test_not_installed_zz' is not installed as a user module/channel", "success": false})
+    );
+    let resp = h.send(post_json("/api/libraries/uninstall", "[]")).await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.body, "Internal Server Error");
+}
+
+#[tokio::test]
+async fn library_post_routes_answer_get_with_405_allow_post() {
+    let h = harness(false).await;
+    for uri in ["/api/libraries/sync", "/api/libraries/install", "/api/libraries/update", "/api/libraries/uninstall"] {
+        let resp = h.get(uri).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "GET {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "POST", "GET {uri}");
+        assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "GET {uri}");
+    }
+}

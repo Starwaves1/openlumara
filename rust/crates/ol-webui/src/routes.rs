@@ -60,7 +60,7 @@ pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
         .route("/api/model/set", post(model_set))
         .route("/api/settings/save", post(settings_save))
         .route("/api/reconnect", post(reconnect))
-        .route("/api/libraries/status", get(libraries_status))
+        .route("/api/libraries/status", get_only(libraries_status))
         .route("/api/libraries/sync", post(libraries_sync))
         .route("/api/libraries/install", post(libraries_install))
         .route("/api/libraries/update", post(libraries_update))
