@@ -8,7 +8,7 @@
 #[path = "../../../generated/modules/scheduler.rs"]
 pub mod meta;
 
-use crate::util::{body_get, body_str, dict_body, fromisoformat_value, iso, now, py_int, py_int_str, py_type, replace_time, total_seconds, weekday};
+use crate::util::{body_get, body_str, dict_body, fromisoformat_value, iso, now, py_int, py_int_str, py_strip, py_type, replace_time, total_seconds, weekday};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDateTime};
@@ -349,48 +349,66 @@ fn str_arg(value: Option<Value>, method: &str) -> anyhow::Result<String> {
     }
 }
 
-/// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur)
-pub fn ui_build_recur(mode: &str, duration: &str, time_str: &str, weekday: Option<&Value>) -> Result<Value, &'static str> {
+/// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur).
+/// the outer error is python exceptions that escape the handler (`int()` of a list or dict weekday),
+/// the inner error is the message python's handler returns
+pub fn ui_build_recur(mode: &str, duration: &str, time_str: &str, weekday: Option<&Value>) -> anyhow::Result<Result<Value, &'static str>> {
     let mut recur = json!({
         "weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0,
         "target_weekday": null, "weekdays_only": false,
     });
     if mode == "relative" {
-        let Some(d) = parse_duration(duration.trim()) else {
-            return Err("invalid duration. use something like '2d 4h 30m'");
+        let Some(d) = parse_duration(py_strip(duration)) else {
+            return Ok(Err("invalid duration. use something like '2d 4h 30m'"));
         };
         // python only overwrites the units that were present; values default to 0 anyway
         for (i, k) in ["weeks", "days", "hours", "minutes", "seconds"].iter().enumerate() {
             recur[*k] = json!(d[i]);
         }
-        return Ok(recur);
+        return Ok(Ok(recur));
     }
+    const FMT: &str = "invalid time format, use HH:MM";
     let parts: Vec<&str> = time_str.split(':').collect();
     if parts.len() < 2 {
-        return Err("invalid time format, use HH:MM");
+        return Ok(Err(FMT));
     }
-    let hour = py_int_str(parts[0]).ok_or("invalid time format, use HH:MM")?;
+    let (Some(hour), Some(minute)) = (py_int_str(parts[0]), py_int_str(parts[1])) else {
+        return Ok(Err(FMT));
+    };
+    let second = if parts.len() == 3 {
+        match py_int_str(parts[2]) {
+            Some(s) => Some(s),
+            None => return Ok(Err(FMT)),
+        }
+    } else {
+        None
+    };
     recur["target_hour"] = json!(hour);
-    let minute = py_int_str(parts[1]).ok_or("invalid time format, use HH:MM")?;
     recur["target_minute"] = json!(minute);
-    if parts.len() == 3 {
-        recur["target_second"] = json!(py_int_str(parts[2]).ok_or("invalid time format, use HH:MM")?);
+    if let Some(s) = second {
+        recur["target_second"] = json!(s);
     }
     if !((0..=23).contains(&hour) && (0..=59).contains(&minute)) {
-        return Err("time out of range");
+        return Ok(Err("time out of range"));
     }
     match weekday {
         Some(Value::String(s)) if s == "weekdays" => recur["weekdays_only"] = json!(true),
         Some(w) if !w.is_null() && !py_str(w).is_empty() => {
-            let wd = py_int(w).ok_or("invalid weekday")?;
+            // python's int() raises TypeError (not ValueError) for a list or dict, and it escapes the handler
+            if matches!(w, Value::Array(_) | Value::Object(_)) {
+                anyhow::bail!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(w));
+            }
+            let Some(wd) = py_int(w) else {
+                return Ok(Err("invalid weekday"));
+            };
             if !(0..=6).contains(&wd) {
-                return Err("weekday must be between 0 (Monday) and 6 (Sunday)");
+                return Ok(Err("weekday must be between 0 (Monday) and 6 (Sunday)"));
             }
             recur["target_weekday"] = json!(wd);
         }
         _ => {}
     }
-    Ok(recur)
+    Ok(Ok(recur))
 }
 
 // ---------------------------------------------------------
@@ -639,7 +657,7 @@ impl Inner {
     async fn execute_job(self: &Arc<Self>, job: &Value) -> anyhow::Result<()> {
         let job_id = py_str_opt(job.get("id"));
         let manager = self.base.manager().ok_or_else(|| anyhow!("manager is gone"))?;
-        let channel_name = job.get("channel").filter(|v| truthy(v)).map(py_str).unwrap_or_default().to_lowercase().trim().to_string();
+        let channel_name = py_strip(&job.get("channel").filter(|v| truthy(v)).map(py_str).unwrap_or_default().to_lowercase()).to_string();
         let job_channel: Option<Arc<Channel>> = manager.channel(&channel_name).or_else(|| manager.current_channel());
         let Some(job_channel) = job_channel else {
             self.log(&format!("error executing job {}: no channel available", job_id));
@@ -793,7 +811,7 @@ impl Inner {
         let job = json!({
             "id": job_id,
             "action": args.0.get("action").cloned().unwrap_or(Value::Null),
-            "channel": py_str(&channel).to_lowercase().trim(),
+            "channel": py_strip(&py_str(&channel).to_lowercase()),
             "trigger_time": iso(&trigger),
             "recurring": recurring,
             "recurs_in": if truthy(&recurring) { recur } else { Value::Null },
@@ -950,7 +968,7 @@ impl Inner {
         } else {
             (String::new(), str_arg(body_get(body, "time"), "split")?)
         };
-        Ok(ui_build_recur(&mode, &duration, &time, weekday.as_ref()))
+        ui_build_recur(&mode, &duration, &time, weekday.as_ref())
     }
 
     async fn route_create_or_update(&self, body: &Option<Value>, update: bool) -> anyhow::Result<Value> {
@@ -967,7 +985,7 @@ impl Inner {
                 return Ok(self.base.result("job does not exist", false));
             }
         }
-        let action = body_str(body, "action", "").trim().to_string();
+        let action = py_strip(&body_str(body, "action", "")).to_string();
         if action.is_empty() {
             return Ok(self.base.result("job action cannot be empty", false));
         }
@@ -1000,7 +1018,7 @@ impl Inner {
         let job = json!({
             "id": new_id,
             "action": action,
-            "channel": py_str(&channel).to_lowercase().trim(),
+            "channel": py_strip(&py_str(&channel).to_lowercase()),
             "trigger_time": iso(&trigger),
             "recurring": recurring,
             "recurs_in": if recurring { recur } else { Value::Null },
@@ -1174,7 +1192,7 @@ mod tests {
         assert_eq!(calculate_next_from(&base, &days(1_000_000_000)).unwrap_err(), "days=1000000000; must have magnitude <= 999999999");
         assert_eq!(calculate_next_from(&base, &days(10_000_000_000)).unwrap_err(), "Python int too large to convert to C int");
         // a digit run too big for i64 is not read as zero: python raises the C int overflow for it
-        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap();
+        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap().unwrap();
         assert_eq!(calculate_next_from(&base, &huge).unwrap_err(), "Python int too large to convert to C int");
     }
 
@@ -1236,15 +1254,30 @@ mod tests {
 
     #[test]
     fn ui_recur() {
-        let r = ui_build_recur("relative", "1h", "", None).unwrap();
+        let r = ui_build_recur("relative", "1h", "", None).unwrap().unwrap();
         assert_eq!(r["hours"], 1);
-        assert_eq!(ui_build_recur("relative", "", "", None).unwrap_err(), "invalid duration. use something like '2d 4h 30m'");
-        let r = ui_build_recur("clock", "", "08:15", Some(&json!("weekdays"))).unwrap();
+        assert_eq!(ui_build_recur("relative", "", "", None).unwrap().unwrap_err(), "invalid duration. use something like '2d 4h 30m'");
+        let r = ui_build_recur("clock", "", "08:15", Some(&json!("weekdays"))).unwrap().unwrap();
         assert_eq!(r, json!({"weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0, "target_weekday": null, "weekdays_only": true, "target_hour": 8, "target_minute": 15}));
-        let r = ui_build_recur("clock", "", "08:15", Some(&json!("3"))).unwrap();
+        let r = ui_build_recur("clock", "", "08:15", Some(&json!("3"))).unwrap().unwrap();
         assert_eq!(r["target_weekday"], 3);
-        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("9"))).unwrap_err(), "weekday must be between 0 (Monday) and 6 (Sunday)");
-        assert_eq!(ui_build_recur("clock", "", "25:00", None).unwrap_err(), "time out of range");
-        assert_eq!(ui_build_recur("clock", "", "x", None).unwrap_err(), "invalid time format, use HH:MM");
+        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("9"))).unwrap().unwrap_err(), "weekday must be between 0 (Monday) and 6 (Sunday)");
+        assert_eq!(ui_build_recur("clock", "", "25:00", None).unwrap().unwrap_err(), "time out of range");
+        assert_eq!(ui_build_recur("clock", "", "x", None).unwrap().unwrap_err(), "invalid time format, use HH:MM");
+        // python int([..]) / int({..}) raise TypeError, which escapes the handler instead of returning a message
+        assert_eq!(
+            ui_build_recur("clock", "", "08:15", Some(&json!([1]))).unwrap_err().to_string(),
+            "int() argument must be a string, a bytes-like object or a real number, not 'list'"
+        );
+        assert_eq!(
+            ui_build_recur("clock", "", "08:15", Some(&json!({"a": 1}))).unwrap_err().to_string(),
+            "int() argument must be a string, a bytes-like object or a real number, not 'dict'"
+        );
+        // the time is checked before the weekday is converted
+        assert_eq!(ui_build_recur("clock", "", "25:00", Some(&json!([1]))).unwrap().unwrap_err(), "time out of range");
+        // duration and weekday strings use python's strip() and int() rules
+        assert_eq!(ui_build_recur("relative", " \n1h\t", "", None).unwrap().unwrap()["hours"], 1);
+        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("1__0"))).unwrap().unwrap_err(), "invalid weekday");
+        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("1_0"))).unwrap().unwrap_err(), "weekday must be between 0 (Monday) and 6 (Sunday)");
     }
 }

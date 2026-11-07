@@ -185,9 +185,9 @@ impl Inner {
             tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
             let Some(inner) = me.upgrade() else { return };
             let live = inner.live(&event);
-            if let Err(e) = inner.notify_user(&live).await {
-                inner.base.log("calendar", &format!("failed to notify: {}", ol_core::detail_error(&e)));
-            }
+            // python's `asyncio.create_task(self._notify_user(event))` never logs through self.log: an
+            // exception there is unhandled by the module, so the error is dropped here too
+            let _ = inner.notify_user(&live).await;
         });
         let mut timers = self.timers.lock();
         timers.retain(|t| !t.is_finished());
@@ -508,10 +508,10 @@ impl Module for Calendar {
         for event in self.inner.events() {
             if event.get("notify").map(truthy).unwrap_or(false) {
                 let inner = self.inner.clone();
+                // python's `asyncio.create_task(self._schedule_notification(event))` is not wrapped in a try:
+                // its exceptions are never logged through self.log (python logs only the call_later failure)
                 let h = tokio::spawn(async move {
-                    if let Err(e) = inner.schedule_notification(event).await {
-                        inner.base.log("calendar", &format!("failed to schedule notification: {}", ol_core::detail_error(&e)));
-                    }
+                    let _ = inner.schedule_notification(event).await;
                 });
                 self.inner.timers.lock().push(h);
             }
