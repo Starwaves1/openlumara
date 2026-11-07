@@ -108,9 +108,14 @@ pub fn urljoin(base: &str, url: &str) -> Result<String, String> {
 /// The text python's `json.loads(text)` raises with, for the ddgs engines that parse json.
 /// serde_json decides whether the text parses; when it does not, this reproduces CPython's
 /// `JSONDecodeError` message (`"Expecting value: line 1 column 1 (char 0)"`). A text CPython
-/// accepts but serde rejects (NaN, Infinity, lone surrogates) keeps serde's own text.
+/// accepts but serde rejects (NaN, Infinity, -Infinity, out-of-range numbers, lone surrogates) keeps serde's
+/// own text, except NaN and Infinity, which get an explicit unsupported-value error (see `py_json_nonfinite`).
 pub fn py_json_loads(text: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_str(text).map_err(|e| py_json_error(text).or_else(|| py_json_nonfinite(text)).unwrap_or_else(|| e.to_string()))
+    serde_json::from_str(text).map_err(|e| {
+        py_json_error(text)
+            .or_else(|| py_json_nonfinite(text))
+            .unwrap_or_else(|| e.to_string())
+    })
 }
 
 /// NaN / Infinity (and numbers past f64 range, which python reads as inf) are an error, not Value::Null: every
@@ -789,11 +794,6 @@ pub fn py_int(v: &serde_json::Value) -> Option<i64> {
 static UNICODE_DECIMAL: once_cell::sync::Lazy<regex::Regex> =
     once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
 
-/// python `str.isspace()` for one code point: `char::is_whitespace` plus U+001C-U+001F
-fn is_py_space(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
-}
-
 /// value of a decimal digit (category Nd) as python's int() reads it. unicode lays each run of ten digits
 /// out as 0..=9 in order, so the value is the length of the Nd run before the char, modulo ten
 fn decimal_value(c: char) -> Option<u32> {
@@ -816,7 +816,8 @@ fn decimal_value(c: char) -> Option<u32> {
 /// python `int(str)`: python whitespace stripped, an optional sign, unicode decimal digits (category Nd only)
 /// with single underscores between them
 fn py_int_str(s: &str) -> Option<i64> {
-    let t = s.trim_matches(is_py_space);
+    // python int() strips str.isspace() code points, which is exactly the Unicode White_Space set (char::is_whitespace)
+    let t = s.trim_matches(char::is_whitespace);
     let (negative, digits) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
         Some(b'+') => (false, &t[1..]),
@@ -1016,8 +1017,8 @@ mod tests {
         assert_eq!(py_int(&json!("\u{663}_\u{664}")), Some(34));
         assert_eq!(py_int(&json!(" \u{ff11}\u{ff12} ")), Some(12));
         assert_eq!(py_int(&json!("-\u{661}")), Some(-1));
-        // python: int('\x1c7\x1f') == 7, the \x1c-\x1f separators are str.isspace()
-        assert_eq!(py_int(&json!("\u{1c}7\u{1f}")), Some(7));
+        // python: int('\x1c7\x1f') raises ValueError, U+001C-U+001F are not stripped by int()
+        assert_eq!(py_int(&json!("\u{1c}7\u{1f}")), None);
         // not category Nd: vulgar fraction and superscript are rejected by int()
         assert_eq!(py_int(&json!("\u{bd}")), None);
         assert_eq!(py_int(&json!("\u{b2}")), None);
