@@ -15,6 +15,7 @@ use ol_core::channel::Channel;
 use ol_core::manager::Manager;
 use ol_core::module::{Module, ModuleBase, UiRoute};
 use ol_core::pyjson::py_str;
+use ol_modules_data::calendar::Calendar;
 use once_cell::sync::Lazy;
 use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
@@ -1336,4 +1337,192 @@ async fn library_post_routes_answer_get_with_405_allow_post() {
         assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "POST", "GET {uri}");
         assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "GET {uri}");
     }
+}
+
+// ---------------- /api/system ----------------
+
+/// writes the config keys the system routes read over the harness config
+fn system_config(max_context: i64, threshold: f64, auto_compress: bool) {
+    ol_core::config::update(|m| {
+        m.insert("api".into(), json!({"max_context": max_context}));
+        m.insert(
+            "model".into(),
+            json!({"context_compression_threshold": threshold, "automatically_compress_context": auto_compress}),
+        );
+    });
+}
+
+#[tokio::test]
+async fn system_data_reports_the_configured_max_context() {
+    let h = harness(false).await;
+    system_config(32000, 0.25, true);
+    let resp = h.get("/api/system/data").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.json(), json!({"data": {"max_context": 32000}, "success": true}));
+}
+
+#[tokio::test]
+async fn system_context_size_appends_threshold_percent_and_auto_compress_last() {
+    let h = harness(false).await;
+    system_config(32000, 0.255, true);
+    let resp = h.get("/api/system/context_size").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let body = resp.json();
+    assert_eq!(body["success"], json!(true));
+    let data = body["data"].as_object().expect("breakdown object");
+    let keys: Vec<&str> = data.keys().map(|k| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "max_context",
+            "total_tokens",
+            "percent_full",
+            "compaction_count",
+            "total_words",
+            "system_prompt",
+            "tools",
+            "message_history",
+            "end_prompt",
+            "compression_threshold",
+            "auto_compress",
+        ]
+    );
+    assert_eq!(data["max_context"], json!(32000));
+    // python: round(0.255 * 100, 1) == 25.5 and bool(True) == true
+    assert_eq!(data["compression_threshold"], json!(25.5));
+    assert_eq!(data["auto_compress"], json!(true));
+}
+
+#[tokio::test]
+async fn system_logs_lists_each_logged_entry_as_category_and_message() {
+    let h = harness(false).await;
+    // the webui channel's on_log hook fills this buffer; the harness does not run that hook, so fill it directly
+    h.shared.logs.lock().push(("core".into(), "first line".into()));
+    h.shared.logs.lock().push(("webui".into(), "second line".into()));
+    let resp = h.get("/api/system/logs").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": [
+                {"category": "core", "message": "first line"},
+                {"category": "webui", "message": "second line"},
+            ],
+            "success": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn system_restart_answers_null_and_logs_the_restart() {
+    let h = harness(false).await;
+    let resp = h.send(request(Method::POST, "/api/system/restart", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body, "null");
+    assert_eq!(resp.json(), Value::Null);
+}
+
+#[tokio::test]
+async fn system_routes_answer_wrong_methods_like_python() {
+    let h = harness(false).await;
+    for uri in ["/api/system/data", "/api/system/context_size", "/api/system/logs"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "HEAD {uri}");
+        assert!(resp.body.is_empty(), "HEAD {uri} body: {}", resp.body);
+        let resp = h.send(request(Method::POST, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "POST {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "POST {uri}");
+        assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}), "POST {uri}");
+    }
+    let resp = h.get("/api/system/restart").await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "POST");
+}
+
+// ---------------- /api/ext/calendar (upcoming, channels) ----------------
+
+/// the calendar module loaded the way the manager loads it at startup, so its webui routes are reachable
+async fn harness_with_calendar() -> Harness {
+    let h = harness(false).await;
+    let base = ModuleBase::new("calendar", false, Arc::downgrade(&h.manager));
+    let calendar: Arc<dyn Module> = Arc::new(Calendar::new(base));
+    calendar.on_ready().await.expect("calendar loads its events");
+    h.manager.insert_module(calendar);
+    h
+}
+
+/// `YYYY-MM-DD`, `days` after today in local time (the calendar's own clock)
+fn day_from_today(days: i64) -> String {
+    (chrono::Local::now().date_naive() + Duration::days(days)).format("%Y-%m-%d").to_string()
+}
+
+/// adds a 09:00 event without a notification through the module's own create route
+async fn add_calendar_event(h: &Harness, title: &str, days: i64) {
+    let body = json!({"title": title, "date": day_from_today(days), "time": "09:00", "notify": false}).to_string();
+    let resp = h.send(post_json("/api/ext/calendar/create", &body)).await;
+    assert_eq!(resp.json()["success"], json!(true), "create {title}: {}", resp.body);
+}
+
+/// the titles of the upcoming items, in the order the route returned them
+fn upcoming_titles(resp: &Reply) -> Vec<String> {
+    let body = resp.json();
+    body["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("upcoming data is not a list: {}", resp.body))
+        .iter()
+        .map(|e| e["title"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn calendar_upcoming_lists_events_in_the_window_soonest_first() {
+    let h = harness_with_calendar().await;
+    add_calendar_event(&h, "Later", 10).await;
+    add_calendar_event(&h, "Soon", 2).await;
+    add_calendar_event(&h, "Far", 30).await;
+
+    let resp = h.get("/api/ext/calendar/upcoming?days=14").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(upcoming_titles(&resp), ["Soon", "Later"]);
+    let body = resp.json();
+    let first = body["data"][0].as_object().expect("item object");
+    let keys: Vec<&str> = first.keys().map(|k| k.as_str()).collect();
+    assert_eq!(keys, ["id", "title", "date", "notify", "notify_channel"]);
+    assert_eq!(first["notify"], json!(false));
+    assert_eq!(first["notify_channel"], Value::Null);
+    assert!(first["date"].as_str().unwrap_or_default().starts_with(&day_from_today(2)), "{body}");
+    assert_eq!(body["success"], json!(true));
+}
+
+#[tokio::test]
+async fn calendar_upcoming_defaults_bad_days_to_14_and_clamps_the_range_like_python() {
+    let h = harness_with_calendar().await;
+    add_calendar_event(&h, "Two", 2).await;
+    add_calendar_event(&h, "Twenty", 20).await;
+
+    // a non-integer or empty `days` is the default 14: day 20 is outside, day 2 inside
+    assert_eq!(upcoming_titles(&h.get("/api/ext/calendar/upcoming?days=abc").await), ["Two"]);
+    assert_eq!(upcoming_titles(&h.get("/api/ext/calendar/upcoming?days=").await), ["Two"]);
+    // days below 1 clamps to 1: the day-2 event is outside a one-day window
+    assert!(upcoming_titles(&h.get("/api/ext/calendar/upcoming?days=0").await).is_empty());
+    // days above 365 clamps to 365, so both events are inside
+    assert_eq!(upcoming_titles(&h.get("/api/ext/calendar/upcoming?days=9999").await), ["Two", "Twenty"]);
+}
+
+#[tokio::test]
+async fn calendar_upcoming_is_get_only_like_the_python_webui_route() {
+    let h = harness_with_calendar().await;
+    let resp = h.send(post_json("/api/ext/calendar/upcoming", "{}")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
+}
+
+#[tokio::test]
+async fn calendar_channels_answers_the_available_channel_names() {
+    let h = harness_with_calendar().await;
+    let resp = h.get("/api/ext/calendar/channels").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let expected = ol_modules_data::scheduler::available_channels();
+    assert_eq!(resp.json(), json!({"data": expected, "success": true}), "{}", resp.body);
 }

@@ -1575,6 +1575,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "ol-core",
+ "ol-modules-data",
  "once_cell",
  "parking_lot",
  "regex",

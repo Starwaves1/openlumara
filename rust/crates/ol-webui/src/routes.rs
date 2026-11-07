@@ -19,7 +19,7 @@ use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_ren
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::Json;
 use axum::Router;
 use indexmap::IndexMap;
@@ -32,9 +32,11 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
+mod system;
+
 /// registers the `/api` chat, stream, input history, settings, library and system routes
 pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
-    router
+    let router = router
         .route("/api/chat/load/{chat_id}", get_only(chat_load))
         .route("/api/chat/current", get_only(chat_current))
         .route("/api/stream/state", get_only(stream_state))
@@ -64,11 +66,8 @@ pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
         .route("/api/libraries/sync", post(libraries_sync))
         .route("/api/libraries/install", post(libraries_install))
         .route("/api/libraries/update", post(libraries_update))
-        .route("/api/libraries/uninstall", post(libraries_uninstall))
-        .route("/api/system/data", get(system_data))
-        .route("/api/system/context_size", get(system_context_size))
-        .route("/api/system/logs", get(system_logs))
-        .route("/api/system/restart", post(system_restart))
+        .route("/api/libraries/uninstall", post(libraries_uninstall));
+    system::add_routes(router)
 }
 
 // ------------------
@@ -333,11 +332,6 @@ pub fn restart_flags(old: &Map<String, Value>, new: &Map<String, Value>) -> Opti
     let requires_reconnect =
         !requires_restart && !py_eq(old.get("api").unwrap_or(&Value::Null), new.get("api").unwrap_or(&Value::Null));
     Some((requires_restart, requires_reconnect))
-}
-
-/// python `round(x, 1)`
-fn round1(x: f64) -> f64 {
-    (x * 10.0).round() / 10.0
 }
 
 // ------------------
@@ -991,37 +985,6 @@ async fn libraries_uninstall(State(app): State<Arc<Shared>>, body: Bytes) -> Res
         Ok(message) => reply(json!({"restart_required": true, "message": message}), true),
         Err(message) => reply(json!(message), false),
     }
-}
-
-// ------------------
-// system
-// ------------------
-
-async fn system_data(State(app): State<Arc<Shared>>) -> Response {
-    let Some(_ch) = app.ch() else { return internal_error() };
-    let max_context = ol_core::config::get(&["api", "max_context"]).unwrap_or(Value::Null);
-    reply(json!({"max_context": max_context}), true)
-}
-
-async fn system_context_size(State(app): State<Arc<Shared>>) -> Response {
-    let Some(ch) = app.ch() else { return internal_error() };
-    let mut size = ch.context.get_size().await;
-    let threshold = ol_core::config::get_f64(&["model", "context_compression_threshold"], 0.0);
-    size["compression_threshold"] = json!(round1(threshold * 100.0));
-    let auto = ol_core::config::get(&["model", "automatically_compress_context"]).unwrap_or(Value::Null);
-    size["auto_compress"] = json!(truthy(&auto));
-    reply(size, true)
-}
-
-async fn system_logs(State(app): State<Arc<Shared>>) -> Response {
-    let logs: Vec<Value> = app.logs.lock().iter().map(|(category, message)| json!({"category": category, "message": message})).collect();
-    reply(json!(logs), true)
-}
-
-async fn system_restart(State(app): State<Arc<Shared>>) -> Response {
-    let Some(ch) = app.ch() else { return internal_error() };
-    ch.manager().restart();
-    Json(Value::Null).into_response()
 }
 
 #[cfg(test)]
