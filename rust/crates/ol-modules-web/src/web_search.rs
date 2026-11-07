@@ -24,6 +24,8 @@ use std::sync::Arc;
 const NO_QUERY: &str = "A non-empty search query is required.";
 const FOLLOW_TEMPLATE: &str = "For each result, follow template: **Title**: Summary (URL). At the end, provide a conclusive summary of all results.";
 const INVALID_DOMAIN: &str = "[invalid domain]";
+/// python's AttributeError text when `backend` is None (`None.split(",")` in ddgs `_get_engines`)
+const NONE_BACKEND_ERROR: &str = "'NoneType' object has no attribute 'split'";
 
 pub struct WebSearch {
     base: ModuleBase,
@@ -185,19 +187,25 @@ impl WebSearch {
         Ok(out)
     }
 
-    /// `_search(kind, query, url_key, fields, **kwargs)`
-    async fn search(&self, cat: Category, query: &Value, args: SearchArgs) -> Value {
+    /// `_search(kind, query, url_key, fields, **kwargs)`. `backend_is_none` is an explicit JSON
+    /// null for `backend`, which python forwards as None.
+    async fn search(&self, cat: Category, query: &Value, args: SearchArgs, backend_is_none: bool) -> Value {
         let query = match query {
             Value::String(q) if !py_strip(q).is_empty() => q,
             _ => return self.base.result(NO_QUERY, false),
         };
         let kind = kind_name(cat);
         let (url_key, fields) = shape(cat);
-        let proxy = self.core.config.get_str("proxy");
-        let ddgs = Ddgs::new(proxy.as_deref());
-        let outcome = match ddgs.search_sync(cat, query, &args).await {
-            Ok(raw) => self.sanitize_results(url_key, fields, raw),
-            Err(e) => Err(e.to_string()),
+        let outcome = if backend_is_none {
+            // ddgs `_get_engines` calls `backend.split(",")` before any engine runs, so None raises
+            Err(NONE_BACKEND_ERROR.to_string())
+        } else {
+            let proxy = self.core.config.get_str("proxy");
+            let ddgs = Ddgs::new(proxy.as_deref());
+            match ddgs.search_sync(cat, query, &args).await {
+                Ok(raw) => self.sanitize_results(url_key, fields, raw),
+                Err(e) => Err(e.to_string()),
+            }
         };
         match outcome {
             Ok(results) => {
@@ -239,7 +247,8 @@ impl Module for WebSearch {
         };
         let query = args.0.get("query").cloned().unwrap_or(Value::Null);
         let search_args = self.search_args(cat, &args);
-        Ok(self.search(cat, &query, search_args).await)
+        let backend_is_none = args.0.get("backend") == Some(&Value::Null);
+        Ok(self.search(cat, &query, search_args, backend_is_none).await)
     }
 
     fn ui_routes(&self) -> Vec<UiRoute> {
@@ -390,6 +399,26 @@ mod tests {
         let images = ws.search_args(Category::Images, &args);
         assert_eq!(images.region, "uk-en");
         assert_eq!(images.extra("size"), "Large");
+    }
+
+    #[tokio::test]
+    async fn explicit_null_backend_fails_like_python_none_split() {
+        // python forwards backend=None; ddgs `_get_engines` raises before any engine runs, so the
+        // tool returns the error string and never reaches the network
+        let ws = detached();
+        let args = ToolArgs(json!({"query": "dune", "backend": null}).as_object().unwrap().clone());
+        let out = ws.call_tool("books", args).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "An error occurred during books search."}));
+    }
+
+    #[tokio::test]
+    async fn null_backend_check_runs_after_the_query_check() {
+        // python checks the query inside _search before DDGS is ever called, so a blank query
+        // keeps the query error even when backend is null
+        let ws = detached();
+        let args = ToolArgs(json!({"query": "  ", "backend": null}).as_object().unwrap().clone());
+        let out = ws.call_tool("text", args).await.unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "A non-empty search query is required."}));
     }
 
     #[test]
