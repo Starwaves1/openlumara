@@ -2474,7 +2474,8 @@ impl Evaluator<'_> {
 
     fn attribute(&self, base: &Expr, name: &str) -> Res<Val> {
         if DISALLOW_PREFIXES.iter().any(|p| name.starts_with(p)) {
-            return fail(format!("Sorry, access to __attributes or func_ attributes is not available. ({name})"));
+            // simpleeval joins two literals here, so the text has two spaces after "__attributes"
+            return fail(format!("Sorry, access to __attributes  or func_ attributes is not available. ({name})"));
         }
         if DISALLOW_METHODS.contains(&name) {
             return fail(format!("Sorry, this method is not available. ({name})"));
@@ -2515,4 +2516,22 @@ pub fn simple_eval(expression: &str) -> Res<Val> {
         return fail("Sorry, cannot evaluate empty string");
     };
     Evaluator { expression, depth: std::cell::Cell::new(0) }.exec(first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disallowed_attribute_message_matches_simpleeval_text() {
+        // simpleeval 1.0.8 builds this as "...__attributes " + " or func_ attributes..." (two spaces)
+        assert_eq!(
+            simple_eval("1 .__class__").unwrap_err().to_string(),
+            "Sorry, access to __attributes  or func_ attributes is not available. (__class__)"
+        );
+        assert_eq!(
+            simple_eval("1 .func_globals").unwrap_err().to_string(),
+            "Sorry, access to __attributes  or func_ attributes is not available. (func_globals)"
+        );
+    }
 }
