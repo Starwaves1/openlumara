@@ -184,22 +184,53 @@ pub fn category_names(categories: &[Value]) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// python `{chat.get("category") or "general": count}` over the chat index, first-seen key order
+/// python `{chat.get("category") or "general": count}` over the chat index, first-seen key order.
+/// keys compare like python dict keys (True == 1 == 1.0), and json.dumps writes the first-seen key
+/// object as its string form (True becomes "true").
 pub fn category_counts(chats: &[Value]) -> Result<Map<String, Value>, String> {
-    let mut counts = Map::new();
+    // equality key -> (json key text, count)
+    let mut counts: IndexMap<String, (String, i64)> = IndexMap::new();
     for chat in chats {
-        let cat = match chat.get("category") {
+        // python `chat.get` on a non-dict index entry raises AttributeError
+        let Some(obj) = chat.as_object() else {
+            return Err(format!("'{}' object has no attribute 'get'", py_type_name(chat)));
+        };
+        let cat = match obj.get("category") {
             Some(c) if truthy(c) => c.clone(),
             _ => json!("general"),
         };
         if matches!(cat, Value::Array(_) | Value::Object(_)) {
             return Err(format!("unhashable type: '{}'", py_type_name(&cat)));
         }
-        let key = py_str(&cat);
-        let n = counts.get(&key).and_then(Value::as_i64).unwrap_or(0) + 1;
-        counts.insert(key, json!(n));
+        counts
+            .entry(py_dict_eq_key(&cat))
+            .and_modify(|(_, n)| *n += 1)
+            .or_insert_with(|| (py_json_key_text(&cat), 1));
     }
-    Ok(counts)
+    Ok(counts.into_values().map(|(key, n)| (key, json!(n))).collect())
+}
+
+/// equality class of a hashable scalar under python `==`/hash: True, 1 and 1.0 share one class
+fn py_dict_eq_key(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => format!("n{}", *b as i64),
+        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => format!("n{i}"),
+            (_, Some(u), _) => format!("n{u}"),
+            (_, _, Some(f)) if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 => format!("n{}", f as i64),
+            (_, _, Some(f)) => format!("f{}", f.to_bits()),
+            _ => py_str(v),
+        },
+        other => format!("s{}", py_str(other)),
+    }
+}
+
+/// text json.dumps writes for a dict key: str as-is, bool as true/false, numbers as python str()
+fn py_json_key_text(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        other => py_str(other),
+    }
 }
 
 /// python `sorted(set(t for chat in chats for t in (chat.get("tags") or []) if t))`
@@ -843,6 +874,17 @@ mod tests {
         assert_eq!(counts.get("work"), Some(&json!(2)));
         assert_eq!(counts.get("general"), Some(&json!(2)));
         assert!(category_counts(&[json!({"category": ["x"]})]).is_err());
+    }
+
+    #[test]
+    fn category_counts_keep_python_dict_key_semantics() {
+        // json.dumps writes a bool key as "true"; True, 1 and 1.0 are one dict key
+        let counts = category_counts(&[json!({"category": true}), json!({"category": 1}), json!({"category": 1.0})]).unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get("true"), Some(&json!(3)));
+        // a non-dict index entry is python's AttributeError on chat.get
+        assert!(category_counts(&[json!({"category": "work"}), json!("work")]).is_err());
+        assert!(category_counts(&[json!(null)]).is_err());
     }
 
     #[test]
