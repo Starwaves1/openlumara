@@ -1939,3 +1939,159 @@ async fn characters_import_rejects_an_unhashable_name_on_an_empty_store_like_pyt
     // nothing was stored
     assert_eq!(h.get("/api/ext/characters/all").await.json(), json!({"data": [], "success": true}));
 }
+
+// ---------------- /api/ext/characters (import_file, names, chats_count, apply, chats, create_chat) ----------------
+
+fn b64_text(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// a png with the given chunks (type, data) between the signature and IEND. the reader does not check crcs
+fn png_with_chunks(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    for (kind, data) in chunks {
+        out.extend((data.len() as u32).to_be_bytes());
+        out.extend(kind.iter());
+        out.extend(data);
+        out.extend([0u8; 4]);
+    }
+    out.extend(0u32.to_be_bytes());
+    out.extend(b"IEND");
+    out.extend([0u8; 4]);
+    out
+}
+
+/// a tEXt chunk carrying a sillytavern-style card: keyword, nul, base64 of the card json
+fn png_card(card: &Value) -> Vec<u8> {
+    let mut text = b"chara\0".to_vec();
+    text.extend(b64_text(card.to_string().as_bytes()).into_bytes());
+    png_with_chunks(&[(b"tEXt", text)])
+}
+
+#[tokio::test]
+async fn characters_import_file_takes_json_and_png_cards_and_reports_python_errors() {
+    let h = harness_with_characters().await;
+    let import = |body: Value| post_json("/api/ext/characters/import_file", &body.to_string());
+
+    let no_data = h.send(import(json!({"filename": "ann.json"}))).await;
+    assert_eq!(no_data.json(), json!({"data": "error: no file data received", "success": false}));
+    let blank_name = h.send(import(json!({"filename": "  ", "data": b64_text(b"{}")}))).await;
+    assert_eq!(blank_name.json(), json!({"data": "error: no file data received", "success": false}));
+    let unsupported = h.send(import(json!({"filename": "card.txt", "data": b64_text(b"x")}))).await;
+    assert_eq!(unsupported.json(), json!({"data": "error: unsupported file type, use .json or .png", "success": false}));
+
+    // json: the extension is matched case-insensitively and the decoded text imports like a pasted card
+    let neo = json!({"name": "Neo", "description": "The one"}).to_string();
+    let json_file = h.send(import(json!({"filename": "neo.JSON", "data": b64_text(neo.as_bytes())}))).await;
+    assert_eq!(json_file.json(), json!({"data": "character successfully imported", "success": true}), "{}", json_file.body);
+
+    // a browser data-URL prefix is stripped before decoding
+    let trin = json!({"name": "Trin", "description": "Second"}).to_string();
+    let data_url = format!("data:application/json;base64,{}", b64_text(trin.as_bytes()));
+    let prefixed = h.send(import(json!({"filename": "trin.json", "data": data_url}))).await;
+    assert_eq!(prefixed.json(), json!({"data": "character successfully imported", "success": true}), "{}", prefixed.body);
+
+    // png: a v2 card inside the tEXt chunk is imported under its own name, not the file name
+    let pix = png_card(&json!({"spec": "chara_card_v2", "data": {"name": "Pix", "description": "A pixel", "tags": ["art"]}}));
+    let png_file = h.send(import(json!({"filename": "pix_file.png", "data": format!("data:image/png;base64,{}", b64_text(&pix))}))).await;
+    assert_eq!(png_file.json(), json!({"data": "character successfully imported", "success": true}), "{}", png_file.body);
+    let all = h.get("/api/ext/characters/all").await.json();
+    let pix_row = all["data"].as_array().unwrap().iter().find(|c| c["key"] == json!("Pix")).expect("Pix stored").clone();
+    assert_eq!(
+        pix_row,
+        json!({"key": "Pix", "name": "Pix", "profile": "A pixel", "scenario": "", "first_message": "", "post_history": "", "category": "", "tags": ["art"]})
+    );
+
+    // re-importing the same png updates the character in place
+    let pix_again = png_card(&json!({"name": "Pix", "description": "Reworked"}));
+    let again = h.send(import(json!({"filename": "again.png", "data": b64_text(&pix_again)}))).await;
+    assert_eq!(again.json()["success"], json!(true), "{}", again.body);
+    let all = h.get("/api/ext/characters/all").await.json();
+    let names: Vec<&str> = all["data"].as_array().unwrap().iter().map(|c| c["key"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Neo", "Pix", "Trin"]);
+    assert_eq!(all["data"][1]["profile"], json!("Reworked"));
+
+    // python: a png without a card, a png whose card has no profile, and a png whose card is not a dict
+    let bare = h.send(import(json!({"filename": "bare.png", "data": b64_text(&png_with_chunks(&[]))}))).await;
+    assert_eq!(bare.json(), json!({"data": "error: no character card found inside this png", "success": false}));
+    let no_profile = h.send(import(json!({"filename": "Nameless.png", "data": b64_text(&png_card(&json!({"name": "X"})))}))).await;
+    assert_eq!(
+        no_profile.json(),
+        json!({"data": "error: failed to extract a usable name and profile from this png", "success": false})
+    );
+    let not_dict = h.send(import(json!({"filename": "list.png", "data": b64_text(&png_card(&json!([1])))}))).await;
+    assert_eq!(not_dict.json(), json!({"data": "error: no character card found inside this png", "success": false}));
+}
+
+#[tokio::test]
+async fn characters_names_lists_stored_keys_with_display_names_sorted_by_lowercase_name() {
+    let h = harness_with_characters().await;
+    assert_eq!(h.get("/api/ext/characters/names").await.json(), json!({"data": [], "success": true}));
+
+    add_character(&h, "bob", "", &[], "").await;
+    add_character(&h, "Ann", "", &[], "").await;
+    add_character(&h, "cara", "", &[], "").await;
+    assert_eq!(
+        h.get("/api/ext/characters/names").await.json(),
+        json!({
+            "data": [
+                {"key": "Ann", "name": "Ann"},
+                {"key": "bob", "name": "bob"},
+                {"key": "cara", "name": "cara"}
+            ],
+            "success": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn characters_apply_tags_the_open_chat_and_chats_count_reflects_it() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "").await;
+    add_character(&h, "Bob", "", &[], "").await;
+    assert_eq!(h.get("/api/ext/characters/chats_count").await.json(), json!({"data": {}, "success": true}));
+
+    let nobody = h.send(post_json("/api/ext/characters/apply", r#"{"name": "nobody"}"#)).await;
+    assert_eq!(nobody.json(), json!({"data": "character not found", "success": false}));
+
+    // the name is trimmed and matched case-insensitively, and the canonical stored name is written
+    let applied = h.send(post_json("/api/ext/characters/apply", r#"{"name": "  ANN "}"#)).await;
+    assert_eq!(applied.json(), json!({"data": "Ann", "success": true}), "{}", applied.body);
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "Ann", "success": true}));
+    assert_eq!(h.get("/api/ext/characters/chats_count").await.json(), json!({"data": {"Ann": 1}, "success": true}));
+
+    // an empty name clears the character on the open chat
+    let cleared = h.send(post_json("/api/ext/characters/apply", "{}")).await;
+    assert_eq!(cleared.json(), json!({"data": "character cleared", "success": true}));
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": {}, "success": true}));
+    assert_eq!(h.get("/api/ext/characters/chats_count").await.json(), json!({"data": {}, "success": true}));
+}
+
+#[tokio::test]
+async fn characters_create_chat_stamps_a_new_chat_and_chats_lists_it() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "").await;
+    add_character(&h, "Bob", "", &[], "").await;
+
+    let missing = h.send(post_json("/api/ext/characters/create_chat", r#"{"name": "nobody"}"#)).await;
+    assert_eq!(missing.json(), json!({"data": "character not found", "success": false}));
+
+    // the new chat is stamped with the canonical name and the response carries its id in the envelope
+    let created = h.send(post_json("/api/ext/characters/create_chat", r#"{"name": "  ann "}"#)).await;
+    assert_eq!(created.json()["success"], json!(true), "{}", created.body);
+    let chat_id = created.json()["data"]["id"].as_str().expect("chat id").to_string();
+    assert!(!chat_id.is_empty());
+
+    // chats are a flat list of this character's chats: id, title, updated (in that key order)
+    let ann = h.get("/api/ext/characters/chats?character=Ann").await.json();
+    let items = ann["data"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{ann}");
+    assert_eq!(items[0]["id"], json!(chat_id));
+    assert_eq!(items[0]["title"], json!("New chat"));
+    let keys: Vec<&str> = items[0].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["id", "title", "updated"]);
+
+    assert_eq!(h.get("/api/ext/characters/chats?character=Bob").await.json(), json!({"data": [], "success": true}));
+    assert_eq!(h.get("/api/ext/characters/chats_count").await.json(), json!({"data": {"Ann": 1}, "success": true}));
+}
