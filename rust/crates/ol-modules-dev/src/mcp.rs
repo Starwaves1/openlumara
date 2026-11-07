@@ -187,15 +187,42 @@ fn find_io_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a std
     None
 }
 
-/// python httpx errors: ConnectError carries the socket error text, timeouts are httpx's own classes
+/// glibc `gai_strerror` texts and their EAI codes (python `socket.gaierror` prints `[Errno code] text`)
+const GAI_ERRORS: [(&str, i32); 11] = [
+    ("Bad value for ai_flags", -1),
+    ("Name or service not known", -2),
+    ("Temporary failure in name resolution", -3),
+    ("Non-recoverable failure in name resolution", -4),
+    ("No address associated with hostname", -5),
+    ("ai_family not supported", -6),
+    ("ai_socktype not supported", -7),
+    ("Servname not supported for ai_socktype", -8),
+    ("Memory allocation failure", -10),
+    ("System error", -11),
+    ("Overflow", -12),
+];
+
+/// python text for a DNS failure: std reports getaddrinfo failures as `failed to lookup address
+/// information: <gai_strerror>` without an errno, so the EAI code is looked up from the text
+fn gai_text(io_message: &str) -> Option<String> {
+    let strerror = io_message.strip_prefix("failed to lookup address information: ")?;
+    let (_, code) = GAI_ERRORS.iter().find(|(text, _)| *text == strerror)?;
+    Some(format!("[Errno {}] {}", code, strerror))
+}
+
+/// python httpx errors: ConnectError carries the socket error text, timeouts are httpx's own
+/// classes with the message "timed out"
 fn http_error(e: &reqwest::Error) -> McpError {
     if e.is_timeout() {
         let kind = if e.is_connect() { "ConnectTimeout" } else { "ReadTimeout" };
-        return McpError::Other { kind, message: chained(e) };
+        return McpError::Other { kind, message: "timed out".into() };
     }
     if e.is_connect() {
-        let os = find_io_error(e).and_then(|io| io.raw_os_error().map(|code| errno_text(io, code)));
-        return McpError::Other { kind: "ConnectError", message: os.unwrap_or_else(|| chained(e)) };
+        let text = find_io_error(e).and_then(|io| match io.raw_os_error() {
+            Some(code) => Some(errno_text(io, code)),
+            None => gai_text(&io.to_string()),
+        });
+        return McpError::Other { kind: "ConnectError", message: text.unwrap_or_else(|| chained(e)) };
     }
     McpError::Other { kind: "HTTPError", message: chained(e) }
 }
@@ -260,11 +287,23 @@ fn sanitize(text: &str) -> String {
     }
 }
 
+/// python `urllib.parse.urlparse` scheme: a letter, then letters, digits, `+`, `-` or `.`
+fn is_url_scheme(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// python `urllib.parse.urlparse(url).hostname`: the raw netloc host, lowercased, with no IDNA
-/// encoding (so `bücher.de` keeps its unicode label)
+/// encoding (so `bücher.de` keeps its unicode label). The netloc follows `scheme://` or a leading
+/// `//` (scheme-relative), so `//mcp.example.com/mcp` has the host `mcp.example.com`.
 fn url_hostname(url: &str) -> String {
-    let Some((_, rest)) = url.split_once("://") else {
-        return String::new();
+    let rest = match url.strip_prefix("//") {
+        Some(rest) => rest,
+        None => match url.split_once("://") {
+            Some((scheme, rest)) if is_url_scheme(scheme) => rest,
+            _ => return String::new(),
+        },
     };
     let netloc = rest.split(['/', '?', '#']).next().unwrap_or("");
     let hostinfo = netloc.rsplit_once('@').map(|(_, host)| host).unwrap_or(netloc);
@@ -398,6 +437,233 @@ fn unique_tool_name(used: &mut BTreeSet<String>, server: &str, tool: &str) -> St
     }
     used.insert(name.clone());
     name
+}
+
+// ---------------------------------------------------------------------------
+//   answer validation (python: the SDK validates every answer with pydantic)
+// ---------------------------------------------------------------------------
+
+/// pydantic error docs base URL (pydantic 2.14, the version the mcp SDK runs with)
+const PYDANTIC_DOCS: &str = "https://errors.pydantic.dev/2.14/v/";
+
+/// one line of a pydantic ValidationError: where, what, the error type and the value pydantic shows
+struct FieldError {
+    loc: String,
+    msg: &'static str,
+    kind: &'static str,
+    input: Value,
+}
+
+impl FieldError {
+    fn new(loc: impl Into<String>, msg: &'static str, kind: &'static str, input: &Value) -> Self {
+        Self { loc: loc.into(), msg, kind, input: input.clone() }
+    }
+
+    /// a required field that is absent; pydantic shows the object it was missing from
+    fn missing(loc: impl Into<String>, parent: &Value) -> Self {
+        Self::new(loc, "Field required", "missing", parent)
+    }
+}
+
+/// python `repr` of a pydantic input_value: longer than 50 characters it keeps the first 25 and
+/// the last 24 characters around `...`
+fn pydantic_repr(v: &Value) -> String {
+    let full = pyjson::py_repr(v);
+    let count = full.chars().count();
+    if count <= 50 {
+        return full;
+    }
+    let head: String = full.chars().take(25).collect();
+    let tail: String = full.chars().skip(count - 24).collect();
+    format!("{}...{}", head, tail)
+}
+
+/// python type name of a JSON value (pydantic's input_type)
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "int",
+        Value::Number(_) => "float",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// text of a pydantic ValidationError (python `str(exc)`)
+fn validation_text(model: &str, errors: &[FieldError]) -> String {
+    let plural = if errors.len() == 1 { "" } else { "s" };
+    let mut text = format!("{} validation error{} for {}", errors.len(), plural, model);
+    for e in errors {
+        text.push_str(&format!(
+            "\n{}\n  {} [type={}, input_value={}, input_type={}]\n    For further information visit {}{}",
+            e.loc,
+            e.msg,
+            e.kind,
+            pydantic_repr(&e.input),
+            py_type_name(&e.input),
+            PYDANTIC_DOCS,
+            e.kind
+        ));
+    }
+    text
+}
+
+/// a validation failure as the python SDK raises it (`ValidationError: <text>` once flattened)
+fn validation_failure(model: &str, errors: &[FieldError]) -> McpError {
+    McpError::other("ValidationError", validation_text(model, errors))
+}
+
+/// a tool from a `tools/list` answer that passed validation (python: `tool` in `_inject_tool`)
+#[derive(Clone, Debug, PartialEq)]
+struct RemoteTool {
+    name: String,
+    description: Option<String>,
+    input_schema: Value,
+}
+
+/// python `ListToolsResult` validation: one malformed tool fails the whole listing, so nothing
+/// that was injected before is purged
+fn parse_tool_listing(listing: &Value) -> Result<Vec<RemoteTool>, McpError> {
+    let mut errors = Vec::new();
+    let mut tools = Vec::new();
+    match listing {
+        Value::Object(fields) => match fields.get("tools") {
+            None => errors.push(FieldError::missing("tools", listing)),
+            Some(Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    tools.extend(parse_remote_tool(i, item, &mut errors));
+                }
+            }
+            Some(other) => errors.push(FieldError::new("tools", "Input should be a valid list", "list_type", other)),
+        },
+        other => errors.push(FieldError::new(
+            "",
+            "Input should be a valid dictionary or instance of ListToolsResult",
+            "model_type",
+            other,
+        )),
+    }
+    if errors.is_empty() {
+        Ok(tools)
+    } else {
+        Err(validation_failure("ListToolsResult", &errors))
+    }
+}
+
+/// one entry of the tool listing: `name` (str) and `inputSchema` are required, `description` may be null
+fn parse_remote_tool(index: usize, item: &Value, errors: &mut Vec<FieldError>) -> Option<RemoteTool> {
+    let loc = format!("tools.{}", index);
+    let Value::Object(fields) = item else {
+        errors.push(FieldError::new(loc, "Input should be a valid dictionary or instance of Tool", "model_type", item));
+        return None;
+    };
+    let name = match fields.get("name") {
+        None => {
+            errors.push(FieldError::missing(format!("{}.name", loc), item));
+            None
+        }
+        Some(Value::String(name)) => Some(name.clone()),
+        Some(other) => {
+            errors.push(FieldError::new(format!("{}.name", loc), "Input should be a valid string", "string_type", other));
+            None
+        }
+    };
+    let description = match fields.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(other) => {
+            errors.push(FieldError::new(
+                format!("{}.description", loc),
+                "Input should be a valid string",
+                "string_type",
+                other,
+            ));
+            None
+        }
+    };
+    let input_schema = match fields.get("inputSchema") {
+        None => {
+            errors.push(FieldError::missing(format!("{}.inputSchema", loc), item));
+            None
+        }
+        Some(schema) => parse_input_schema(&format!("{}.inputSchema", loc), schema, errors),
+    };
+    match (name, input_schema) {
+        (Some(name), Some(input_schema)) => Some(RemoteTool { name, description, input_schema }),
+        _ => None,
+    }
+}
+
+/// python `InputSchema` validation: `type` must be "object"; `properties` and `required` may be
+/// null, otherwise they must be an object and a list. Other keys are allowed.
+fn parse_input_schema(loc: &str, schema: &Value, errors: &mut Vec<FieldError>) -> Option<Value> {
+    let Value::Object(fields) = schema else {
+        errors.push(FieldError::new(
+            loc,
+            "Input should be a valid dictionary or instance of InputSchema",
+            "model_type",
+            schema,
+        ));
+        return None;
+    };
+    let before = errors.len();
+    match fields.get("properties") {
+        None | Some(Value::Null) | Some(Value::Object(_)) => {}
+        Some(other) => errors.push(FieldError::new(
+            format!("{}.properties", loc),
+            "Input should be a valid dictionary",
+            "dict_type",
+            other,
+        )),
+    }
+    match fields.get("required") {
+        None | Some(Value::Null) | Some(Value::Array(_)) => {}
+        Some(other) => errors.push(FieldError::new(
+            format!("{}.required", loc),
+            "Input should be a valid list",
+            "list_type",
+            other,
+        )),
+    }
+    match fields.get("type") {
+        None => errors.push(FieldError::missing(format!("{}.type", loc), schema)),
+        Some(Value::String(kind)) if kind == "object" => {}
+        Some(other) => errors.push(FieldError::new(format!("{}.type", loc), "Input should be 'object'", "literal_error", other)),
+    }
+    (errors.len() == before).then(|| schema.clone())
+}
+
+/// python `CallToolResult` validation: `content` is a required list (its blocks are not checked)
+fn validate_call_result(result: &Value) -> Result<(), McpError> {
+    let mut errors = Vec::new();
+    match result {
+        Value::Object(fields) => match fields.get("content") {
+            None => errors.push(FieldError::missing("content", result)),
+            Some(Value::Array(_)) => {}
+            Some(other) => errors.push(FieldError::new("content", "Input should be a valid list", "list_type", other)),
+        },
+        other => errors.push(FieldError::new(
+            "",
+            "Input should be a valid dictionary or instance of CallToolResult",
+            "model_type",
+            other,
+        )),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(validation_failure("CallToolResult", &errors))
+    }
+}
+
+/// text python gives for a JSON array answer: the single-message JSON-RPC adapter rejects a batch
+fn batch_error(batch: &Value) -> String {
+    const MEMBERS: [&str; 4] = ["JSONRPCRequest", "JSONRPCNotification", "JSONRPCResponse", "JSONRPCError"];
+    let errors: Vec<FieldError> =
+        MEMBERS.iter().map(|member| FieldError::new(*member, "Input should be an object", "model_type", batch)).collect();
+    validation_text(&format!("union[{}]", MEMBERS.join(",")), &errors)
 }
 
 // ---------------------------------------------------------------------------
@@ -777,10 +1043,9 @@ impl HttpTransport {
         }
         if content_type.starts_with("application/json") {
             match resp.json::<Value>().await {
-                Ok(Value::Array(items)) => {
-                    for item in items {
-                        let _ = self.tx.send(item);
-                    }
+                // python validates the body as one JSON-RPC message: a batch array is a parse error
+                Ok(batch @ Value::Array(_)) => {
+                    reply_error(&self.tx, id, -32700, format!("Failed to parse JSON response: {}", batch_error(&batch)))
                 }
                 Ok(single) => {
                     let _ = self.tx.send(single);
@@ -1295,8 +1560,13 @@ async fn resync_tools(inner: &Inner, name: &str) {
     let Some(srv) = inner.server(name) else { return };
     let session = srv.session.lock().clone();
     let Some(session) = session else { return };
+    // python: list_tools raises on a malformed answer, and the old tools stay in place
     let listing = match session.request("tools/list", Value::Null).await {
-        Ok(listing) => listing,
+        Ok(listing) => parse_tool_listing(&listing),
+        Err(e) => Err(e),
+    };
+    let tools = match listing {
+        Ok(tools) => tools,
         Err(e) => {
             inner.log(&format!("could not list tools for '{}': {}", name, flatten_error(&e)));
             return;
@@ -1308,10 +1578,8 @@ async fn resync_tools(inner: &Inner, name: &str) {
     let was_active: BTreeSet<String> = channels.iter().flat_map(|ch| ch.tool_loader.active_names()).collect();
     inner.purge_server(name);
 
-    if let Some(Value::Array(tools)) = listing.get("tools") {
-        for tool in tools {
-            inject_tool(inner, name, &srv, tool, &was_active, &channels);
-        }
+    for tool in &tools {
+        inject_tool(inner, name, &srv, tool, &was_active, &channels);
     }
     srv.state.lock().tools.sort();
 
@@ -1326,24 +1594,20 @@ fn inject_tool(
     inner: &Inner,
     server: &str,
     srv: &Server,
-    tool: &Value,
+    tool: &RemoteTool,
     was_active: &BTreeSet<String>,
     channels: &[Arc<Channel>],
 ) {
-    let Some(remote) = tool.get("name").and_then(Value::as_str) else { return };
+    let remote = tool.name.as_str();
     let tool_name = unique_tool_name(&mut inner.used_names.lock(), server, remote);
-    let description = match tool.get("description").filter(|d| truthy(d)) {
-        Some(d) => py_str(d),
+    let description = match tool.description.as_deref().filter(|d| !d.is_empty()) {
+        Some(d) => d.to_string(),
         None => format!("MCP tool '{}' from server '{}'.", remote, server),
     };
-    // the server provides a ready-made JSON Schema for its input
-    let schema = match tool.get("inputSchema").filter(|s| truthy(s)) {
-        Some(s) => s.clone(),
-        None => json!({"type": "object", "properties": {}}),
-    };
+    // the server provides a ready-made JSON Schema for its input (validated: an object with type "object")
     let definition = json!({
         "type": "function",
-        "function": {"name": tool_name, "description": description, "parameters": schema},
+        "function": {"name": tool_name, "description": description, "parameters": tool.input_schema.clone()},
     });
 
     inner.dispatch.lock().insert(tool_name.clone(), Dispatch { server: server.to_string(), remote: remote.to_string() });
@@ -1474,7 +1738,11 @@ impl Mcp {
         let Some(session) = session else {
             return self.base.result(format!("MCP server '{}' is not connected. Check /mcp.", dispatch.server), false);
         };
-        match session.request("tools/call", json!({"name": dispatch.remote, "arguments": Value::Object(arguments)})).await {
+        let answer = session
+            .request("tools/call", json!({"name": dispatch.remote, "arguments": Value::Object(arguments)}))
+            .await
+            .and_then(|result| validate_call_result(&result).map(|()| result));
+        match answer {
             Ok(result) => {
                 let is_error = result.get("isError").map(truthy).unwrap_or(false);
                 self.base.result(call_result_text(&result), !is_error)
@@ -1822,5 +2090,77 @@ mod tests {
     async fn http_404_without_a_session_is_method_not_found() {
         let text = http_connect_error("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
         assert_eq!(text, "MCPError [-32601] Not Found");
+    }
+
+    #[test]
+    fn tool_listing_is_validated_like_the_sdk() {
+        let ok = parse_tool_listing(&json!({"tools": [{"name": "echo", "inputSchema": {"type": "object"}}]})).unwrap();
+        assert_eq!(
+            ok,
+            vec![RemoteTool { name: "echo".into(), description: None, input_schema: json!({"type": "object"}) }]
+        );
+        // a tool without a name fails the whole listing (python: list_tools raises)
+        let err = parse_tool_listing(&json!({"tools": [{"inputSchema": {"type": "object"}}]})).unwrap_err();
+        assert_eq!(
+            flatten_error(&err),
+            "ValidationError: 1 validation error for ListToolsResult\ntools.0.name\n  Field required [type=missing, input_value={'inputSchema': {'type': 'object'}}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.14/v/missing"
+        );
+        // an empty schema is not a valid InputSchema (type is required), so it is not replaced by a default
+        let err = parse_tool_listing(&json!({"tools": [{"name": "echo", "inputSchema": {}}]})).unwrap_err();
+        assert_eq!(
+            flatten_error(&err),
+            "ValidationError: 1 validation error for ListToolsResult\ntools.0.inputSchema.type\n  Field required [type=missing, input_value={}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.14/v/missing"
+        );
+        assert!(parse_tool_listing(&json!({})).is_err());
+    }
+
+    #[test]
+    fn call_answers_need_content_like_the_sdk() {
+        let err = validate_call_result(&json!({"isError": false})).unwrap_err();
+        assert_eq!(
+            flatten_error(&err),
+            "ValidationError: 1 validation error for CallToolResult\ncontent\n  Field required [type=missing, input_value={'isError': False}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.14/v/missing"
+        );
+        assert!(validate_call_result(&json!({"content": []})).is_ok());
+    }
+
+    #[test]
+    fn batch_answers_are_parse_errors() {
+        let line = "\n  Input should be an object [type=model_type, input_value=[{'jsonrpc': '2.0', 'id': 1, 'result': {}}], input_type=list]\n    For further information visit https://errors.pydantic.dev/2.14/v/model_type";
+        let expected = format!(
+            "4 validation errors for union[JSONRPCRequest,JSONRPCNotification,JSONRPCResponse,JSONRPCError]\nJSONRPCRequest{0}\nJSONRPCNotification{0}\nJSONRPCResponse{0}\nJSONRPCError{0}",
+            line
+        );
+        assert_eq!(batch_error(&json!([{"jsonrpc": "2.0", "id": 1, "result": {}}])), expected);
+    }
+
+    #[test]
+    fn scheme_relative_urls_name_the_server() {
+        assert_eq!(url_hostname("//mcp.example.com/mcp"), "mcp.example.com");
+        assert_eq!(derive_url_name("//mcp.example.com/mcp"), "example");
+        assert_eq!(url_hostname("https://x.test/a?u=http://evil.test"), "x.test");
+        assert_eq!(url_hostname("//x.test/a?u=http://evil.test"), "x.test");
+        assert_eq!(url_hostname("localhost:8000/mcp"), "");
+        assert_eq!(derive_url_name("localhost:8000/mcp"), "unnamed");
+    }
+
+    #[test]
+    fn dns_failures_carry_the_gaierror_text() {
+        assert_eq!(
+            gai_text("failed to lookup address information: Name or service not known").as_deref(),
+            Some("[Errno -2] Name or service not known")
+        );
+        assert_eq!(gai_text("some other io failure"), None);
+    }
+
+    #[tokio::test]
+    async fn read_timeouts_say_timed_out_like_httpx() {
+        // accepts the connection but never answers, so the client's read times out
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        let client = reqwest::Client::builder().timeout(Duration::from_millis(200)).build().expect("client");
+        let err = client.post(&url).send().await.err().expect("must time out");
+        assert_eq!(flatten_error(&http_error(&err)), "ReadTimeout: timed out");
+        drop(listener);
     }
 }
