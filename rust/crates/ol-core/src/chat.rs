@@ -111,7 +111,7 @@ impl Chat {
     // ------------------
 
     fn active_character(&self) -> Option<Value> {
-        self.get("metadata").and_then(|m| m.get("character").cloned()).filter(|v| truthy(v))
+        self.get("metadata").and_then(|m| m.get("character").cloned()).filter(truthy)
     }
 
     pub fn cached_system_prompt(&self) -> Option<String> {

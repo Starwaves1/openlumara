@@ -163,7 +163,7 @@ pub async fn process_input(ch: &Arc<Channel>, content: &str, authorized: bool) -
     if !content.starts_with(&prefix) {
         return Ok(None);
     }
-    let result = dispatch(ch, &cmd.to_lowercase().trim().to_string(), args).await;
+    let result = dispatch(ch, cmd.to_lowercase().trim(), args).await;
     let shown = result.clone().unwrap_or_else(|| "None".into());
     ch.chat.messages_add(&json!({"role": "assistant", "content": shown}), true, use_temporary).await;
     Ok(result)
@@ -379,7 +379,7 @@ fn fmt_thousands(n: i64) -> String {
     let s = n.abs().to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);

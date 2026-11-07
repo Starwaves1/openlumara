@@ -177,7 +177,7 @@ fn group_counts(chats: &[Value], tz: i64) -> Result<IndexMap<String, (i64, Strin
 /// None where python's `get_total_tokens` raises: its `int(chat_data.get(key, 0))` on a stored value python
 /// cannot int() (null, list, dict, a non-numeric string) fails before anything else is read
 async fn chat_with_details(ch: &Channel) -> Option<Value> {
-    if !["token_usage", "token_usage_mark"].iter().all(|key| ch.chat.get(key).map_or(true, |v| py_int(&v).is_some())) {
+    if !["token_usage", "token_usage_mark"].iter().all(|key| ch.chat.get(key).is_none_or(|v| py_int(&v).is_some())) {
         return None;
     }
     let mut chat = ch.chat.get_chat();
@@ -597,7 +597,7 @@ async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     // python: updated-descending unless sort=relevance (the BM25 order is kept then)
     let sort = obj.get("sort").filter(|v| truthy(v)).cloned().unwrap_or(json!("updated"));
     if sort != json!("relevance") {
-        results.sort_by(|a, b| updated_of(b).cmp(&updated_of(a)));
+        results.sort_by_key(|a| std::cmp::Reverse(updated_of(a)));
     }
 
     let mut projected = Vec::new();

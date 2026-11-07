@@ -237,7 +237,7 @@ pub fn py_utf8_decode(bytes: &[u8]) -> Result<String, String> {
             let (end, reason) = match e.error_len() {
                 Some(n) => {
                     // a lead byte that is valid on its own fails on the continuation byte after it
-                    let lead_ok = matches!(bytes[start], 0xC2..=0xDF | 0xE0..=0xEF | 0xF0..=0xF4);
+                    let lead_ok = matches!(bytes[start], 0xC2..=0xF4);
                     (start + n, if lead_ok { "invalid continuation byte" } else { "invalid start byte" })
                 }
                 None => (bytes.len(), "unexpected end of data"),

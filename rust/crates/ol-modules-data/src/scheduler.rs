@@ -381,7 +381,7 @@ pub fn ui_build_recur(mode: &str, duration: &str, time_str: &str, weekday: Optio
     }
     match weekday {
         Some(Value::String(s)) if s == "weekdays" => recur["weekdays_only"] = json!(true),
-        Some(w) if !w.is_null() && py_str(w) != "" => {
+        Some(w) if !w.is_null() && !py_str(w).is_empty() => {
             let wd = py_int(w).ok_or("invalid weekday")?;
             if !(0..=6).contains(&wd) {
                 return Err("weekday must be between 0 (Monday) and 6 (Sunday)");

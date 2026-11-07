@@ -399,7 +399,7 @@ impl Characters {
     /// searches for a character, case insensitive. python callers all test the result for truthiness
     /// (`if not char`), so the first match is a miss when its stored value is falsy (e.g. an empty dict)
     fn find_character(&self, name: &str) -> Option<Value> {
-        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v).filter(|v| truthy(v))
+        self.all().into_iter().find(|(k, _)| eq_ci_strip(k, name)).map(|(_, v)| v).filter(truthy)
     }
 
     /// searches for a character and returns the stored key with correct case
