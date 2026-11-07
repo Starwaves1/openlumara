@@ -216,6 +216,252 @@ pub fn eq_ci_strip(a: &str, b: &str) -> bool {
     py_strip(&a.to_lowercase()) == py_strip(&b.to_lowercase())
 }
 
+/// python's json decoder recurses; a container nested deeper than this fails with python's
+/// RecursionError text. python's real limit is its interpreter recursion limit, so the exact depth differs
+const MAX_JSON_DEPTH: usize = 1000;
+
+/// python `json.loads(text)` on a str: the same accepted documents, the same error positions (in
+/// characters) and the same `JSONDecodeError` text as CPython's scanner, returned as python's `str(e)`.
+/// python's NaN, Infinity, -Infinity and out-of-range numbers are read as `true`: they are truthy and
+/// not strings, and a non-dict top level is rejected for them as it is for `true`
+pub fn py_json_loads(text: &str) -> Result<Value, String> {
+    if text.starts_with('\u{feff}') {
+        return Err("Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)".into());
+    }
+    let doc: Vec<char> = text.chars().collect();
+    let scanner = JsonScanner { doc: &doc };
+    let start = scanner.ws(0);
+    let (value, end) = scanner.value(start, 0)?;
+    let end = scanner.ws(end);
+    if end != doc.len() {
+        return Err(decode_error(&doc, "Extra data", end));
+    }
+    Ok(value)
+}
+
+/// python `RecursionError` text for a container nested deeper than `MAX_JSON_DEPTH`
+fn recursion_error(kind: &str) -> String {
+    format!("maximum recursion depth exceeded while decoding a JSON {kind} from a unicode string")
+}
+
+fn decode_error(doc: &[char], msg: &str, pos: usize) -> String {
+    let lineno = doc[..pos].iter().filter(|&&c| c == '\n').count() + 1;
+    let colno = match doc[..pos].iter().rposition(|&c| c == '\n') {
+        Some(newline) => pos - newline,
+        None => pos + 1,
+    };
+    format!("{msg}: line {lineno} column {colno} (char {pos})")
+}
+
+/// recursive-descent mirror of CPython's `_json` scanner. every method takes the index of the
+/// first character it may consume and returns the index just past what it consumed
+struct JsonScanner<'a> {
+    doc: &'a [char],
+}
+
+impl JsonScanner<'_> {
+    fn ws(&self, mut i: usize) -> usize {
+        while matches!(self.doc.get(i), Some(' ' | '\t' | '\n' | '\r')) {
+            i += 1;
+        }
+        i
+    }
+
+    fn word(&self, i: usize, word: &str) -> bool {
+        word.chars().enumerate().all(|(k, c)| self.doc.get(i + k) == Some(&c))
+    }
+
+    /// a value python parses but `Value` cannot hold: a failure, or its stand-in, ending at `end`
+    fn python_only(&self, end: usize) -> Result<(Value, usize), String> {
+        Ok((Value::Bool(true), end))
+    }
+
+    fn value(&self, i: usize, depth: usize) -> Result<(Value, usize), String> {
+        match self.doc.get(i) {
+            Some('"') => {
+                let (text, end) = self.string(i + 1)?;
+                Ok((Value::String(text), end))
+            }
+            Some('{') => self.object(i + 1, depth + 1),
+            Some('[') => self.array(i + 1, depth + 1),
+            Some('n') if self.word(i, "null") => Ok((Value::Null, i + 4)),
+            Some('t') if self.word(i, "true") => Ok((Value::Bool(true), i + 4)),
+            Some('f') if self.word(i, "false") => Ok((Value::Bool(false), i + 5)),
+            Some('N') if self.word(i, "NaN") => self.python_only(i + 3),
+            Some('I') if self.word(i, "Infinity") => self.python_only(i + 8),
+            Some('-') if self.word(i, "-Infinity") => self.python_only(i + 9),
+            _ => self.number(i),
+        }
+    }
+
+    fn number(&self, start: usize) -> Result<(Value, usize), String> {
+        let d = self.doc;
+        let digits = |mut j: usize| {
+            while matches!(d.get(j), Some(c) if c.is_ascii_digit()) {
+                j += 1;
+            }
+            j
+        };
+        let mut j = start;
+        if d.get(j) == Some(&'-') {
+            j += 1;
+        }
+        match d.get(j) {
+            Some('0') => j += 1,
+            Some(c) if c.is_ascii_digit() => j = digits(j),
+            _ => return Err(decode_error(d, "Expecting value", start)),
+        }
+        let mut is_float = false;
+        if d.get(j) == Some(&'.') && matches!(d.get(j + 1), Some(c) if c.is_ascii_digit()) {
+            j = digits(j + 1);
+            is_float = true;
+        }
+        if matches!(d.get(j), Some('e' | 'E')) {
+            let mut k = j + 1;
+            if matches!(d.get(k), Some('+' | '-')) {
+                k += 1;
+            }
+            if matches!(d.get(k), Some(c) if c.is_ascii_digit()) {
+                j = digits(k);
+                is_float = true;
+            }
+        }
+        let text: String = d[start..j].iter().collect();
+        if is_float {
+            return match text.parse::<f64>().ok().and_then(serde_json::Number::from_f64) {
+                Some(n) => Ok((Value::Number(n), j)),
+                None => self.python_only(j),
+            };
+        }
+        match text.parse::<i64>().map(Value::from).or_else(|_| text.parse::<u64>().map(Value::from)) {
+            Ok(v) => Ok((v, j)),
+            Err(_) => self.python_only(j),
+        }
+    }
+
+    /// `start` is the index just past the opening quote
+    fn string(&self, start: usize) -> Result<(String, usize), String> {
+        let d = self.doc;
+        let begin = start - 1;
+        let mut out = String::new();
+        let mut i = start;
+        loop {
+            let mut j = i;
+            while let Some(&c) = d.get(j) {
+                if c == '"' || c == '\\' || (c as u32) < 0x20 {
+                    break;
+                }
+                j += 1;
+            }
+            out.extend(&d[i..j]);
+            match d.get(j) {
+                None => return Err(decode_error(d, "Unterminated string starting at", begin)),
+                Some('"') => return Ok((out, j + 1)),
+                Some('\\') => {}
+                Some(_) => return Err(decode_error(d, "Invalid control character at", j)),
+            }
+            // j is the backslash
+            let Some(&esc) = d.get(j + 1) else {
+                return Err(decode_error(d, "Unterminated string starting at", begin));
+            };
+            let plain = match esc {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'u' => {
+                    let (unit, next) = self.hex4(j + 1)?;
+                    i = next;
+                    let mut code = unit;
+                    // a high surrogate followed by an escaped low surrogate is one character
+                    if (0xD800..0xDC00).contains(&unit) && d.get(next) == Some(&'\\') && d.get(next + 1) == Some(&'u') {
+                        let (low, after) = self.hex4(next + 1)?;
+                        if (0xDC00..0xE000).contains(&low) {
+                            code = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                            i = after;
+                        }
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                    continue;
+                }
+                _ => return Err(decode_error(d, "Invalid \\escape", j)),
+            };
+            out.push(plain);
+            i = j + 2;
+        }
+    }
+
+    /// the four hex digits of a `\u` escape whose `u` is at `u_at`; returns the code unit and the
+    /// index just past the digits
+    fn hex4(&self, u_at: usize) -> Result<(u32, usize), String> {
+        let unit = (1..=4).try_fold(0u32, |acc, k| {
+            self.doc.get(u_at + k).and_then(|c| c.to_digit(16)).map(|v| acc * 16 + v)
+        });
+        match unit {
+            Some(unit) => Ok((unit, u_at + 5)),
+            None => Err(decode_error(self.doc, "Invalid \\uXXXX escape", u_at)),
+        }
+    }
+
+    /// `start` is the index just past the `{`
+    fn object(&self, start: usize, depth: usize) -> Result<(Value, usize), String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(recursion_error("object"));
+        }
+        let d = self.doc;
+        let mut map = Map::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&'}') {
+            return Ok((Value::Object(map), i + 1));
+        }
+        loop {
+            if d.get(i) != Some(&'"') {
+                return Err(decode_error(d, "Expecting property name enclosed in double quotes", i));
+            }
+            let (key, after_key) = self.string(i + 1)?;
+            let colon = self.ws(after_key);
+            if d.get(colon) != Some(&':') {
+                return Err(decode_error(d, "Expecting ':' delimiter", colon));
+            }
+            let (value, after_value) = self.value(self.ws(colon + 1), depth)?;
+            map.insert(key, value);
+            let next = self.ws(after_value);
+            match d.get(next) {
+                Some('}') => return Ok((Value::Object(map), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
+    }
+
+    /// `start` is the index just past the `[`
+    fn array(&self, start: usize, depth: usize) -> Result<(Value, usize), String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(recursion_error("array"));
+        }
+        let d = self.doc;
+        let mut items = Vec::new();
+        let mut i = self.ws(start);
+        if d.get(i) == Some(&']') {
+            return Ok((Value::Array(items), i + 1));
+        }
+        loop {
+            let (item, after_item) = self.value(i, depth)?;
+            items.push(item);
+            let next = self.ws(after_item);
+            match d.get(next) {
+                Some(']') => return Ok((Value::Array(items), next + 1)),
+                Some(',') => i = self.ws(next + 1),
+                _ => return Err(decode_error(d, "Expecting ',' delimiter", next)),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@
 #[path = "../../../generated/modules/characters.rs"]
 pub mod meta;
 
-use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_strip, py_type};
+use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_json_loads, py_strip, py_type};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -34,12 +34,18 @@ fn or_value(v: Option<&Value>, fallback: Value) -> Value {
 
 /// converts a character of any supported format into openlumara's flat internal format
 pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
-    let char_obj = ch.as_object()?;
+    normalize_card(stored_key, ch).ok().flatten()
+}
+
+/// python `_normalize_character`. the error is the TypeError python raises when a truthy non-str
+/// profile is concatenated with the personality or example-conversation text
+pub fn normalize_card(stored_key: &str, ch: &Value) -> Result<Option<Value>, String> {
+    let Some(char_obj) = ch.as_object() else { return Ok(None) };
     let empty = json!("");
     let empty_list = json!([]);
     if char_obj.contains_key("profile") {
         // already internal format; just make sure every field exists
-        return Some(json!({
+        return Ok(Some(json!({
             "name": or_value(char_obj.get("name"), json!(stored_key)),
             "profile": get_or(char_obj, "profile", &empty),
             "scenario": get_or(char_obj, "scenario", &empty),
@@ -47,10 +53,10 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
             "post_history": get_or(char_obj, "post_history", &empty),
             "category": char_obj.get("category").cloned().unwrap_or(Value::Null),
             "tags": get_or(char_obj, "tags", &empty_list),
-        }));
+        })));
     }
     // character card V2 wraps everything in a data field, V1 is flat
-    let card = char_obj.get("data").unwrap_or(ch).as_object()?;
+    let Some(card) = char_obj.get("data").unwrap_or(ch).as_object() else { return Ok(None) };
     let name = or_value(card.get("name"), json!(stored_key));
     let mut profile = card.get("description").cloned().unwrap_or(json!(""));
     if !truthy(&profile) {
@@ -58,7 +64,7 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
         profile = char_obj.get("identity").cloned().unwrap_or(json!(""));
     }
     if !truthy(&profile) {
-        return None;
+        return Ok(None);
     }
     // fold personality and example conversations into the profile
     let mut extras = Vec::new();
@@ -69,7 +75,16 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
         extras.push(format!("Example conversation:\n{}", py_str(m)));
     }
     if !extras.is_empty() {
-        profile = json!(format!("{}\n\n{}", py_str(&profile), extras.join("\n\n")));
+        // python `profile + "\n\n"`: only a str concatenates
+        let Value::String(text) = &profile else {
+            let t = py_type(&profile);
+            return Err(if t == "list" {
+                "can only concatenate list (not \"str\") to list".to_string()
+            } else {
+                format!("unsupported operand type(s) for +: '{}' and 'str'", t)
+            });
+        };
+        profile = json!(format!("{}\n\n{}", text, extras.join("\n\n")));
     }
     let first_message = match card.get("first_mes") {
         Some(v) => v.clone(),
@@ -79,7 +94,7 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
         Some(v) => v.clone(),
         None => char_obj.get("tags").cloned().unwrap_or(json!([])),
     };
-    Some(json!({
+    Ok(Some(json!({
         "name": name,
         "profile": profile,
         "scenario": get_or(card, "scenario", &empty),
@@ -87,7 +102,7 @@ pub fn normalize_character(stored_key: &str, ch: &Value) -> Option<Value> {
         "post_history": get_or(card, "post_history_instructions", &empty),
         "category": char_obj.get("category").cloned().unwrap_or(Value::Null),
         "tags": tags,
-    }))
+    })))
 }
 
 /// extracts an embedded character card from a png's tEXt/iTXt metadata chunks
@@ -664,20 +679,31 @@ impl Characters {
     }
 
     pub async fn import_json(&self, json_code: &str) -> anyhow::Result<Value> {
-        let obj: Value = match serde_json::from_str(json_code) {
+        let obj: Value = match py_json_loads(json_code) {
             Ok(v) => v,
-            Err(e) => return Ok(self.base.result(format!("error: {}", ol_core::detail_error(&e)), false)),
+            Err(e) => return Ok(self.base.result(format!("error: {}", e), false)),
         };
         if !obj.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
             return Ok(self.base.result("error: character card was empty", false));
         }
-        let normalized = normalize_character("", &obj)
+        let normalized = normalize_card("", &obj).map_err(anyhow::Error::msg)?;
+        let normalized = normalized
             .filter(|n| n.get("name").map(truthy).unwrap_or(false) && n.get("profile").map(truthy).unwrap_or(false));
         let Some(normalized) = normalized else {
             return Ok(self.base.result("error: failed to extract a usable name and profile from this character card", false));
         };
-        let nname = py_str(&normalized["name"]);
-        let key = self.find_char_name(&nname).unwrap_or(nname);
+        // python `existing_name = self._find_char_name(name)`; `name = existing_name or normalized name`
+        let key = match normalized["name"].clone() {
+            Value::String(card_name) => self.find_char_name(&card_name).filter(|k| !k.is_empty()).unwrap_or(card_name),
+            other => {
+                // python's lookup calls `.lower()` on the name for every stored key, so a non-str name
+                // raises once any character is stored; with an empty store it is stored under its text
+                if !self.all().is_empty() {
+                    anyhow::bail!("'{}' object has no attribute 'lower'", py_type(&other));
+                }
+                py_str(&other)
+            }
+        };
         self.with_chars(|c| {
             c.data.insert(key, normalized);
             c.save()
@@ -740,26 +766,29 @@ impl Characters {
     /// python `_route_all`: a stored value that is not a dict raises at `.get`, and the sort key
     /// `c["name"].lower()` raises for a non-str name
     fn route_all(&self) -> anyhow::Result<Value> {
-        let mut chars: Vec<(String, Value)> = Vec::new();
+        // python builds every entry first (`.get` raises for a non-dict), and only then sorts
+        let mut built: Vec<(Value, Value)> = Vec::new();
         for (key, ch) in self.all() {
             if !ch.is_object() {
                 anyhow::bail!("'{}' object has no attribute 'get'", py_type(&ch));
             }
             let name = or_value(ch.get("name"), json!(key));
-            let sort_key = str_for_lower(&name)?.to_lowercase();
-            chars.push((
-                sort_key,
-                json!({
-                    "key": key,
-                    "name": name,
-                    "profile": ch.get("profile").cloned().unwrap_or(json!("")),
-                    "scenario": ch.get("scenario").cloned().unwrap_or(json!("")),
-                    "first_message": ch.get("first_message").cloned().unwrap_or(json!("")),
-                    "post_history": ch.get("post_history").cloned().unwrap_or(json!("")),
-                    "category": or_value(ch.get("category"), json!("")),
-                    "tags": or_value(ch.get("tags"), json!([])),
-                }),
-            ));
+            let entry = json!({
+                "key": key,
+                "name": name.clone(),
+                "profile": ch.get("profile").cloned().unwrap_or(json!("")),
+                "scenario": ch.get("scenario").cloned().unwrap_or(json!("")),
+                "first_message": ch.get("first_message").cloned().unwrap_or(json!("")),
+                "post_history": ch.get("post_history").cloned().unwrap_or(json!("")),
+                "category": or_value(ch.get("category"), json!("")),
+                "tags": or_value(ch.get("tags"), json!([])),
+            });
+            built.push((name, entry));
+        }
+        // the sort key `c["name"].lower()` is computed for every entry, in order, after the build
+        let mut chars: Vec<(String, Value)> = Vec::with_capacity(built.len());
+        for (name, entry) in built {
+            chars.push((str_for_lower(&name)?.to_lowercase(), entry));
         }
         // python list.sort is stable, and sort_by is too
         chars.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1354,5 +1383,37 @@ mod tests {
         assert_eq!(current_route_value(Some(json!({}))).unwrap(), Value::Null);
         assert_eq!(current_route_value(None).unwrap_err().to_string(), "'NoneType' object has no attribute 'get'");
         assert_eq!(current_route_value(Some(json!("x"))).unwrap_err().to_string(), "'str' object has no attribute 'get'");
+    }
+
+    #[test]
+    fn import_json_errors_are_python_json_decode_errors() {
+        // python json.loads texts, shown in the import modal as `error: <text>`
+        assert_eq!(py_json_loads("").unwrap_err(), "Expecting value: line 1 column 1 (char 0)");
+        assert_eq!(py_json_loads("{bad").unwrap_err(), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
+        assert_eq!(py_json_loads("{} x").unwrap_err(), "Extra data: line 1 column 4 (char 3)");
+        assert_eq!(py_json_loads("\u{feff}{}").unwrap_err(), "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)");
+    }
+
+    #[test]
+    fn python_json_accepts_nan_and_infinity() {
+        // python reads these as floats: a top-level NaN is a non-dict card, and a nested one is kept
+        assert_eq!(py_json_loads("NaN").unwrap(), json!(true));
+        assert_eq!(py_json_loads("{\"a\": -Infinity, \"b\": 1e400}").unwrap(), json!({"a": true, "b": true}));
+    }
+
+    #[test]
+    fn non_str_profile_with_extras_is_a_python_type_error() {
+        // python `profile + "\n\n"` on an int profile raises; a str profile folds the extras in
+        let card = |profile: Value| json!({"data": {"name": "Ann", "description": profile, "personality": "kind"}});
+        assert_eq!(
+            normalize_card("", &card(json!(5))).unwrap_err(),
+            "unsupported operand type(s) for +: 'int' and 'str'"
+        );
+        assert_eq!(normalize_card("", &card(json!([1]))).unwrap_err(), "can only concatenate list (not \"str\") to list");
+        let ok = normalize_card("", &card(json!("A pirate"))).unwrap().unwrap();
+        assert_eq!(ok["profile"], json!("A pirate\n\nPersonality: kind"));
+        // without personality or example text the non-str profile is stored as it is
+        let plain = normalize_card("", &json!({"data": {"name": "Ann", "description": 5}})).unwrap().unwrap();
+        assert_eq!(plain["profile"], json!(5));
     }
 }
