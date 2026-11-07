@@ -10,7 +10,7 @@ use crate::listing::{
 };
 use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
-use crate::util::{get_strip, or_strip, py_int, py_int_str, py_slice, py_strip, py_type_name};
+use crate::util::{export_chat_text, get_strip, or_strip, py_int, py_int_str, py_slice, py_strip, py_type_name};
 use crate::ws::{op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -285,7 +285,7 @@ async fn stream_state(State(app): State<Arc<Shared>>) -> Response {
 
 async fn chat_export(State(app): State<Arc<Shared>>) -> Response {
     let Some(ch) = app.ch() else { return internal_error() };
-    let Ok(content) = ch.chat.export().await else { return internal_error() };
+    let Ok(content) = export_chat_text(&ch.chat) else { return internal_error() };
     // python `chat.get("title") or ""` fed to re.sub: a truthy non-string title raises TypeError
     let title = match ch.chat.get("title") {
         Some(v) if truthy(&v) => match v {

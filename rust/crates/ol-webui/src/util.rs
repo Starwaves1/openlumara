@@ -1,9 +1,12 @@
 //! small python-semantics helpers used by the webui port
 
-use ol_core::pyjson::truthy;
+use ol_core::chat::Chat;
+use ol_core::lenient_json::repair_loads;
+use ol_core::pyjson::{char_len, py_str, py_str_opt, take_chars, truthy};
+use ol_core::turns::group_history;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 /// python `type(x).__name__` for json values (used in python-style error strings)
 pub fn py_type_name(v: &Value) -> &'static str {
@@ -274,10 +277,205 @@ pub fn channel_url(host: Option<&str>, port: impl std::fmt::Display) -> String {
     format!("http://{}:{}", host.unwrap_or("None"), port)
 }
 
+const TOOL_CALL_FALLBACK: &str = "🔧 Calling tool...";
+
+/// python `ToolcallManager.display_call` (core/toolcalls.py). Everything python raises inside its
+/// try block (tool data that is not a dict, a `function` that is not a dict, arguments that repair
+/// to a non-dict) returns the generic fallback string. ol-core's display_call differs on those
+/// inputs, so the chat export formats tool calls through this function.
+pub fn display_call(tool_data: &Value) -> String {
+    let Some(function) = tool_data.get("function") else {
+        return TOOL_CALL_FALLBACK.into();
+    };
+    let Some(function) = function.as_object() else {
+        return TOOL_CALL_FALLBACK.into();
+    };
+    let func_name = function.get("name").map(py_str).unwrap_or_else(|| "unknown".into());
+    let raw_args = function.get("arguments").cloned().unwrap_or_else(|| json!("{}"));
+    let args: Map<String, Value> = match raw_args {
+        Value::String(s) => match repair_loads(&s) {
+            Value::Object(m) => m,
+            _ => return TOOL_CALL_FALLBACK.into(),
+        },
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    let arg_strs: Vec<String> = args
+        .iter()
+        .map(|(key, value)| {
+            let mut value_str = py_str(value);
+            if char_len(&value_str) > 30 {
+                value_str = format!("{}..", take_chars(&value_str, 30));
+            }
+            format!("{}=\"{}\"", key, value_str.replace('"', "'"))
+        })
+        .collect();
+    format!("🔧 {}({})", func_name, arg_strs.join(", "))
+}
+
+/// python `ChatStore.export` (core/chat.py) over the current chat. The Err string is the python
+/// exception message; the route turns any Err into a 500, as starlette does for the raised error.
+pub fn export_chat_text(chat: &Chat) -> Result<String, String> {
+    if chat.current().is_none() {
+        return Err("No chat is currently loaded!".into());
+    }
+    export_turns_text(&group_history(&chat.messages_get()))
+}
+
+/// the formatting half of python `ChatStore.export`, over already grouped turns
+pub fn export_turns_text(turns: &[Value]) -> Result<String, String> {
+    let mut turn_export: Vec<String> = Vec::new();
+    for turn in turns {
+        let mut turn_lines = vec![format!("--- {} ---", py_str_opt(turn.get("role")))];
+        let messages = turn
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "turn messages is not a list".to_string())?;
+
+        // (kind, text) pairs in order; kind is "content" or "tool"
+        let mut items: Vec<(&str, String)> = Vec::new();
+        for message in messages {
+            let Some(message) = message.as_object() else {
+                return Err("message object has no attribute 'get'".into());
+            };
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            let toolcalls = message.get("tool_calls").filter(|t| truthy(t));
+
+            if let Some(content) = message.get("content").filter(|c| truthy(c)) {
+                if role != "tool" && toolcalls.is_none() {
+                    match content {
+                        Value::String(s) => items.push(("content", py_strip(s).to_string())),
+                        Value::Array(parts) => {
+                            for part in parts {
+                                let Some(part) = part.as_object() else {
+                                    return Err("content part object has no attribute 'get'".into());
+                                };
+                                if part.get("type").and_then(Value::as_str) == Some("text") {
+                                    // python `part.get('text').strip()`: a missing or non-str text raises
+                                    let text = part
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(|| "'NoneType' object has no attribute 'strip'".to_string())?;
+                                    items.push(("content", py_strip(text).to_string()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some(toolcalls) = toolcalls {
+                match toolcalls {
+                    Value::Array(calls) => items.extend(calls.iter().map(|tc| ("tool", display_call(tc)))),
+                    // python iterates a truthy dict (its keys) or string (its characters); each item is a str,
+                    // which display_call never reads as a tool call
+                    Value::Object(map) => items.extend(map.keys().map(|_| ("tool", TOOL_CALL_FALLBACK.to_string()))),
+                    Value::String(s) => items.extend(s.chars().map(|_| ("tool", TOOL_CALL_FALLBACK.to_string()))),
+                    _ => return Err("tool_calls value is not iterable".into()),
+                }
+            }
+        }
+
+        // group consecutive items of one kind into blocks
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+        let mut current_kind: Option<&str> = None;
+        for (kind, text) in items {
+            if current_kind != Some(kind) {
+                blocks.push(Vec::new());
+                current_kind = Some(kind);
+            }
+            if let Some(block) = blocks.last_mut() {
+                block.push(text);
+            }
+        }
+
+        // blocks join with a blank line, items within a block with a single newline
+        let formatted: Vec<String> = blocks.iter().map(|b| b.join("\n")).collect();
+        turn_lines.push(formatted.join("\n\n"));
+        turn_export.push(turn_lines.join("\n"));
+    }
+    Ok(turn_export.join("\n\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn display_call_matches_python_format() {
+        let call = json!({"function": {"name": "web_search", "arguments": "{\"q\": \"rust \\\"nightly\\\"\", \"n\": 3}"}});
+        assert_eq!(display_call(&call), "🔧 web_search(q=\"rust 'nightly'\", n=\"3\")");
+        // arguments longer than 30 chars are cut to 30 and suffixed with '..'
+        let long = json!({"function": {"name": "f", "arguments": {"text": "x".repeat(40)}}});
+        assert_eq!(display_call(&long), format!("🔧 f(text=\"{}..\")", "x".repeat(30)));
+        // missing name is 'unknown', a null name renders as python None
+        assert_eq!(display_call(&json!({"function": {}})), "🔧 unknown()");
+        assert_eq!(display_call(&json!({"function": {"name": null}})), "🔧 None()");
+    }
+
+    #[test]
+    fn display_call_falls_back_where_python_raises() {
+        // python: tool_data['function'].get raises on null, lists, strings
+        assert_eq!(display_call(&json!({"function": null})), "🔧 Calling tool...");
+        assert_eq!(display_call(&json!({"function": ["x"]})), "🔧 Calling tool...");
+        assert_eq!(display_call(&json!({"name": "no function key"})), "🔧 Calling tool...");
+        assert_eq!(display_call(&json!("plain string")), "🔧 Calling tool...");
+        // python: a string argument that repairs to a non-dict hits args_dict.items()
+        assert_eq!(display_call(&json!({"function": {"name": "f", "arguments": "[1, 2]"}})), "🔧 Calling tool...");
+        assert_eq!(display_call(&json!({"function": {"name": "f", "arguments": "\"s\""}})), "🔧 Calling tool...");
+        // non-string, non-dict arguments are an empty dict, not a failure
+        assert_eq!(display_call(&json!({"function": {"name": "f", "arguments": null}})), "🔧 f()");
+    }
+
+    #[test]
+    fn export_strips_like_python_including_separators() {
+        let turns = vec![json!({
+            "role": "assistant",
+            "messages": [
+                {"role": "assistant", "content": "\u{1c}hi there\u{1f}"},
+                {"role": "assistant", "content": [{"type": "text", "text": "\u{1d}part\u{1e}"}]}
+            ]
+        })];
+        assert_eq!(export_turns_text(&turns).unwrap(), "--- assistant ---\nhi there\npart");
+    }
+
+    #[test]
+    fn export_text_part_without_text_is_an_error() {
+        let missing = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "content": [{"type": "text"}]}
+        ]})];
+        assert!(export_turns_text(&missing).is_err());
+        let null_text = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": null}]}
+        ]})];
+        assert!(export_turns_text(&null_text).is_err());
+    }
+
+    #[test]
+    fn export_tool_calls_follow_python_iteration() {
+        // a list is one display line per call
+        let list = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": {"a": 1}}}]}
+        ]})];
+        assert_eq!(export_turns_text(&list).unwrap(), "--- assistant ---\n🔧 f(a=\"1\")");
+        // a truthy dict or string is iterated: one generic line per key or character, and it
+        // suppresses the message content as a tool call does
+        let dict = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "content": "ignored", "tool_calls": {"a": 1, "b": 2}}
+        ]})];
+        assert_eq!(export_turns_text(&dict).unwrap(), "--- assistant ---\n🔧 Calling tool...\n🔧 Calling tool...");
+        let string = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "tool_calls": "ab"}
+        ]})];
+        assert_eq!(export_turns_text(&string).unwrap(), "--- assistant ---\n🔧 Calling tool...\n🔧 Calling tool...");
+        // a truthy number is not iterable: python raises
+        let number = vec![json!({"role": "assistant", "messages": [
+            {"role": "assistant", "tool_calls": 5}
+        ]})];
+        assert!(export_turns_text(&number).is_err());
+    }
 
     #[test]
     fn ints() {
