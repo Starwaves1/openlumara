@@ -110,7 +110,30 @@ pub fn urljoin(base: &str, url: &str) -> Result<String, String> {
 /// `JSONDecodeError` message (`"Expecting value: line 1 column 1 (char 0)"`). A text CPython
 /// accepts but serde rejects (NaN, Infinity, lone surrogates) keeps serde's own text.
 pub fn py_json_loads(text: &str) -> Result<serde_json::Value, String> {
-    serde_json::from_str(text).map_err(|e| py_json_error(text).unwrap_or_else(|| e.to_string()))
+    serde_json::from_str(text).map_err(|e| py_json_error(text).or_else(|| py_json_nonfinite(text)).unwrap_or_else(|| e.to_string()))
+}
+
+/// NaN / Infinity (and numbers past f64 range, which python reads as inf) are an error, not Value::Null: every
+/// py_json_loads caller would observably differ (bing_images.rs:59 and results.rs:356 name the type in
+/// `'float' object has no attribute 'get'`, and a NaN title or result is dumped as NaN, not null)
+fn py_json_nonfinite(text: &str) -> Option<String> {
+    fn first_nonfinite(v: &PyJson) -> Option<f64> {
+        match v {
+            PyJson::Float(f) if !f.is_finite() => Some(*f),
+            PyJson::List(items) => items.iter().find_map(first_nonfinite),
+            PyJson::Dict(entries) => entries.iter().find_map(|(_, v)| first_nonfinite(v)),
+            _ => None,
+        }
+    }
+    let f = first_nonfinite(&json_loads(text)?)?;
+    let name = if f.is_nan() {
+        "NaN"
+    } else if f > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    Some(format!("json.loads value {name} is not supported: python accepts it, this port cannot represent it"))
 }
 
 /// CPython's `JSONDecodeError` text for `text`, or None when CPython's decoder accepts it.
@@ -763,8 +786,37 @@ pub fn py_int(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
+static UNICODE_DECIMAL: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\p{Nd}$").unwrap());
+
+/// python `str.isspace()` for one code point: `char::is_whitespace` plus U+001C-U+001F
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// value of a decimal digit (category Nd) as python's int() reads it. unicode lays each run of ten digits
+/// out as 0..=9 in order, so the value is the length of the Nd run before the char, modulo ten
+fn decimal_value(c: char) -> Option<u32> {
+    if c.is_ascii_digit() {
+        return Some(c as u32 - '0' as u32);
+    }
+    let is_nd = |c: char| UNICODE_DECIMAL.is_match(c.encode_utf8(&mut [0; 4]));
+    if !is_nd(c) {
+        return None;
+    }
+    let mut run = 0u32;
+    let mut cp = c as u32;
+    while let Some(prev) = cp.checked_sub(1).and_then(char::from_u32).filter(|p| is_nd(*p)) {
+        run += 1;
+        cp = prev as u32;
+    }
+    Some(run % 10)
+}
+
+/// python `int(str)`: python whitespace stripped, an optional sign, unicode decimal digits (category Nd only)
+/// with single underscores between them
 fn py_int_str(s: &str) -> Option<i64> {
-    let t = s.trim();
+    let t = s.trim_matches(is_py_space);
     let (negative, digits) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
         Some(b'+') => (false, &t[1..]),
@@ -777,8 +829,7 @@ fn py_int_str(s: &str) -> Option<i64> {
     const LIMIT: i128 = i64::MAX as i128 + 1;
     let mut value: i128 = 0;
     for c in digits.chars().filter(|c| *c != '_') {
-        // ASCII digits only; python also accepts other unicode decimal digits
-        let d = c.to_digit(10)? as i128;
+        let d = decimal_value(c)? as i128;
         value = (value * 10 + d).min(LIMIT);
     }
     let signed = if negative { -value } else { value };
@@ -955,6 +1006,38 @@ mod tests {
         assert_eq!(msg("{\n\"a\" 1}"), "Expecting ':' delimiter: line 2 column 5 (char 6)");
         assert_eq!(msg("{1:2}"), "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)");
         assert_eq!(py_json_loads("[1, {\"k\": null}]").unwrap()[1]["k"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn py_int_takes_unicode_decimal_digits_like_python_int() {
+        use serde_json::json;
+        // python: int('١٢') == 12, int('٣_٤') == 34, int(' １２ ') == 12
+        assert_eq!(py_int(&json!("\u{661}\u{662}")), Some(12));
+        assert_eq!(py_int(&json!("\u{663}_\u{664}")), Some(34));
+        assert_eq!(py_int(&json!(" \u{ff11}\u{ff12} ")), Some(12));
+        assert_eq!(py_int(&json!("-\u{661}")), Some(-1));
+        // python: int('\x1c7\x1f') == 7, the \x1c-\x1f separators are str.isspace()
+        assert_eq!(py_int(&json!("\u{1c}7\u{1f}")), Some(7));
+        // not category Nd: vulgar fraction and superscript are rejected by int()
+        assert_eq!(py_int(&json!("\u{bd}")), None);
+        assert_eq!(py_int(&json!("\u{b2}")), None);
+        // underscores only between digits
+        assert_eq!(py_int(&json!("1__0")), None);
+        assert_eq!(py_int(&json!("_1")), None);
+        assert_eq!(py_int(&json!("1_")), None);
+        assert_eq!(py_int(&json!("")), None);
+    }
+
+    #[test]
+    fn py_json_loads_rejects_nonfinite_constants_instead_of_nulling_them() {
+        // python: json.loads('[NaN]') == [nan], json.loads('-Infinity') == -inf; a Value cannot hold them
+        assert_eq!(py_json_loads("NaN").unwrap_err(), "json.loads value NaN is not supported: python accepts it, this port cannot represent it");
+        assert_eq!(py_json_loads("[1, Infinity]").unwrap_err(), "json.loads value Infinity is not supported: python accepts it, this port cannot represent it");
+        assert_eq!(py_json_loads("{\"a\": -Infinity}").unwrap_err(), "json.loads value -Infinity is not supported: python accepts it, this port cannot represent it");
+        // python: json.loads('1e400') == inf
+        assert!(py_json_loads("[1e400]").unwrap_err().contains("Infinity"));
+        // python rejections keep python's own text
+        assert_eq!(py_json_loads("[NaN").unwrap_err(), "Expecting ',' delimiter: line 1 column 5 (char 4)");
     }
 
     #[test]
