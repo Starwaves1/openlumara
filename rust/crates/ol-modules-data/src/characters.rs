@@ -279,6 +279,34 @@ fn category_key(v: &Value) -> String {
     }
 }
 
+/// python dict key rendering in json.dumps: a bool is `true`/`false`, anything else is its str()
+fn json_key_text(v: &Value) -> String {
+    match v {
+        Value::Bool(true) => "true".into(),
+        Value::Bool(false) => "false".into(),
+        other => py_str(other),
+    }
+}
+
+/// python `_route_chats_count`: `counts[char] = counts.get(char, 0) + 1` for each truthy character. The dict
+/// key is the stored value itself, so True, 1 and 1.0 share one entry, and the first stored value decides how
+/// the key is rendered
+fn chats_count_from(characters: Vec<Value>) -> anyhow::Result<Value> {
+    let mut counts: IndexMap<String, (String, i64)> = IndexMap::new();
+    for c in characters {
+        if !truthy(&c) {
+            continue;
+        }
+        // python uses the stored value as a dict key: a list or dict is unhashable
+        if matches!(c, Value::Array(_) | Value::Object(_)) {
+            anyhow::bail!("unhashable type: '{}'", py_type(&c));
+        }
+        counts.entry(category_key(&c)).or_insert_with(|| (json_key_text(&c), 0)).1 += 1;
+    }
+    let out: IndexMap<String, i64> = counts.into_values().collect();
+    Ok(json!(out))
+}
+
 /// python `name.lower()`: only a str has the method, so a truthy non-str receiver raises AttributeError
 fn str_for_lower(v: &Value) -> anyhow::Result<&str> {
     match v {
@@ -709,7 +737,8 @@ impl Characters {
     pub async fn import_json(&self, json_code: &str) -> anyhow::Result<Value> {
         let obj: Value = match py_json_loads(json_code) {
             Ok(v) => v,
-            Err(e) => return Ok(self.base.result(format!("error: {}", e), false)),
+            // python import_json: `core.detail_error(e)`
+            Err(e) => return Ok(self.base.result(format!("error: {}", ol_core::detail_error(&e)), false)),
         };
         if !obj.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
             return Ok(self.base.result("error: character card was empty", false));
@@ -949,13 +978,13 @@ impl Characters {
             let decoded = b64decode_text(&data_b64).and_then(|b| py_utf8_decode(&b));
             return match decoded {
                 Ok(code) => self.import_json(&code).await,
-                Err(e) => Ok(self.base.result(format!("error: could not decode file: {}", e), false)),
+                Err(e) => Ok(self.base.result(format!("error: could not decode file: {}", ol_core::detail_error(&e)), false)),
             };
         }
         if lower.ends_with(".png") {
             let raw = match b64decode_text(&data_b64) {
                 Ok(r) => r,
-                Err(e) => return Ok(self.base.result(format!("error: could not decode file: {}", e), false)),
+                Err(e) => return Ok(self.base.result(format!("error: could not decode file: {}", ol_core::detail_error(&e)), false)),
             };
             // python `if not card:` is false for an empty dict too
             let Some(card) = extract_card_from_png(&raw).filter(|c| !c.is_empty()) else {
@@ -1013,18 +1042,8 @@ impl Characters {
 
     fn route_chats_count(&self) -> anyhow::Result<Value> {
         let ch = self.channel()?;
-        let mut counts: IndexMap<String, i64> = IndexMap::new();
-        for chat in ch.chat.get_all() {
-            let c = Self::chat_character(&chat)?;
-            if truthy(&c) {
-                // python uses the stored value as a dict key: a list or dict is unhashable
-                if matches!(c, Value::Array(_) | Value::Object(_)) {
-                    anyhow::bail!("unhashable type: '{}'", py_type(&c));
-                }
-                *counts.entry(py_str(&c)).or_insert(0) += 1;
-            }
-        }
-        Ok(json!(counts))
+        let characters = ch.chat.get_all().iter().map(Self::chat_character).collect::<anyhow::Result<Vec<_>>>()?;
+        chats_count_from(characters)
     }
 
     /// python `self._find_char_name(name) or char.get("name")`: the canonical stored key, or the card's name
@@ -1071,9 +1090,20 @@ impl Characters {
             return Ok(self.base.result("character not found", false));
         };
         let key = self.canonical_char_name(&name, &ch);
-        let category = self.base.config.get1("category").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "general".into());
+        // python `self.config.get("category") or "general"` is passed to chat.new() unchanged
+        let category = self.base.config.get1("category").filter(truthy).unwrap_or_else(|| json!("general"));
         let channel = self.channel()?;
-        let id = channel.chat.new_chat(&category, "New chat", Some(json!({"character": key}))).await;
+        // ol-core's new_chat takes a &str, so a non-str category is stored by replacing the fresh chat's field
+        let category_text = py_str(&category);
+        let id = channel.chat.new_chat(&category_text, "New chat", Some(json!({"character": key}))).await;
+        if !category.is_string() {
+            channel.chat.with_data_mut(|d| {
+                if let Some(chat) = d.iter_mut().find(|c| c["id"].as_str() == Some(id.as_str())) {
+                    chat["category"] = category;
+                }
+            });
+            channel.chat.save_index();
+        }
         Ok(json!({"id": id}))
     }
 }
@@ -1531,5 +1561,22 @@ mod tests {
         assert!(dict_body(&Some(json!([]))).is_ok());
         assert!(dict_body(&None).is_ok());
         assert_eq!(dict_body(&Some(json!(["x"]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
+    }
+
+    #[test]
+    fn chats_count_merges_python_equal_keys() {
+        // python: counts[True], counts[1], counts[1.0] are one dict entry keyed by the first stored value,
+        // which json.dumps renders as "true"; a str "a" is its own key; falsy characters are skipped
+        let counts = chats_count_from(vec![json!(true), json!(1), json!(1.0), json!("a"), json!(""), json!(null)]).unwrap();
+        assert_eq!(counts, json!({"true": 3, "a": 1}));
+    }
+
+    #[test]
+    fn chats_count_keeps_the_first_stored_spelling() {
+        // python keeps the first key object: 1.0 first renders as "1.0", and a later 1 joins that entry
+        let counts = chats_count_from(vec![json!(1.0), json!(1), json!("Ann"), json!("Ann")]).unwrap();
+        assert_eq!(counts, json!({"1.0": 2, "Ann": 2}));
+        // an unhashable character raises like python's dict key TypeError
+        assert_eq!(chats_count_from(vec![json!(["x"])]).unwrap_err().to_string(), "unhashable type: 'list'");
     }
 }
