@@ -53,14 +53,11 @@ fn sget(m: &Map<String, Value>, key: &str) -> String {
     }
 }
 
-/// `(body or {}).get(key, "")` followed by `if not value`: a falsy value (0, false, [], {})
-/// counts as missing, like null, instead of being stringified
-fn sget_required(m: &Map<String, Value>, key: &str) -> String {
-    if present(m, key) {
-        sget(m, key)
-    } else {
-        String::new()
-    }
+/// python's `(body or {}).get(key, "")` for a field a write route requires: a falsy value
+/// (absent, null, "", 0, false, [], {}) is missing; a truthy value is kept as the raw JSON
+/// value, because python hands it on unchanged to `startswith`
+fn required_field<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    m.get(key).filter(|v| truthy(v))
 }
 
 /// python truthiness of a str-or-other value fetched with a "" default
@@ -448,6 +445,19 @@ impl Coder {
         let requested = requested.strip_prefix(sandbox).unwrap_or(requested);
         let base = self.full_sandbox(sandbox)?;
         ol_core::paths::sandbox_path(&base, Some(requested)).map_err(|e| e.to_string())
+    }
+
+    /// python `_get_sandbox_subpath(sandbox, requested_path)` on the raw request values: the
+    /// `requested_path.startswith(sandbox)` call raises for a non-str operand, and that exception
+    /// text is what the route returns
+    fn sandbox_subpath_raw(&self, sandbox: &Value, requested: &Value) -> R<String> {
+        let Value::String(requested) = requested else {
+            return Err(format!("'{}' object has no attribute 'startswith'", py_type_name(requested)));
+        };
+        let Value::String(sandbox) = sandbox else {
+            return Err(format!("startswith first arg must be str or a tuple of str, not {}", py_type_name(sandbox)));
+        };
+        self.get_sandbox_subpath(sandbox, requested)
     }
 
     // ---------------- treesitter helpers
@@ -923,18 +933,14 @@ impl Coder {
     }
 
     fn route_save(&self, b: &Map<String, Value>) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget_required(b, "sandbox");
-        let rel_path = sget_required(b, "path");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        let (Some(sandbox), Some(rel)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
+        };
+        let target = match self.sandbox_subpath_raw(sandbox, rel) {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
+        let rel_path = py_str(rel);
         let content = match raw_content(b) {
             Ok(c) => c,
             Err(ty) => {
@@ -959,12 +965,10 @@ impl Coder {
     }
 
     fn route_lint(&self, b: &Map<String, Value>) -> Value {
-        let sandbox = sget_required(b, "sandbox");
-        let rel_path = sget_required(b, "path");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        let (Some(sandbox), Some(rel)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
+        };
+        let target = match self.sandbox_subpath_raw(sandbox, rel) {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
@@ -992,19 +996,15 @@ impl Coder {
     }
 
     fn route_create(&self, b: &Map<String, Value>) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget_required(b, "sandbox");
-        let rel_path = sget_required(b, "path");
-        let is_dir = present(b, "is_dir");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        let (Some(sandbox), Some(rel)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
+        };
+        let is_dir = present(b, "is_dir");
+        let target = match self.sandbox_subpath_raw(sandbox, rel) {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
+        let rel_path = py_str(rel);
         let r = if is_dir {
             pyos::makedirs(&target, false)
         } else {
@@ -1019,19 +1019,14 @@ impl Coder {
     }
 
     fn route_move(&self, b: &Map<String, Value>) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget_required(b, "sandbox");
-        let src = sget_required(b, "src");
-        let dst = sget_required(b, "dst");
-        if sandbox.is_empty() || src.is_empty() || dst.is_empty() {
+        let (Some(sandbox), Some(src), Some(dst)) = (required_field(b, "sandbox"), required_field(b, "src"), required_field(b, "dst")) else {
             return self.result("sandbox, src and dst are all required", false);
-        }
-        let (src_path, dst_path) = match (self.get_sandbox_subpath(&sandbox, &src), self.get_sandbox_subpath(&sandbox, &dst)) {
+        };
+        let (src_path, dst_path) = match (self.sandbox_subpath_raw(sandbox, src), self.sandbox_subpath_raw(sandbox, dst)) {
             (Ok(a), Ok(b)) => (a, b),
             (Err(e), _) | (_, Err(e)) => return self.result(e, false),
         };
+        let (src, dst) = (py_str(src), py_str(dst));
         if pyos::exists(&dst_path) {
             return self.result(format!("destination already exists: {}", dst), false);
         }
@@ -1044,18 +1039,14 @@ impl Coder {
     }
 
     fn route_delete(&self, b: &Map<String, Value>) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget_required(b, "sandbox");
-        let rel_path = sget_required(b, "path");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        let (Some(sandbox), Some(rel)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
+        };
+        let target = match self.sandbox_subpath_raw(sandbox, rel) {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
+        let rel_path = py_str(rel);
         let r = if pyos::isdir(&target) {
             pyos::rmtree(&target)
         } else {
@@ -1068,18 +1059,14 @@ impl Coder {
     }
 
     fn route_duplicate(&self, b: &Map<String, Value>) -> Value {
-        if self.read_only() {
-            return self.result("coder is in read-only mode", false);
-        }
-        let sandbox = sget_required(b, "sandbox");
-        let rel_path = sget_required(b, "path");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        let (Some(sandbox), Some(rel)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let src = match self.get_sandbox_subpath(&sandbox, &rel_path) {
+        };
+        let src = match self.sandbox_subpath_raw(sandbox, rel) {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
+        let rel_path = py_str(rel);
         if !pyos::exists(&src) {
             return self.result(format!("not found: {}", rel_path), false);
         }
@@ -1868,6 +1855,11 @@ impl Module for Coder {
     }
 
     async fn ui_route(&self, path: &str, _method: &str, body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
+        // python's write routes check read-only before they read the body, so a bad body still
+        // gets the read-only refusal here
+        if matches!(path, "save" | "create" | "move" | "delete" | "duplicate") && self.read_only() {
+            return Ok(self.result("coder is in read-only mode", false));
+        }
         let b = body_dict(path, body)?;
         let q = &query;
         Ok(match path {
@@ -1944,20 +1936,33 @@ mod tests {
     }
 
     #[test]
-    fn falsy_request_fields_are_missing_not_stringified() {
+    fn falsy_request_fields_are_missing_and_truthy_ones_are_kept_raw() {
         let b = json!({"sandbox": "s", "path": 0, "src": false, "dst": [], "content": null, "n": 5});
         let m = b.as_object().unwrap();
-        assert_eq!(sget_required(m, "sandbox"), "s");
-        assert_eq!(sget_required(m, "path"), "");
-        assert_eq!(sget_required(m, "src"), "");
-        assert_eq!(sget_required(m, "dst"), "");
-        assert_eq!(sget_required(m, "absent"), "");
-        // truthy non-strings keep the stringified form
-        assert_eq!(sget_required(m, "n"), "5");
+        assert_eq!(required_field(m, "sandbox"), Some(&json!("s")));
+        assert_eq!(required_field(m, "path"), None);
+        assert_eq!(required_field(m, "src"), None);
+        assert_eq!(required_field(m, "dst"), None);
+        assert_eq!(required_field(m, "absent"), None);
+        // truthy non-strings are not stringified: python hands them to startswith, which raises
+        assert_eq!(required_field(m, "n"), Some(&json!(5)));
         // a null content is not "" in python: write() gets None
         assert_eq!(raw_content(m), Err("NoneType"));
         assert_eq!(raw_content(json!({"content": "hi"}).as_object().unwrap()), Ok("hi".to_string()));
         assert_eq!(raw_content(json!({}).as_object().unwrap()), Ok(String::new()));
+    }
+
+    #[test]
+    fn non_str_sandbox_fields_raise_python_startswith_errors() {
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        // python: requested_path.startswith(sandbox) looks up the attribute on the path first
+        assert_eq!(coder.sandbox_subpath_raw(&json!("ws"), &json!(5)).unwrap_err(), "'int' object has no attribute 'startswith'");
+        assert_eq!(coder.sandbox_subpath_raw(&json!("ws"), &json!([1])).unwrap_err(), "'list' object has no attribute 'startswith'");
+        // then the sandbox argument must be a str (python's TypeError text)
+        assert_eq!(
+            coder.sandbox_subpath_raw(&json!(5), &json!("a")).unwrap_err(),
+            "startswith first arg must be str or a tuple of str, not int"
+        );
     }
 
     #[test]
