@@ -32,12 +32,12 @@ use std::sync::Arc;
 pub fn add_api_routes(router: Router<Arc<Shared>>) -> Router<Arc<Shared>> {
     router
         .route("/api/chat/load/{chat_id}", get_only(chat_load))
-        .route("/api/chat/current", get(chat_current))
-        .route("/api/stream/state", get(stream_state))
-        .route("/api/chat/export", get(chat_export))
-        .route("/api/chats", get(get_chats))
-        .route("/api/chats/days", get(get_chat_days))
-        .route("/api/chats/day", get(get_chats_for_day))
+        .route("/api/chat/current", get_only(chat_current))
+        .route("/api/stream/state", get_only(stream_state))
+        .route("/api/chat/export", get_only(chat_export))
+        .route("/api/chats", get_only(get_chats))
+        .route("/api/chats/days", get_only(get_chat_days))
+        .route("/api/chats/day", get_only(get_chats_for_day))
         .route("/api/chats/categories", get(get_chat_categories))
         .route("/api/chats/categories/count", get(get_chat_category_counts))
         .route("/api/chats/tags", get(get_chat_tags))
@@ -158,11 +158,16 @@ fn group_counts(chats: &[Value], tz: i64) -> Result<IndexMap<String, (i64, Strin
 }
 
 /// python `chat.get(...)` dict of the loaded chat, with turn history and live token usage
-async fn chat_with_details(ch: &Channel) -> Value {
+/// None where python's `get_total_tokens` raises: its `int(chat_data.get(key, 0))` on a stored value python
+/// cannot int() (null, list, dict, a non-numeric string) fails before anything else is read
+async fn chat_with_details(ch: &Channel) -> Option<Value> {
+    if !["token_usage", "token_usage_mark"].iter().all(|key| ch.chat.get(key).map_or(true, |v| py_int(&v).is_some())) {
+        return None;
+    }
     let mut chat = ch.chat.get_chat();
     chat["turn_history"] = json!(ch.group_history());
     chat["token_usage"] = json!(ch.context.get_total_tokens().await);
-    chat
+    Some(chat)
 }
 
 /// python `chat_store.get_categories()` mapped through `c or "general"`, sorted, "general" first
@@ -267,7 +272,8 @@ async fn chat_load(State(app): State<Arc<Shared>>, Path(chat_id): Path<String>) 
     if !op_chat_switch(&app, &ch, &chat_id).await {
         return reply(json!("error while loading chat"), false);
     }
-    reply(chat_with_details(&ch).await, true)
+    let Some(chat) = chat_with_details(&ch).await else { return internal_error() };
+    reply(chat, true)
 }
 
 async fn chat_current(State(app): State<Arc<Shared>>) -> Response {
@@ -276,7 +282,8 @@ async fn chat_current(State(app): State<Arc<Shared>>) -> Response {
     if ch.chat.current().is_none() {
         return internal_error();
     }
-    reply(chat_with_details(&ch).await, true)
+    let Some(chat) = chat_with_details(&ch).await else { return internal_error() };
+    reply(chat, true)
 }
 
 async fn stream_state(State(app): State<Arc<Shared>>) -> Response {

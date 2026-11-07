@@ -635,3 +635,54 @@ async fn get_chats_for_day_pages_one_group_and_reports_its_count() {
     let tagged = h.get(&format!("/api/chats/day?day={today_key}&tags=nope")).await.json();
     assert_eq!(tagged["data"]["count"], json!(0));
 }
+
+#[tokio::test]
+async fn get_only_chat_routes_answer_head_and_post_with_405_allow_get() {
+    // FastAPI's @app.get adds no HEAD, and starlette's 405 carries `Allow: GET`; a POST gets the detail body too
+    let h = harness(false).await;
+    for uri in ["/api/chat/current", "/api/stream/state", "/api/chat/export", "/api/chats", "/api/chats/days", "/api/chats/day"] {
+        let resp = h.send(request(Method::HEAD, uri, None, None, "")).await;
+        assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED, "HEAD {uri}");
+        assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET", "HEAD {uri}");
+        assert!(resp.body.is_empty(), "HEAD {uri} body: {}", resp.body);
+    }
+    let resp = h.send(request(Method::POST, "/api/chats", None, None, "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.headers.get(header::ALLOW).unwrap(), "GET");
+    assert_eq!(resp.json(), json!({"detail": "Method Not Allowed"}));
+    // GET still answers normally
+    let state = h.get("/api/stream/state").await;
+    assert_eq!(state.status, StatusCode::OK);
+    assert!(state.json()["data"]["state"].is_string());
+}
+
+#[tokio::test]
+async fn chat_current_and_load_fail_with_500_when_a_stored_token_count_is_not_a_python_int() {
+    // python's get_total_tokens runs int() on token_usage and token_usage_mark: null, a list, or a non-numeric
+    // string raises, so chat/current and chat/load are the plain 500
+    let h = harness(false).await;
+    let id = h.ch.chat.new_chat("general", "tokens", None).await;
+    let set = |key: &'static str, value: Value| {
+        h.ch.chat.with_data_mut(|data| {
+            for chat in data.iter_mut().filter(|c| c["id"] == json!(id)) {
+                chat[key] = value.clone();
+            }
+        });
+    };
+    set("token_usage", Value::Null);
+    let resp = h.get("/api/chat/current").await;
+    assert_eq!(resp.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.body, "Internal Server Error");
+    assert_eq!(h.get(&format!("/api/chat/load/{id}")).await.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    set("token_usage", json!(0));
+    set("token_usage_mark", json!([1]));
+    assert_eq!(h.get("/api/chat/current").await.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // a numeric string that python's int() accepts (underscores included) is no error
+    set("token_usage", json!("1_000"));
+    set("token_usage_mark", json!("0"));
+    let ok = h.get("/api/chat/current").await;
+    assert_eq!(ok.status, StatusCode::OK);
+    assert_eq!(ok.json()["success"], json!(true));
+}
