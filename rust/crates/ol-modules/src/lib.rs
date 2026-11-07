@@ -1,5 +1,6 @@
 //! (being ported - see rust/PORTING.md)
 
+pub mod chats;
 pub mod identity;
 pub mod lists;
 pub mod notes;
@@ -75,5 +76,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: lists::meta::UNSAFE,
         category: lists::meta::CATEGORY,
         factory: lists::Lists::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "chats",
+        class_name: chats::meta::CLASS_NAME,
+        doc: chats::meta::DOC,
+        settings: chats::meta::settings,
+        unsafe_: chats::meta::UNSAFE,
+        category: chats::meta::CATEGORY,
+        factory: chats::Chats::factory,
     });
 }
