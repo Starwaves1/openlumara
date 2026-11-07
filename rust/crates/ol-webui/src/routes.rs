@@ -25,6 +25,7 @@ use axum::Router;
 use indexmap::IndexMap;
 use ol_core::channel::Channel;
 use ol_core::context::GetOpts;
+use ol_core::storage::StorageList;
 use ol_core::pyjson::{py_repr, py_str, truthy};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -287,6 +288,15 @@ fn input_history_file_parses(path: &str) -> bool {
         Ok(text) => text.is_empty() || !matches!(py_json_loads(text.as_bytes()), Err(BodyJsonError::Decode(_))),
         Err(_) => true,
     }
+}
+
+/// python `history.load()` followed by the handler's use of it. ol-core's load clears the list before it
+/// reads the file, so a file that json.loads rejects leaves the list empty (python's load raises after the
+/// clear, and the next GET reads []). false when the file does not parse: the POST is a 500 and is not saved.
+/// the file is read on every POST here, where python re-reads only when the file's mtime changed
+fn input_history_reload(history: &mut StorageList) -> bool {
+    history.load();
+    input_history_file_parses(&history.path)
 }
 
 /// python `(config.get(key) or {}).get(k)` for `k` in enabled and disabled: `{"enabled", "disabled"}` of a
@@ -712,10 +722,9 @@ async fn input_history_add(State(app): State<Arc<Shared>>, body: Bytes) -> Respo
         return reply(Value::Null, true);
     }
     let mut history = app.input_history.lock();
-    if !input_history_file_parses(&history.path) {
+    if !input_history_reload(&mut history) {
         return internal_error();
     }
-    history.load();
     // python returns the list without saving when the message repeats the last entry
     if push_input_history(&mut history.data, &message) {
         let _ = history.save();
@@ -1023,6 +1032,28 @@ mod tests {
         assert!(input_history_file_parses(&file("nan.json", "[NaN]")));
         // a file that cannot be read is logged by python's _read and does not raise
         assert!(input_history_file_parses(&dir.path().join("missing.json").to_string_lossy()));
+    }
+
+    #[test]
+    fn input_history_reload_empties_the_list_when_the_file_is_corrupt() {
+        // python load() clears the list, then json.loads raises: the POST is a 500 and the list reads []
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("history").to_string_lossy().to_string();
+        let mut history = StorageList::with_autoload("webui_input_history_test", ol_core::storage::StorageType::Json, Some(&base), false).unwrap();
+        std::fs::write(&history.path, "[\"ls\", \"cd").unwrap();
+        history.data = vec![json!("old")];
+        assert!(!input_history_reload(&mut history));
+        assert!(history.data.is_empty());
+    }
+
+    #[test]
+    fn input_history_reload_loads_a_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("history").to_string_lossy().to_string();
+        let mut history = StorageList::with_autoload("webui_input_history_test", ol_core::storage::StorageType::Json, Some(&base), false).unwrap();
+        std::fs::write(&history.path, "[\"ls\", \"cd /tmp\"]").unwrap();
+        assert!(input_history_reload(&mut history));
+        assert_eq!(history.data, vec![json!("ls"), json!("cd /tmp")]);
     }
 
     #[test]
