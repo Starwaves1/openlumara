@@ -559,7 +559,7 @@ fn remove_chat_history_file(ch: &Channel, chat_id: &str) -> anyhow::Result<()> {
 /// python `ChatStore.set`: `if self.current is None and not index` raises, so an index of 0 counts as
 /// no index. with no chat loaded, setting a field of the chat at index 0 fails in python.
 pub fn ensure_chat_set_target(ch: &Channel, index: usize) -> anyhow::Result<()> {
-    if index == 0 && ch.chat.get("id").is_none() {
+    if index == 0 && ch.chat.current().is_none() {
         return Err(anyhow!("No chat is currently loaded!"));
     }
     Ok(())

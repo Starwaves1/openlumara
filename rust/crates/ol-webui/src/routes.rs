@@ -12,7 +12,7 @@ use crate::server::{api_result, get_only, internal_error, Shared};
 use crate::settings::{build_settings_structure, flatten_categories, get_module_info, MODULE_CATEGORY_KEYS};
 use crate::util::{
     export_chat_text, get_strip, or_strip, parse_body, py_contains, py_eq, py_int, py_int_str, py_iter,
-    py_json_loads, py_json_loads_lenient, py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip,
+    py_json_loads, py_json_loads_int_rejects_python_only, py_json_loads_lenient, py_json_loads_python_only_true, py_slice, py_sorted_unique, py_strip,
     py_type_name, BodyJsonError,
 };
 use crate::ws::{ensure_chat_set_target, op_chat_delete, op_chat_new, op_chat_rename, op_chat_switch};
@@ -109,9 +109,16 @@ impl QueryParams {
     }
 }
 
-/// `await request.json()` for a body that must be a dict; None where python raises
+/// `await request.json()` for a body that must be a dict; None where python raises. python's json.loads
+/// takes NaN and Infinity, read here as `true` (a truthy non-string, as python's NaN is)
 fn json_object(body: &[u8]) -> Option<Map<String, Value>> {
-    serde_json::from_slice::<Value>(body).ok()?.as_object().cloned()
+    py_json_loads_python_only_true(body).ok()?.as_object().cloned()
+}
+
+/// python `int(data.get("tz_offset") or 0)` on a search body; None where `int()` raises (nan, inf)
+fn search_tz_offset(body: &[u8]) -> Option<i64> {
+    let raw = py_json_loads_int_rejects_python_only(body).ok()?.get("tz_offset").cloned();
+    tz_offset_of(raw.as_ref())
 }
 
 /// `await request.json()` for the library routes, which read string keys with `(data.get(k) or "").strip()`.
@@ -549,7 +556,7 @@ async fn search_chats(State(app): State<Arc<Shared>>, body: Bytes) -> Response {
     let Ok(query) = get_strip(obj.get("query"), "") else { return internal_error() };
     let search_in_content = obj.get("search_in_content").map(truthy).unwrap_or(true);
     let category = obj.get("category").cloned().unwrap_or(Value::Null);
-    let Some(tz) = tz_offset_of(obj.get("tz_offset")) else { return internal_error() };
+    let Some(tz) = search_tz_offset(&body) else { return internal_error() };
     if query.is_empty() {
         return reply(json!([]), true);
     }
@@ -1088,6 +1095,24 @@ mod tests {
         std::fs::write(&history.path, "[\"ls\", \"cd /tmp\"]").unwrap();
         assert!(input_history_reload(&mut history));
         assert_eq!(history.data, vec![json!("ls"), json!("cd /tmp")]);
+    }
+
+    #[test]
+    fn category_and_search_bodies_accept_python_nan_and_infinity() {
+        // python json.loads takes NaN and Infinity: an unused key holding them is not a 500
+        let obj = json_object(br#"{"name":"x","n":NaN,"m":-Infinity}"#).unwrap();
+        assert_eq!(obj.get("name"), Some(&json!("x")));
+        // a non-object body is still rejected
+        assert!(json_object(b"[NaN]").is_none());
+    }
+
+    #[test]
+    fn search_tz_offset_fails_on_nan_like_python_int() {
+        // python int(nan) raises ValueError and int(-inf) raises OverflowError: both are a 500
+        assert_eq!(search_tz_offset(br#"{"tz_offset": 300}"#), Some(300));
+        assert_eq!(search_tz_offset(br#"{"query": "a"}"#), Some(0));
+        assert_eq!(search_tz_offset(br#"{"tz_offset": NaN}"#), None);
+        assert_eq!(search_tz_offset(br#"{"tz_offset": -Infinity}"#), None);
     }
 
     #[test]

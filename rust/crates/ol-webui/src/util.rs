@@ -42,6 +42,12 @@ pub fn py_json_loads_python_only_true(body: &[u8]) -> Result<Value, BodyJsonErro
     parse_document(body, Some(Value::Bool(true)))
 }
 
+/// `py_json_loads` for a handler that runs `int()` on a key: python's NaN and Infinity make `int()` raise,
+/// so they are read as the string "nan", which `py_int` rejects the same way `int()` does.
+pub fn py_json_loads_int_rejects_python_only(body: &[u8]) -> Result<Value, BodyJsonError> {
+    parse_document(body, Some(Value::String("nan".to_string())))
+}
+
 /// `python_only_as` is the value a python-only number reads as; None when `Value` cannot hold it
 fn parse_document(body: &[u8], python_only_as: Option<Value>) -> Result<Value, BodyJsonError> {
     // json.loads on bytes decodes with utf-8-sig, which drops a leading byte order mark
