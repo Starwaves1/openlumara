@@ -28,8 +28,20 @@ use std::sync::Arc;
 /// but without going through config::get_module_structure() (which evaluates this
 /// module's own settings -> infinite recursion).
 pub fn available_channels() -> Vec<String> {
-    let mut out = ol_core::config::available_names("channels");
-    out.extend(ol_core::config::available_names("user_channels"));
+    let names = ol_core::config::available_names("channels")
+        .into_iter()
+        .chain(ol_core::config::available_names("user_channels"));
+    dedup_keep_first(names)
+}
+
+/// python keys metadata_registry by name, so a name listed in both sections appears once, at its first position
+fn dedup_keep_first(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
     out
 }
 
@@ -72,6 +84,27 @@ pub fn settings() -> Value {
 // Pure time / parsing logic
 // ---------------------------------------------------------
 
+/// python `int(s)` for a run of `\d` matches. `\d` is unicode-aware in python and in the regex crate,
+/// so the run can hold non-ascii decimal digits; saturates instead of overflowing.
+fn digits_to_i64(s: &str) -> i64 {
+    static DIGIT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"^\d$").unwrap());
+    s.chars().fold(0i64, |acc, ch| acc.saturating_mul(10).saturating_add(decimal_value(ch, &DIGIT)))
+}
+
+/// value of a unicode decimal digit. Every run of `\d` characters is a whole number of blocks of ten
+/// that each start at zero, so the value is the distance from the start of the run, mod 10.
+fn decimal_value(ch: char, digit: &regex::Regex) -> i64 {
+    let mut start = ch as u32;
+    let mut buf = [0u8; 4];
+    while let Some(prev) = start.checked_sub(1).and_then(char::from_u32) {
+        if !digit.is_match(prev.encode_utf8(&mut buf)) {
+            break;
+        }
+        start -= 1;
+    }
+    ((ch as u32 - start) % 10) as i64
+}
+
 /// `re.findall(r'(\d+)\s*([wdhms])', s)` -> (weeks, days, hours, minutes, seconds); None if no match
 pub fn parse_duration(s: &str) -> Option<[i64; 5]> {
     static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(\d+)\s*([wdhms])").unwrap());
@@ -80,7 +113,7 @@ pub fn parse_duration(s: &str) -> Option<[i64; 5]> {
     for c in RE.captures_iter(s) {
         any = true;
         // python keeps the unbounded int and its timedelta rejects it later; saturating keeps it huge
-        let val: i64 = c[1].parse().unwrap_or(i64::MAX);
+        let val = digits_to_i64(&c[1]);
         let idx = match &c[2] {
             "w" => 0,
             "d" => 1,
@@ -229,6 +262,27 @@ pub fn format_recurring_time(recur: &Value) -> String {
     }
 }
 
+/// python `_route_list` loop body: one display dict per job. a stored entry that is not a dict fails the
+/// whole request at `job.get`, like python's AttributeError, rather than being listed with defaults.
+fn list_items(jobs: &[Value]) -> anyhow::Result<Vec<Value>> {
+    jobs.iter()
+        .map(|job| {
+            if !job.is_object() {
+                anyhow::bail!("'{}' object has no attribute 'get'", py_type(job));
+            }
+            Ok(json!({
+                "id": job.get("id").cloned().unwrap_or(Value::Null),
+                "action": job.get("action").cloned().unwrap_or(json!("")),
+                "channel": job.get("channel").cloned().unwrap_or(json!("")),
+                "trigger_time": job.get("trigger_time").cloned().unwrap_or(json!("")),
+                "recurring": job.get("recurring").map(truthy).unwrap_or(false),
+                "recurs_in": job.get("recurs_in").cloned().unwrap_or(Value::Null),
+                "display": format_job_time(job)?,
+            }))
+        })
+        .collect()
+}
+
 /// python `_format_job_time`. a missing `recurs_in` is {} (`job.get(k, {})`), but a stored null or other
 /// non-dict raises AttributeError on `.get` inside python's formatter
 /// python `items.sort(key=lambda j: j.get("trigger_time") or "9999")`: the key is the stored value itself when
@@ -345,48 +399,55 @@ fn str_arg(value: Option<Value>, method: &str) -> anyhow::Result<String> {
     }
 }
 
-/// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur)
-pub fn ui_build_recur(mode: &str, duration: &str, time_str: &str, weekday: Option<&Value>) -> Result<Value, &'static str> {
+/// builds a recurrence dict from the webui modal's form fields (python _ui_build_recur).
+/// the outer error is a python exception that escapes the route (a TypeError); the inner error is a
+/// message the route returns with success=False.
+pub fn ui_build_recur(mode: &str, duration: &str, time_str: &str, weekday: Option<&Value>) -> anyhow::Result<Result<Value, &'static str>> {
     let mut recur = json!({
         "weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0,
         "target_weekday": null, "weekdays_only": false,
     });
     if mode == "relative" {
         let Some(d) = parse_duration(duration.trim()) else {
-            return Err("invalid duration. use something like '2d 4h 30m'");
+            return Ok(Err("invalid duration. use something like '2d 4h 30m'"));
         };
         // python only overwrites the units that were present; values default to 0 anyway
         for (i, k) in ["weeks", "days", "hours", "minutes", "seconds"].iter().enumerate() {
             recur[*k] = json!(d[i]);
         }
-        return Ok(recur);
+        return Ok(Ok(recur));
     }
     let parts: Vec<&str> = time_str.split(':').collect();
     if parts.len() < 2 {
-        return Err("invalid time format, use HH:MM");
+        return Ok(Err("invalid time format, use HH:MM"));
     }
-    let hour = py_int_str(parts[0]).ok_or("invalid time format, use HH:MM")?;
+    let Some(hour) = py_int_str(parts[0]) else { return Ok(Err("invalid time format, use HH:MM")) };
     recur["target_hour"] = json!(hour);
-    let minute = py_int_str(parts[1]).ok_or("invalid time format, use HH:MM")?;
+    let Some(minute) = py_int_str(parts[1]) else { return Ok(Err("invalid time format, use HH:MM")) };
     recur["target_minute"] = json!(minute);
     if parts.len() == 3 {
-        recur["target_second"] = json!(py_int_str(parts[2]).ok_or("invalid time format, use HH:MM")?);
+        let Some(second) = py_int_str(parts[2]) else { return Ok(Err("invalid time format, use HH:MM")) };
+        recur["target_second"] = json!(second);
     }
     if !((0..=23).contains(&hour) && (0..=59).contains(&minute)) {
-        return Err("time out of range");
+        return Ok(Err("time out of range"));
     }
     match weekday {
         Some(Value::String(s)) if s == "weekdays" => recur["weekdays_only"] = json!(true),
         Some(w) if !w.is_null() && py_str(w) != "" => {
-            let wd = py_int(w).ok_or("invalid weekday")?;
+            // python int() raises TypeError for a list or dict; _ui_build_recur only catches ValueError
+            if matches!(w, Value::Array(_) | Value::Object(_)) {
+                anyhow::bail!("int() argument must be a string, a bytes-like object or a real number, not '{}'", py_type(w));
+            }
+            let Some(wd) = py_int(w) else { return Ok(Err("invalid weekday")) };
             if !(0..=6).contains(&wd) {
-                return Err("weekday must be between 0 (Monday) and 6 (Sunday)");
+                return Ok(Err("weekday must be between 0 (Monday) and 6 (Sunday)"));
             }
             recur["target_weekday"] = json!(wd);
         }
         _ => {}
     }
-    Ok(recur)
+    Ok(Ok(recur))
 }
 
 // ---------------------------------------------------------
@@ -917,22 +978,7 @@ impl Inner {
 
     fn route_list(&self) -> anyhow::Result<Value> {
         self.with(|s| s.load())?;
-        // python builds the whole list in one loop: one job whose schedule can't be formatted fails the request
-        let mut items: Vec<Value> = self
-            .jobs()
-            .iter()
-            .map(|job| {
-                Ok(json!({
-                    "id": job.get("id").cloned().unwrap_or(Value::Null),
-                    "action": job.get("action").cloned().unwrap_or(json!("")),
-                    "channel": job.get("channel").cloned().unwrap_or(json!("")),
-                    "trigger_time": job.get("trigger_time").cloned().unwrap_or(json!("")),
-                    "recurring": job.get("recurring").map(truthy).unwrap_or(false),
-                    "recurs_in": job.get("recurs_in").cloned().unwrap_or(Value::Null),
-                    "display": format_job_time(job)?,
-                }))
-            })
-            .collect::<anyhow::Result<_>>()?;
+        let mut items = list_items(&self.jobs())?;
         sort_by_trigger_time(&mut items)?;
         Ok(Value::Array(items))
     }
@@ -946,22 +992,29 @@ impl Inner {
         } else {
             (String::new(), str_arg(body_get(body, "time"), "split")?)
         };
-        Ok(ui_build_recur(&mode, &duration, &time, weekday.as_ref()))
+        ui_build_recur(&mode, &duration, &time, weekday.as_ref())
     }
 
     async fn route_create_or_update(&self, body: &Option<Value>, update: bool) -> anyhow::Result<Value> {
         dict_body(body)?;
-        let mut index = -1;
         let job_id = body_get(body, "id").unwrap_or(Value::Null);
+        if update && !truthy(&job_id) {
+            return Ok(self.base.result("no job id given", false));
+        }
+        // python finds the index, reads the existing job and writes back at that index with no await in
+        // between. the dispatcher task can remove a job between separate lock acquisitions, which would
+        // shift the indexes, so the lookup and the write both happen under this one lock.
+        let mut guard = self.schedule.lock();
+        let storage = guard.as_mut().ok_or_else(|| anyhow!("'Scheduler' object has no attribute 'schedule'"))?;
+        let mut index = -1i64;
+        let mut existing = json!({});
         if update {
-            if !truthy(&job_id) {
-                return Ok(self.base.result("no job id given", false));
-            }
-            self.with(|s| s.load())?;
-            index = self.get_index(&job_id);
+            storage.load();
+            index = Self::index_in(&storage.data, &job_id);
             if index == -1 {
                 return Ok(self.base.result("job does not exist", false));
             }
+            existing = storage.data[index as usize].clone();
         }
         let action = body_str(body, "action", "").trim().to_string();
         if action.is_empty() {
@@ -981,7 +1034,6 @@ impl Inner {
             Err(e) => return Err(anyhow!(e)),
         };
         let resolved = if update {
-            let existing = self.job_at(index).unwrap_or(json!({}));
             body_get(body, "channel")
                 .filter(truthy)
                 .or_else(|| existing.get("channel").filter(|v| truthy(v)).cloned())
@@ -1001,16 +1053,17 @@ impl Inner {
             "recurring": recurring,
             "recurs_in": if recurring { recur } else { Value::Null },
         });
-        self.with(|s| {
-            if update {
-                if let Some(slot) = s.data.get_mut(index as usize) {
-                    *slot = job;
-                }
-            } else {
-                s.data.push(job);
-            }
-            s.save();
-        })?;
+        if update {
+            // the index was found under this same lock, so it still names the job that was read
+            let Some(slot) = storage.data.get_mut(index as usize) else {
+                anyhow::bail!("list assignment index out of range");
+            };
+            *slot = job;
+        } else {
+            storage.data.push(job);
+        }
+        storage.save();
+        drop(guard);
         self.signal_reschedule();
         if update {
             Ok(self.base.result("job edited", true))
@@ -1162,7 +1215,7 @@ mod tests {
         assert_eq!(calculate_next_from(&base, &days(1_000_000_000)).unwrap_err(), "days=1000000000; must have magnitude <= 999999999");
         assert_eq!(calculate_next_from(&base, &days(10_000_000_000)).unwrap_err(), "Python int too large to convert to C int");
         // a digit run too big for i64 is not read as zero: python raises the C int overflow for it
-        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap();
+        let huge = ui_build_recur("relative", "99999999999999999999d", "", None).unwrap().unwrap();
         assert_eq!(calculate_next_from(&base, &huge).unwrap_err(), "Python int too large to convert to C int");
     }
 
@@ -1224,15 +1277,51 @@ mod tests {
 
     #[test]
     fn ui_recur() {
-        let r = ui_build_recur("relative", "1h", "", None).unwrap();
+        let r = ui_build_recur("relative", "1h", "", None).unwrap().unwrap();
         assert_eq!(r["hours"], 1);
-        assert_eq!(ui_build_recur("relative", "", "", None).unwrap_err(), "invalid duration. use something like '2d 4h 30m'");
-        let r = ui_build_recur("clock", "", "08:15", Some(&json!("weekdays"))).unwrap();
+        assert_eq!(ui_build_recur("relative", "", "", None).unwrap().unwrap_err(), "invalid duration. use something like '2d 4h 30m'");
+        let r = ui_build_recur("clock", "", "08:15", Some(&json!("weekdays"))).unwrap().unwrap();
         assert_eq!(r, json!({"weeks": 0, "days": 0, "hours": 0, "minutes": 0, "seconds": 0, "target_weekday": null, "weekdays_only": true, "target_hour": 8, "target_minute": 15}));
-        let r = ui_build_recur("clock", "", "08:15", Some(&json!("3"))).unwrap();
+        let r = ui_build_recur("clock", "", "08:15", Some(&json!("3"))).unwrap().unwrap();
         assert_eq!(r["target_weekday"], 3);
-        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("9"))).unwrap_err(), "weekday must be between 0 (Monday) and 6 (Sunday)");
-        assert_eq!(ui_build_recur("clock", "", "25:00", None).unwrap_err(), "time out of range");
-        assert_eq!(ui_build_recur("clock", "", "x", None).unwrap_err(), "invalid time format, use HH:MM");
+        assert_eq!(ui_build_recur("clock", "", "08:15", Some(&json!("9"))).unwrap().unwrap_err(), "weekday must be between 0 (Monday) and 6 (Sunday)");
+        assert_eq!(ui_build_recur("clock", "", "25:00", None).unwrap().unwrap_err(), "time out of range");
+        assert_eq!(ui_build_recur("clock", "", "x", None).unwrap().unwrap_err(), "invalid time format, use HH:MM");
+    }
+
+    #[test]
+    fn duration_digits_follow_python_unicode_int() {
+        // python: re.findall(r'(\d+)...') matches unicode decimal digits and int() reads them
+        assert_eq!(parse_duration("\u{0663}d"), Some([0, 3, 0, 0, 0]));
+        assert_eq!(parse_duration("\u{ff11}\u{ff12}h"), Some([0, 0, 12, 0, 0]));
+        assert_eq!(parse_duration("\u{1d7d7}s"), Some([0, 0, 0, 0, 9]));
+    }
+
+    #[test]
+    fn list_fails_on_a_non_object_stored_job() {
+        // python: job.get(...) on a non-dict raises AttributeError and the whole list request fails
+        let err = list_items(&[json!({"id": "a", "trigger_time": ""}), json!("oops")]).unwrap_err().to_string();
+        assert_eq!(err, "'str' object has no attribute 'get'");
+        let items = list_items(&[json!({"id": "a", "action": "x", "recurring": false})]).unwrap();
+        assert_eq!(items[0]["display"], "one-time, invalid time");
+        assert_eq!(items[0]["channel"], "");
+    }
+
+    #[test]
+    fn available_channel_names_appear_once() {
+        // python's metadata_registry is keyed by name, so a name in both sections is listed once
+        let names = ["webui", "discord", "webui"].map(String::from);
+        assert_eq!(dedup_keep_first(names), vec!["webui".to_string(), "discord".to_string()]);
+    }
+
+    #[test]
+    fn weekday_container_raises_like_python_int() {
+        // python int([1]) raises TypeError, which _ui_build_recur does not catch: the route raises
+        let err = ui_build_recur("clock", "", "08:15", Some(&json!([1]))).unwrap_err().to_string();
+        assert_eq!(err, "int() argument must be a string, a bytes-like object or a real number, not 'list'");
+        // the time is validated first, so a bad time still returns its message instead of raising
+        assert_eq!(ui_build_recur("clock", "", "25:00", Some(&json!({"a": 1}))).unwrap().unwrap_err(), "time out of range");
+        // relative mode never reads the weekday
+        assert!(ui_build_recur("relative", "1h", "", Some(&json!([1]))).unwrap().is_ok());
     }
 }

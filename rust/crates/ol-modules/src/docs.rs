@@ -23,23 +23,38 @@ impl Docs {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
 
-    fn folders(&self) -> Vec<String> {
+    /// the raw `folders` items in python's iteration order (a string iterates its characters)
+    fn raw_folders(&self) -> Vec<Value> {
         match self.base.config.get1("folders") {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) if !s.is_empty() => s.chars().map(|c| c.to_string()).collect(),
+            Some(Value::Array(a)) => a,
+            Some(Value::String(s)) if !s.is_empty() => s.chars().map(|c| json!(c.to_string())).collect(),
             _ => Vec::new(),
         }
     }
 
+    /// python `f.rstrip(os.path.sep)` needs a str: any other item raises AttributeError
+    fn folder_str(item: &Value) -> anyhow::Result<String> {
+        match item {
+            Value::String(s) => Ok(s.clone()),
+            other => anyhow::bail!("'{}' object has no attribute 'rstrip'", util::py_type_name(other)),
+        }
+    }
+
+    fn folders(&self) -> anyhow::Result<Vec<String>> {
+        self.raw_folders().iter().map(Self::folder_str).collect()
+    }
+
     /// translates the folder path list into basenames for the AI
-    pub fn get_folder_names(&self) -> Vec<String> {
-        self.folders().iter().map(|f| util::basename(&util::rstrip_sep(f))).collect()
+    pub fn get_folder_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.folders()?.iter().map(|f| util::basename(&util::rstrip_sep(f))).collect())
     }
 
     /// resolves a folder basename to its full path
     pub fn get_folder_path(&self, folder: &str) -> anyhow::Result<Option<String>> {
         let wanted = util::rstrip_sep(folder);
-        for f in self.folders() {
+        // python checks one item at a time and returns at the match, so a bad item only fails if it is reached
+        for item in self.raw_folders() {
+            let f = Self::folder_str(&item)?;
             if util::basename(&util::rstrip_sep(&f)) == wanted {
                 return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&f))?)));
             }
@@ -90,7 +105,12 @@ impl Module for Docs {
     }
 
     async fn on_ready(&self) -> anyhow::Result<()> {
-        for folder in self.folders() {
+        for item in self.raw_folders() {
+            // python's os.path.expanduser raises TypeError for a non-str item
+            let folder = match &item {
+                Value::String(s) => s.clone(),
+                other => anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(other)),
+            };
             let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&folder))?);
             std::fs::create_dir_all(&p).map_err(|e| anyhow::anyhow!(util::os_error(&e, &p)))?;
         }
@@ -101,7 +121,7 @@ impl Module for Docs {
     }
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
-        let folders = self.get_folder_names();
+        let folders = self.get_folder_names()?;
         if folders.is_empty() {
             return Ok(None);
         }
@@ -110,7 +130,7 @@ impl Module for Docs {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()), true)),
+            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()?), true)),
             "list" => {
                 let folder = args.str("folder").unwrap_or_default();
                 let subfolder = args.str("subfolder");
@@ -152,7 +172,7 @@ impl Module for Docs {
     async fn ui_route(&self, path: &str, _method: &str, _body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         match path {
             // doc folder basenames for the sidebar dropdown
-            "folders" => Ok(json!(self.get_folder_names())),
+            "folders" => Ok(json!(self.get_folder_names()?)),
             // one directory level: {subfolders: [...], files: [...]} relative paths
             "list" => {
                 let folder = query_str(&query, "folder");
