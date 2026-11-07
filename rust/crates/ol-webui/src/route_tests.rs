@@ -2785,3 +2785,210 @@ async fn coder_git_sync_writes_are_refused_in_read_only_mode() {
         assert_eq!(resp.json(), json!({"data": "coder is in read-only mode", "success": false}), "{route}");
     }
 }
+
+// ---------------- /api/ext/coder git_revert_file, upload and git_split_diff ----------------
+
+#[tokio::test]
+async fn git_revert_file_restores_head_for_worktree_and_staged_edits() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+
+    // a staged edit and a further unstaged edit on top of it both go back to HEAD
+    std::fs::write(repo.join("a.txt"), "staged\n").unwrap();
+    run_git(&repo, &["add", "--", "a.txt"]);
+    std::fs::write(repo.join("a.txt"), "unstaged\n").unwrap();
+    let resp = post_coder(&h, "git_revert_file", json!({"sandbox": "repo", "path": "a.txt"})).await;
+    assert_eq!(resp.json(), json!({"data": "reverted a.txt to HEAD", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "one\n");
+    assert_eq!(run_git(&repo, &["status", "--porcelain"]), "");
+
+    assert_eq!(
+        post_coder(&h, "git_revert_file", json!({"sandbox": "repo"})).await.json(),
+        json!({"data": "sandbox and path are both required", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "git_revert_file", json!({"sandbox": "repo", "path": "../../outside.txt"})).await.json(),
+        json!({"data": "path escapes the sandbox: ../../outside.txt", "success": false})
+    );
+    // a file git does not know has no HEAD version to restore, so the git failure is the answer
+    std::fs::write(repo.join("new.txt"), "fresh\n").unwrap();
+    let resp = post_coder(&h, "git_revert_file", json!({"sandbox": "repo", "path": "new.txt"})).await;
+    assert_eq!(resp.json()["success"], json!(false), "{}", resp.body);
+    assert!(repo.join("new.txt").exists(), "an untracked file is left alone");
+}
+
+#[tokio::test]
+async fn git_revert_file_is_refused_in_read_only_mode_and_is_post_only() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+
+    let resp = h.get("/api/ext/coder/git_revert_file").await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}));
+
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+    let resp = post_coder(&h, "git_revert_file", json!({"sandbox": "repo", "path": "a.txt"})).await;
+    assert_eq!(resp.json(), json!({"data": "coder is in read-only mode", "success": false}));
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "changed\n", "read-only leaves the edit");
+}
+
+/// base64 of `raw`, the way the webui encodes a dropped file
+fn b64(raw: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(raw)
+}
+
+#[tokio::test]
+async fn upload_writes_the_decoded_file_and_creates_parent_directories() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+
+    let resp = post_coder(
+        &h,
+        "upload",
+        json!({"sandbox": "repo", "path": "docs/deep", "filename": "a b.txt", "content": b64(b"hello\n")}),
+    )
+    .await;
+    assert_eq!(resp.json(), json!({"data": "uploaded docs/deep/a b.txt", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read(repo.join("docs/deep/a b.txt")).unwrap(), b"hello\n");
+
+    // a second upload to the same name is refused and leaves the file alone
+    let resp = post_coder(
+        &h,
+        "upload",
+        json!({"sandbox": "repo", "path": "docs/deep", "filename": "a b.txt", "content": b64(b"other")}),
+    )
+    .await;
+    assert_eq!(resp.json(), json!({"data": "file already exists: docs/deep/a b.txt", "success": false}));
+    assert_eq!(std::fs::read(repo.join("docs/deep/a b.txt")).unwrap(), b"hello\n");
+
+    // path separators in the filename become underscores, so the file stays inside the path given
+    let resp = post_coder(&h, "upload", json!({"sandbox": "repo", "path": ".", "filename": "x/y.txt", "content": b64(b"z")})).await;
+    assert_eq!(resp.json(), json!({"data": "uploaded ./x_y.txt", "success": true}), "{}", resp.body);
+    assert_eq!(std::fs::read(repo.join("x_y.txt")).unwrap(), b"z");
+}
+
+#[tokio::test]
+async fn upload_checks_its_fields_content_size_and_read_only_mode() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    let h = harness_with_coder(&repo).await;
+
+    assert_eq!(
+        post_coder(&h, "upload", json!({"sandbox": "repo", "path": "docs", "content": ""})).await.json(),
+        json!({"data": "sandbox, path and filename are all required", "success": false})
+    );
+    assert_eq!(
+        post_coder(&h, "upload", json!({"sandbox": "repo", "path": "../../escape", "filename": "x.txt", "content": ""})).await.json()["success"],
+        json!(false)
+    );
+    // a payload that is not base64 (missing padding) is the python invalid base64 answer
+    assert_eq!(
+        post_coder(&h, "upload", json!({"sandbox": "repo", "path": "docs", "filename": "bad.bin", "content": "abc"})).await.json(),
+        json!({"data": "invalid base64 content", "success": false})
+    );
+    assert!(!repo.join("docs/bad.bin").exists());
+
+    // 10,000,001 bytes is over the 10MB guard
+    let big = vec![0u8; 10_000_001];
+    assert_eq!(
+        post_coder(&h, "upload", json!({"sandbox": "repo", "path": "docs", "filename": "big.bin", "content": b64(&big)})).await.json(),
+        json!({"data": "file too large (max 10MB)", "success": false})
+    );
+    assert!(!repo.join("docs/big.bin").exists());
+
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    assert_eq!(
+        post_coder(&h, "upload", json!({"sandbox": "repo", "path": "docs", "filename": "ro.txt", "content": b64(b"x")})).await.json(),
+        json!({"data": "coder is in read-only mode", "success": false})
+    );
+    assert!(!repo.join("docs/ro.txt").exists());
+}
+
+#[tokio::test]
+async fn git_split_diff_pairs_changes_into_side_by_side_rows() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\ntwo\nthree\n", "first");
+    let h = harness_with_coder(&repo).await;
+    std::fs::write(repo.join("a.txt"), "one\n2\nthree\nfour\n").unwrap();
+
+    let resp = h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=a.txt").await;
+    assert_eq!(
+        resp.json(),
+        json!({"data": {"rows": [
+            {"old_num": 1, "old_text": "one", "new_num": 1, "new_text": "one", "type": "equal"},
+            {"old_num": 2, "old_text": "two", "new_num": 2, "new_text": "2", "type": "mod"},
+            {"old_num": 3, "old_text": "three", "new_num": 3, "new_text": "three", "type": "equal"},
+            {"old_num": null, "old_text": null, "new_num": 4, "new_text": "four", "type": "add"},
+        ]}, "success": true}),
+        "{}",
+        resp.body
+    );
+    // each row keeps python's key order: old_num, old_text, new_num, new_text, type
+    let rows = resp.json()["data"]["rows"].clone();
+    assert_eq!(keys_of(&rows[0]), ["old_num", "old_text", "new_num", "new_text", "type"]);
+
+    // staged and untracked variants read the same row shape. staging "four" makes it an add row against
+    // HEAD; dropping it from the worktree makes it a del row against the index
+    run_git(&repo, &["add", "--", "a.txt"]);
+    let staged = h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=a.txt&staged=1").await.json();
+    assert_eq!(staged["data"]["rows"][3], json!({"old_num": null, "old_text": null, "new_num": 4, "new_text": "four", "type": "add"}));
+    std::fs::write(repo.join("a.txt"), "one\n2\nthree\n").unwrap();
+    let unstaged = h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=a.txt").await.json();
+    assert_eq!(unstaged["data"]["rows"][3], json!({"old_num": 4, "old_text": "four", "new_num": null, "new_text": null, "type": "del"}));
+    std::fs::write(repo.join("new.txt"), "a\nb\n").unwrap();
+    let untracked = h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=new.txt&untracked=1").await.json();
+    assert_eq!(
+        untracked,
+        json!({"data": {"rows": [
+            {"old_num": null, "old_text": null, "new_num": 1, "new_text": "a", "type": "add"},
+            {"old_num": null, "old_text": null, "new_num": 2, "new_text": "b", "type": "add"},
+        ]}, "success": true})
+    );
+}
+
+#[tokio::test]
+async fn git_split_diff_checks_its_fields_method_and_read_only_is_no_bar() {
+    let root = tempfile::tempdir().expect("sandbox root");
+    let repo = root.path().join("repo");
+    init_repo(&repo);
+    commit_file(&repo, "a.txt", "one\n", "first");
+    let h = harness_with_coder(&repo).await;
+
+    assert_eq!(
+        h.get("/api/ext/coder/git_split_diff?sandbox=repo").await.json(),
+        json!({"data": "sandbox and path are both required", "success": false})
+    );
+    assert_eq!(
+        h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=../../outside.txt").await.json(),
+        json!({"data": "path escapes the sandbox: ../../outside.txt", "success": false})
+    );
+    // no changes is an empty row list, not a failure
+    assert_eq!(
+        h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=a.txt").await.json(),
+        json!({"data": {"rows": []}, "success": true})
+    );
+
+    let resp = h.send(post_json("/api/ext/coder/git_split_diff", "")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
+
+    // a read route, so read-only mode still answers it
+    h.manager.module("coder").expect("coder loaded").base().config.view().set("read-only", json!(true));
+    assert_eq!(
+        h.get("/api/ext/coder/git_split_diff?sandbox=repo&path=a.txt").await.json(),
+        json!({"data": {"rows": []}, "success": true})
+    );
+}
