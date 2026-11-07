@@ -1526,3 +1526,161 @@ async fn calendar_channels_answers_the_available_channel_names() {
     let expected = ol_modules_data::scheduler::available_channels();
     assert_eq!(resp.json(), json!({"data": expected, "success": true}), "{}", resp.body);
 }
+
+// ---------------- /api/ext/characters (list, current, get, switch, switch_default) ----------------
+
+use ol_modules_data::characters::Characters;
+
+/// the characters module loaded the way the manager loads it at startup, so its webui routes are reachable
+async fn harness_with_characters() -> Harness {
+    let h = harness(false).await;
+    let base = ModuleBase::new("characters", false, Arc::downgrade(&h.manager));
+    let characters: Arc<dyn Module> = Arc::new(Characters::new(base));
+    characters.on_ready().await.expect("characters load");
+    h.manager.insert_module(characters);
+    // the character lives in the loaded chat's metadata, so a chat must be open (the app always has one)
+    let opened = h.send(post_json("/api/chat/new", "{}")).await;
+    assert_eq!(opened.json()["success"], json!(true), "open chat: {}", opened.body);
+    h
+}
+
+/// adds a character through the module's own add route
+async fn add_character(h: &Harness, name: &str, category: &str, tags: &[&str], first_message: &str) {
+    let body = json!({
+        "name": name,
+        "profile": "A test profile",
+        "category": category,
+        "tags": tags,
+        "first_message": first_message,
+    })
+    .to_string();
+    let resp = h.send(post_json("/api/ext/characters/add", &body)).await;
+    assert_eq!(resp.json()["success"], json!(true), "add {name}: {}", resp.body);
+}
+
+#[tokio::test]
+async fn characters_list_groups_by_category_with_general_default_and_name_sorted_members() {
+    let h = harness_with_characters().await;
+    add_character(&h, "bob", "wizards", &["mage"], "").await;
+    add_character(&h, "Ann", "pirates", &["sea", "bold"], "").await;
+    add_character(&h, "zed", "", &[], "").await;
+    add_character(&h, "Cy", "pirates", &[], "").await;
+
+    let resp = h.get("/api/ext/characters/list").await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": {"categories": [
+                {"name": "general", "characters": [{"name": "zed", "tags": []}]},
+                {"name": "pirates", "characters": [
+                    {"name": "Ann", "tags": ["sea", "bold"]},
+                    {"name": "Cy", "tags": []},
+                ]},
+                {"name": "wizards", "characters": [{"name": "bob", "tags": ["mage"]}]},
+            ]},
+            "success": true,
+        }),
+        "{}",
+        resp.body
+    );
+}
+
+#[tokio::test]
+async fn characters_get_matches_names_case_and_space_insensitively_and_reports_a_miss() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "pirates", &["sea"], "").await;
+
+    let found = h.get("/api/ext/characters/get?name=%20ANN%20").await;
+    assert_eq!(found.status, StatusCode::OK);
+    let body = found.json();
+    assert_eq!(body["success"], json!(true));
+    assert_eq!(body["data"]["name"], json!("Ann"));
+    assert_eq!(body["data"]["category"], json!("pirates"));
+    assert_eq!(body["data"]["tags"], json!(["sea"]));
+
+    assert_eq!(
+        h.get("/api/ext/characters/get?name=nobody").await.json(),
+        json!({"data": "character not found", "success": false})
+    );
+    // a missing name parameter is the empty name, which matches nothing
+    assert_eq!(
+        h.get("/api/ext/characters/get").await.json(),
+        json!({"data": "character not found", "success": false})
+    );
+}
+
+#[tokio::test]
+async fn characters_switch_then_current_then_switch_default_round_trips_the_active_character() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "pirates", &[], "").await;
+
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": {}, "success": true}));
+
+    let switched = h.send(post_json("/api/ext/characters/switch", r#"{"name": "  ann  "}"#)).await;
+    assert_eq!(switched.status, StatusCode::OK);
+    assert_eq!(
+        switched.json(),
+        json!({"data": "Switch successful. Write your response as the character's first message.", "success": true})
+    );
+    // the active character is stored under the canonical key, not the spelling that was asked for
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "Ann", "success": true}));
+
+    let reset = h.send(post_json("/api/ext/characters/switch_default", "")).await;
+    assert_eq!(reset.json(), json!({"data": "switched to default character", "success": true}));
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": {}, "success": true}));
+}
+
+#[tokio::test]
+async fn characters_switch_reports_missing_name_and_unknown_character_like_python() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "").await;
+
+    let no_name = h.send(post_json("/api/ext/characters/switch", "{}")).await;
+    assert_eq!(no_name.json(), json!({"data": "error: no character name given", "success": false}));
+    let empty = h.send(post_json("/api/ext/characters/switch", r#"{"name": ""}"#)).await;
+    assert_eq!(empty.json(), json!({"data": "error: no character name given", "success": false}));
+    let unknown = h.send(post_json("/api/ext/characters/switch", r#"{"name": "nobody"}"#)).await;
+    assert_eq!(unknown.json(), json!({"data": "character not found", "success": false}));
+    // a failed switch leaves the chat on the default character
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": {}, "success": true}));
+}
+
+#[tokio::test]
+async fn characters_switch_with_first_messages_on_returns_the_greeting_to_stream_verbatim() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "Ahoy {{user}}, I am {{char}}.").await;
+    ol_core::config::update(|m| {
+        m.insert("modules".into(), json!({"settings": {"characters": {"use_first_messages": true}}}));
+    });
+
+    let resp = h.send(post_json("/api/ext/characters/switch", r#"{"name": "Ann"}"#)).await;
+    assert_eq!(
+        resp.json(),
+        json!({
+            "data": "Switched to Ann. Begin your reply now with this exact greeting, verbatim, and add nothing else:\n\nAhoy user, I am Ann.",
+            "success": true,
+        }),
+        "{}",
+        resp.body
+    );
+}
+
+#[tokio::test]
+async fn characters_routes_answer_wrong_methods_with_python_messages() {
+    let h = harness_with_characters().await;
+    let resp = h.get("/api/ext/characters/switch").await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}));
+
+    let resp = h.get("/api/ext/characters/switch_default").await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts POST", "success": false}));
+
+    let resp = h.send(post_json("/api/ext/characters/list", "{}")).await;
+    assert_eq!(resp.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
+    let resp = h.send(post_json("/api/ext/characters/current", "{}")).await;
+    assert_eq!(resp.json(), json!({"data": "route only accepts GET", "success": false}));
+}
+
