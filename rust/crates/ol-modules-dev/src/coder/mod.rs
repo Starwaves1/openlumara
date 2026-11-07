@@ -1471,10 +1471,11 @@ impl Coder {
             .ok_or_else(|| FSPATH_NONE.to_string())
     }
 
-    /// `_git_root` for a POST body: `subpath` is handed on raw, so a falsy non-str value is "no
-    /// subpath" and a truthy non-str one fails as python's `.replace` does
-    fn body_git_root(&self, sandbox: &str, b: &Map<String, Value>) -> R<String> {
-        self.python_git_root(&Value::String(sandbox.to_string()), &subpath_of(b))?
+    /// `_git_root` for a POST body: `sandbox` and `subpath` are handed on raw, so a falsy non-str
+    /// subpath is "no subpath" and a truthy non-str one fails as python's `.replace` does. A None
+    /// root is refused: python's revert route fails on it in `os.path.dirname(None)`
+    fn body_git_root(&self, sandbox: &Value, b: &Map<String, Value>) -> R<String> {
+        self.python_git_root(sandbox, &subpath_of(b))?
             .ok_or_else(|| FSPATH_NONE.to_string())
     }
 
@@ -1835,30 +1836,33 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        if sandbox.is_empty() {
+        // python `if not sandbox`: a falsy non-str value is missing; a truthy one goes to _git_root raw
+        let Some(sandbox) = required_field(b, "sandbox") else {
             return self.result("no sandbox given", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
+        };
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(sandbox, &subpath_of(b)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let cwd = root.as_deref();
+        let (ok, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
-        let Some(remote) = Self::pick_remote(Some(&root)).await else {
+        let Some(remote) = Self::pick_remote(cwd).await else {
             return self.result("this repo has no remotes", false);
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("fetch"), remote, "--prune".into()], 120).await;
-        let out = String::from_utf8_lossy(&raw).trim().to_string();
+        let (rc, raw) = run_git_bytes_in(cwd, &[String::from("fetch"), remote, "--prune".into()], 120).await;
+        let out = pyos::strip(&String::from_utf8_lossy(&raw)).to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git fetch failed".into() } else { out }, false);
         }
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git_in(cwd, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let upstream = pyos::strip(&upstream).to_string();
         let mut incoming = Vec::new();
-        if ok && upstream.trim().contains('/') {
-            let (rc2, raw2) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream.trim()), "-n100".into()], 15).await;
+        if ok && upstream.contains('/') {
+            let (rc2, raw2) = run_git_bytes_in(cwd, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream), "-n100".into()], 15).await;
             if rc2 == 0 {
                 incoming = parse_log(&raw2);
             }
@@ -1870,22 +1874,23 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        if sandbox.is_empty() {
+        let Some(sandbox) = required_field(b, "sandbox") else {
             return self.result("no sandbox given", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
+        };
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(sandbox, &subpath_of(b)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let cwd = root.as_deref();
+        let (ok, branch) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pulling", false);
         }
-        let (rc, raw) = run_git_bytes(&root, &s(&["pull"]), 120).await;
-        let out = String::from_utf8_lossy(&raw).trim().to_string();
+        let (rc, raw) = run_git_bytes_in(cwd, &s(&["pull"]), 120).await;
+        let out = pyos::strip(&String::from_utf8_lossy(&raw)).to_string();
         if rc != 0 {
-            let (_, craw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+            let (_, craw) = run_git_bytes_in(cwd, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
             let craw = String::from_utf8_lossy(&craw).to_string();
             let conflicts: Vec<&str> = py_splitlines(&craw).into_iter().filter(|l| !l.trim().is_empty()).collect();
             if !conflicts.is_empty() {
@@ -1896,54 +1901,56 @@ impl Coder {
         self.result(if out.is_empty() { "pulled".into() } else { out }, true)
     }
 
-    async fn route_git_branch_create(&self, b: &Map<String, Value>) -> Value {
+    async fn route_git_branch_create(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let name = sget(b, "name").trim().to_string();
+        // python calls `.strip()` on the raw name before the sandbox check, outside any try
+        let name = body_str_strip(b, "name")?;
         let checkout = b.get("checkout").map(truthy).unwrap_or(true);
-        if sandbox.is_empty() || name.is_empty() {
-            return self.result("sandbox and name are both required", false);
-        }
+        let Some(sandbox) = required_field(b, "sandbox").filter(|_| !name.is_empty()) else {
+            return Ok(self.result("sandbox and name are both required", false));
+        };
         let valid = regex::Regex::new(r"^[a-zA-Z0-9._/\-]+\n?$").unwrap();
         if !valid.is_match(&name) {
-            return self.result("invalid branch name: use letters, digits, dots, slashes, hyphens, underscores", false);
+            return Ok(self.result("invalid branch name: use letters, digits, dots, slashes, hyphens, underscores", false));
         }
-        let root = match self.body_git_root(&sandbox, b) {
+        let root = match self.python_git_root(sandbox, &subpath_of(b)) {
             Ok(r) => r,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
         };
-        let (ok, out) = if checkout { git(&root, &["switch", "-c", &name]).await } else { git(&root, &["branch", &name]).await };
+        let cwd = root.as_deref();
+        let (ok, out) = if checkout { git_in(cwd, &["switch", "-c", &name]).await } else { git_in(cwd, &["branch", &name]).await };
         if !ok {
-            return self.result(out, false);
+            return Ok(self.result(out, false));
         }
-        self.result(if out.is_empty() { format!("created branch {}", name) } else { out }, true)
+        Ok(self.result(if out.is_empty() { format!("created branch {}", name) } else { out }, true))
     }
 
-    async fn route_git_branch_delete(&self, b: &Map<String, Value>) -> Value {
+    async fn route_git_branch_delete(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
         if self.read_only() {
-            return self.result("coder is in read-only mode", false);
+            return Ok(self.result("coder is in read-only mode", false));
         }
-        let sandbox = sget(b, "sandbox");
-        let name = sget(b, "name").trim().to_string();
+        // python calls `.strip()` on the raw name before the sandbox check, outside any try
+        let name = body_str_strip(b, "name")?;
         let force = b.get("force").map(truthy).unwrap_or(false);
-        if sandbox.is_empty() || name.is_empty() {
-            return self.result("sandbox and name are both required", false);
-        }
-        let root = match self.body_git_root(&sandbox, b) {
-            Ok(r) => r,
-            Err(e) => return self.result(e, false),
+        let Some(sandbox) = required_field(b, "sandbox").filter(|_| !name.is_empty()) else {
+            return Ok(self.result("sandbox and name are both required", false));
         };
-        let (_, current) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        if current.trim() == name {
-            return self.result("cannot delete the branch you are currently on", false);
+        let root = match self.python_git_root(sandbox, &subpath_of(b)) {
+            Ok(r) => r,
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        let cwd = root.as_deref();
+        let (_, current) = git_in(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        if pyos::strip(&current) == name {
+            return Ok(self.result("cannot delete the branch you are currently on", false));
         }
-        let (ok, out) = git(&root, &["branch", if force { "-D" } else { "-d" }, &name]).await;
+        let (ok, out) = git_in(cwd, &["branch", if force { "-D" } else { "-d" }, &name]).await;
         if !ok {
-            return self.result(out, false);
+            return Ok(self.result(out, false));
         }
-        self.result(if out.is_empty() { format!("deleted branch {}", name) } else { out }, true)
+        Ok(self.result(if out.is_empty() { format!("deleted branch {}", name) } else { out }, true))
     }
 
     async fn route_git_conflicts(&self, q: &Map<String, Value>) -> Value {
@@ -1951,16 +1958,17 @@ impl Coder {
         if sandbox.is_empty() {
             return self.result("no sandbox given", false);
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")) {
+        // no sandbox_paths and no subpath: python's cwd=None, the server's own working directory
+        let root = match self.python_git_root(&Value::String(sandbox), &Value::String(sget(q, "subpath"))) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (rc, raw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+        let (rc, raw) = run_git_bytes_in(root.as_deref(), &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
         if rc != 0 {
             return json!({"conflicts": []});
         }
         let text = String::from_utf8_lossy(&raw).to_string();
-        let conflicts: Vec<&str> = py_splitlines(&text).into_iter().filter(|l| !l.trim().is_empty()).map(|l| l.trim()).collect();
+        let conflicts: Vec<&str> = py_splitlines(&text).into_iter().filter(|l| !l.trim().is_empty()).map(pyos::strip).collect();
         json!({"conflicts": conflicts})
     }
 
@@ -1968,19 +1976,24 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        let strategy = if b.contains_key("strategy") { sget(b, "strategy") } else { "ours".into() };
-        if sandbox.is_empty() || rel_path.is_empty() {
+        // python `if not sandbox or not rel_path`: a falsy non-str value is missing
+        let (Some(sandbox), Some(rel_raw)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
+        };
+        let strategy = if b.contains_key("strategy") { sget(b, "strategy") } else { "ours".into() };
         if !matches!(strategy.as_str(), "ours" | "theirs" | "both") {
             return self.result("strategy must be 'ours', 'theirs', or 'both'", false);
         }
-        let root = match self.body_git_root(&sandbox, b).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
+        // python: a None root reaches `os.path.dirname(None)` in _check_git_paths
+        let root = match self.python_git_root(sandbox, &subpath_of(b)).and_then(|r| r.ok_or_else(|| FSPATH_NONE.to_string())) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
+        if let Err(e) = Self::check_git_paths(&root, std::slice::from_ref(rel_raw)) {
+            return self.result(e, false);
+        }
+        // check_git_paths only accepts a str path, so this is the path itself
+        let rel_path = rel_raw.as_str().unwrap_or_default().to_string();
         let abs = pyos::normpath(&pyos::join(&root, &rel_path));
         let (ok, out) = match strategy.as_str() {
             "ours" => git(&root, &["checkout", "--ours", "--", &rel_path]).await,
@@ -2010,17 +2023,18 @@ impl Coder {
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
-        let sandbox = sget(b, "sandbox");
-        let rel_path = sget(b, "path");
-        if sandbox.is_empty() || rel_path.is_empty() {
+        // python `if not sandbox or not rel_path`: a falsy non-str value is missing
+        let (Some(sandbox), Some(rel_raw)) = (required_field(b, "sandbox"), required_field(b, "path")) else {
             return self.result("sandbox and path are both required", false);
-        }
-        let root = match self.body_git_root(&sandbox, b).and_then(|r| Self::check_git_paths(&r, &[Value::String(rel_path.clone())]).map(|_| r)) {
+        };
+        let root = match self.body_git_root(sandbox, b).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(rel_raw)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
+        // check_git_paths only accepts a str path, so this is the path itself
+        let rel_path = rel_raw.as_str().unwrap_or_default().to_string();
         let abs = pyos::normpath(&pyos::join(&root, &rel_path));
-        let (ok, out) = git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
+        let (ok, out) = git(&root, &["restore","--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
         if !ok {
             return self.result(out, false);
         }
@@ -2242,8 +2256,8 @@ impl Module for Coder {
             "git_diff" => self.route_git_diff(q).await,
             "git_fetch" => self.route_git_fetch(&b).await,
             "git_pull" => self.route_git_pull(&b).await,
-            "git_branch_create" => self.route_git_branch_create(&b).await,
-            "git_branch_delete" => self.route_git_branch_delete(&b).await,
+            "git_branch_create" => self.route_git_branch_create(&b).await?,
+            "git_branch_delete" => self.route_git_branch_delete(&b).await?,
             "git_conflicts" => self.route_git_conflicts(q).await,
             "git_resolve" => self.route_git_resolve(&b).await,
             "git_revert_file" => self.route_git_revert_file(&b).await,
@@ -2576,6 +2590,73 @@ mod tests {
         // letters and other numerics (roman numeral, superscript) are not decimal digits
         assert_eq!(parse_py_int("\u{2164}"), None);
         assert_eq!(parse_py_int("\u{00B2}"), None);
+    }
+
+    #[tokio::test]
+    async fn branch_routes_raise_on_non_string_name_like_python_strip() {
+        // python `(body or {}).get("name", "").strip()` runs before the sandbox check and outside
+        // any try, so a non-str name raises AttributeError instead of being coerced to a branch name
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let cases = [
+            (json!(5), "'int' object has no attribute 'strip'"),
+            (json!(true), "'bool' object has no attribute 'strip'"),
+            (json!(null), "'NoneType' object has no attribute 'strip'"),
+        ];
+        for (name, msg) in cases {
+            let body = json!({"sandbox": "ws", "name": name});
+            let err = coder.route_git_branch_create(body.as_object().unwrap()).await.unwrap_err();
+            assert_eq!(err.to_string(), msg);
+            let err = coder.route_git_branch_delete(body.as_object().unwrap()).await.unwrap_err();
+            assert_eq!(err.to_string(), msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn falsy_non_string_sandbox_and_path_are_missing_on_git_sync_routes_like_python() {
+        // python `if not sandbox` / `if not rel_path`: 0, false, [] and {} are missing, so the
+        // routes answer with their required-field error instead of running git on "0" or "False"
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        for v in [json!(0), json!(false), json!([]), json!({})] {
+            let body = json!({"sandbox": v.clone()});
+            let out = coder.route_git_fetch(body.as_object().unwrap()).await;
+            assert_eq!(out, json!({"status": "error", "content": "no sandbox given"}));
+            let out = coder.route_git_pull(body.as_object().unwrap()).await;
+            assert_eq!(out, json!({"status": "error", "content": "no sandbox given"}));
+            let body = json!({"sandbox": v.clone(), "name": "feat"});
+            let out = coder.route_git_branch_create(body.as_object().unwrap()).await.unwrap();
+            assert_eq!(out, json!({"status": "error", "content": "sandbox and name are both required"}));
+            let body = json!({"sandbox": "ws", "path": v});
+            let out = coder.route_git_resolve(body.as_object().unwrap()).await;
+            assert_eq!(out, json!({"status": "error", "content": "sandbox and path are both required"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_with_non_string_path_fails_on_the_none_root_like_python() {
+        // no sandbox_paths and no subpath: python's _git_root is None, so _check_git_paths fails in
+        // os.path.dirname(None) before the path is looked at
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let body = json!({"sandbox": "ws", "path": 5});
+        let out = coder.route_git_resolve(body.as_object().unwrap()).await;
+        assert_eq!(out, json!({"status": "error", "content": "expected str, bytes or os.PathLike object, not NoneType"}));
+    }
+
+    #[tokio::test]
+    async fn conflicts_without_sandbox_paths_runs_git_in_server_cwd_like_python() {
+        // python runs `git diff --diff-filter=U` with cwd=None rather than refusing; the reply is a
+        // conflicts list, never an error
+        let coder = Coder::new(ModuleBase::detached("coder"));
+        let q = json!({"sandbox": "ws"});
+        let out = coder.route_git_conflicts(q.as_object().unwrap()).await;
+        assert!(out["conflicts"].is_array(), "{out}");
+        assert!(out.get("status").is_none(), "{out}");
+    }
+
+    #[test]
+    fn branch_name_strip_uses_python_whitespace_set() {
+        // python str.strip() removes U+001C..U+001F, which rust trim() does not
+        let m = json!({"name": "\u{1c}feature\u{1f}"});
+        assert_eq!(body_str_strip(m.as_object().unwrap(), "name").unwrap(), "feature");
     }
 
     #[cfg(unix)]
