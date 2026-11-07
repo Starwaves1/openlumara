@@ -77,7 +77,7 @@ pub fn build(cat: Category, pairs: Vec<(&str, Value)>) -> Result<Record, DdgsErr
 fn normalize(field: &str, value: Value) -> Result<Value, DdgsError> {
     match field {
         "title" | "body" | "author" | "publisher" | "info" => Ok(Value::String(normalize_text(text_arg(&value)?))),
-        "href" | "url" | "thumbnail" | "image" => Ok(Value::String(normalize_url(text_arg(&value)?))),
+        "href" | "url" | "thumbnail" | "image" => Ok(Value::String(normalize_url(url_arg(&value)?))),
         // _normalize_date: ints (bool included, as in python) become ISO timestamps, the rest pass through
         "date" => match &value {
             Value::Bool(b) => iso_from_timestamp(i64::from(*b)).map(Value::String),
@@ -88,10 +88,53 @@ fn normalize(field: &str, value: Value) -> Result<Value, DdgsError> {
     }
 }
 
+/// `_normalize_text(value)` on a truthy non-str: `re.sub` rejects it
 fn text_arg(value: &Value) -> Result<&str, DdgsError> {
-    value
-        .as_str()
-        .ok_or_else(|| DdgsError::Failed(format!("expected a string, not {}", py_type_name(value))))
+    value.as_str().ok_or_else(|| {
+        DdgsError::Failed(format!("expected string or bytes-like object, got '{}'", py_type_name(value)))
+    })
+}
+
+/// `_normalize_url(value)` on a truthy non-str: `unquote` runs `'%' not in value` (a TypeError for
+/// scalars); for a list or dict that passes and `string.split` is the AttributeError
+fn url_arg(value: &Value) -> Result<&str, DdgsError> {
+    value.as_str().ok_or_else(|| {
+        let t = py_type_name(value);
+        DdgsError::Failed(match value {
+            Value::Array(_) | Value::Object(_) => format!("'{t}' object has no attribute 'split'"),
+            _ => format!("argument of type '{t}' is not iterable"),
+        })
+    })
+}
+
+/// `value.<name>` on a json value that is not the object python expects: AttributeError text
+pub fn no_attr(value: &Value, name: &str) -> DdgsError {
+    DdgsError::Failed(format!("'{}' object has no attribute '{name}'", py_type_name(value)))
+}
+
+/// python `value[index]` on a json value, with the exception python raises: IndexError on lists
+/// and strs (strs index by character), KeyError on dicts (str of the int key), TypeError otherwise
+pub fn py_getitem(value: &Value, index: usize) -> Result<Value, DdgsError> {
+    match value {
+        Value::Array(a) => a.get(index).cloned().ok_or_else(|| DdgsError::Failed("list index out of range".into())),
+        Value::String(s) => s
+            .chars()
+            .nth(index)
+            .map(|c| Value::String(c.to_string()))
+            .ok_or_else(|| DdgsError::Failed("string index out of range".into())),
+        Value::Object(_) => Err(DdgsError::Failed(index.to_string())),
+        other => Err(DdgsError::Failed(format!("'{}' object is not subscriptable", py_type_name(other)))),
+    }
+}
+
+/// python `value["key"]` on a json value, with the exception python raises (KeyError text is the repr)
+pub fn py_key<'a>(value: &'a Value, key: &str) -> Result<&'a Value, DdgsError> {
+    match value {
+        Value::Object(o) => o.get(key).ok_or_else(|| DdgsError::Failed(format!("'{key}'"))),
+        Value::Array(_) => Err(DdgsError::Failed("list indices must be integers or slices, not str".into())),
+        Value::String(_) => Err(DdgsError::Failed("string indices must be integers, not 'str'".into())),
+        other => Err(DdgsError::Failed(format!("'{}' object is not subscriptable", py_type_name(other)))),
+    }
 }
 
 static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new("<.*?>").unwrap());
@@ -314,17 +357,19 @@ pub fn json_results(text: &str) -> Result<Vec<Value>, DdgsError> {
     match obj.get("results") {
         None => Ok(Vec::new()),
         Some(Value::Array(items)) => Ok(items.clone()),
-        // iterating an empty dict or string yields nothing
+        // `for item in x` over an empty dict or str yields nothing
         Some(Value::Object(o)) if o.is_empty() => Ok(Vec::new()),
         Some(Value::String(s)) if s.is_empty() => Ok(Vec::new()),
-        Some(other) => Err(DdgsError::Failed(format!("'{}' item has no attribute 'get'", py_type_name(other)))),
+        // a non-empty dict yields its keys and a non-empty str its characters: both are str
+        Some(Value::Object(_)) | Some(Value::String(_)) => Err(DdgsError::Failed("'str' object has no attribute 'get'".into())),
+        // a for loop over an int, float, bool or None raises whatever its truthiness
+        Some(other) => Err(DdgsError::Failed(format!("'{}' object is not iterable", py_type_name(other)))),
     }
 }
 
 /// one JSON result item as a dict (`item.get(key)` needs a dict)
 pub fn json_item(item: &Value) -> Result<&Map<String, Value>, DdgsError> {
-    item.as_object()
-        .ok_or_else(|| DdgsError::Failed(format!("'{}' object has no attribute 'get'", py_type_name(item))))
+    item.as_object().ok_or_else(|| no_attr(item, "get"))
 }
 
 #[cfg(test)]
@@ -338,6 +383,17 @@ mod tests {
         // non-string truthy values raise, as _normalize_text does on int/bool
         let mut rec = template(Category::Text);
         assert!(set(&mut rec, "title", json!(5)).is_err());
+        let text_err = set(&mut rec, "title", json!(5)).unwrap_err();
+        assert_eq!(text_err.message(), "expected string or bytes-like object, got 'int'");
+        let url_err = set(&mut rec, "url", json!(5)).unwrap_err();
+        assert_eq!(url_err.message(), "argument of type 'int' is not iterable");
+        assert_eq!(json_results(r#"{"results": {"a": 1}}"#).unwrap_err().message(), "'str' object has no attribute 'get'");
+        assert_eq!(json_results(r#"{"results": 3}"#).unwrap_err().message(), "'int' object is not iterable");
+        assert_eq!(json_results(r#"{"results": [3]}"#).unwrap().len(), 1);
+        assert_eq!(json_item(&json!(3)).unwrap_err().message(), "'int' object has no attribute 'get'");
+        assert_eq!(py_getitem(&json!(["a"]), 1).unwrap_err().message(), "list index out of range");
+        assert_eq!(py_getitem(&json!({"a": 1}), 1).unwrap_err().message(), "1");
+        assert_eq!(py_key(&json!([1]), "query").unwrap_err().message(), "list indices must be integers or slices, not str");
         assert_eq!(normalize_url("https://a.test/x%20y z"), "https://a.test/x+y+z");
     }
 

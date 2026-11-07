@@ -134,6 +134,20 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_first_text_node_is_python_text_0() {
+        // python: dimension[0] is the blank node ' ', split('x') has one part: unpack ValueError
+        let blank_dim = r#"<div class="item"><div class="imgpt"><a class="iusc" m='{"t":"T","murl":"https://i/x.jpg","turl":"https://t/x.jpg","purl":"https://p/x"}'></a></div>
+            <div class="infopt"><div class="img_info"><span class="nowrap"> <b>x</b>640x480</span></div></div></div>"#;
+        assert_eq!(extract(blank_dim).unwrap_err().message(), "not enough values to unpack (expected 2, got 1)");
+        // python: source[0] is the blank text node '\n  ' of <a>, kept as-is
+        let blank_source = r#"<div class="item"><div class="imgpt"><a class="iusc" m='{"t":"T","murl":"https://i/x.jpg","turl":"https://t/x.jpg","purl":"https://p/x"}'></a></div>
+            <div class="infopt"><div class="img_info"><span class="nowrap">640x480</span></div><div class="lnkw"><a>
+  <img>Pet Site</a></div></div></div>"#;
+        let out = extract(blank_source).unwrap();
+        assert_eq!(out[0]["source"], serde_json::json!("\n  "));
+    }
+
+    #[test]
     fn payload_uses_count_35_and_python_qft_table() {
         let args = SearchArgs::default();
         let p = build_payload("dogs", &args).unwrap();

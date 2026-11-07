@@ -3,12 +3,18 @@
 //! the caller names the original expression. Node-sets are returned in document order and
 //! without duplicates, as XPath does.
 
-use crate::pytext::py_strip;
-use scraper::{ElementRef, Html};
+use html5ever::driver::{self, ParseOpts};
+use scraper::{ElementRef, Html, HtmlTreeSink};
 use std::collections::HashSet;
+use tendril::TendrilSink;
 
+/// Parses a page the way lxml does for ddgs: html5ever with scripting disabled, so `<noscript>`
+/// content is markup (lazy-load `<img>` inside it stays in the tree). scraper's own
+/// `Html::parse_document` runs with scripting on and would make that content raw text.
 pub fn parse(text: &str) -> Html {
-    Html::parse_document(text)
+    let mut opts = ParseOpts::default();
+    opts.tree_builder.scripting_enabled = false;
+    driver::parse_document(HtmlTreeSink::new(Html::new_document()), opts).one(text)
 }
 
 /// `//*` of the document (root included), document order
@@ -133,11 +139,11 @@ pub fn direct_text(els: &[ElementRef<'_>]) -> String {
     out
 }
 
-/// first direct text child that is not only whitespace (lxml's `remove_blank_text` drops those)
+/// `text()[0]` of one element: the first direct text child, whitespace-only text included.
+/// lxml keeps whitespace-only text nodes inside `span`/`a` (`//span/text()` on
+/// `<span> <b>x</b>640x480</span>` is `[' ', '640x480']`), so python takes the blank one too.
 pub fn first_text(el: ElementRef<'_>) -> Option<String> {
-    el.children()
-        .filter_map(|n| n.value().as_text().map(|t| t.text.to_string()))
-        .find(|t| !py_strip(t).is_empty())
+    el.children().find_map(|n| n.value().as_text().map(|t| t.text.to_string()))
 }
 
 /// `"".join(xpath("./@attr"))` over a node-set (attributes that are present, document order)
@@ -158,6 +164,24 @@ mod tests {
         assert_eq!(text_of(&[outer]), "xyzw");
         assert_eq!(text_of(&[outer, inner[0]]), "xyzw");
         assert_eq!(text_of(&inner), "yz");
+    }
+
+    #[test]
+    fn noscript_content_is_markup_like_lxml() {
+        let doc = parse("<div><noscript><img data-src=lazy.jpg></noscript></div>");
+        let imgs = desc_named(all_elements(&doc)[0], "img");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].value().attr("data-src"), Some("lazy.jpg"));
+    }
+
+    #[test]
+    fn first_text_keeps_whitespace_only_text_nodes() {
+        let doc = parse("<span class=nowrap> <b>x</b>640x480</span>");
+        let span = desc_named(all_elements(&doc)[0], "span")[0];
+        assert_eq!(first_text(span).as_deref(), Some(" "));
+        let empty = parse("<span><b>x</b></span>");
+        let span = desc_named(all_elements(&empty)[0], "span")[0];
+        assert_eq!(first_text(span), None);
     }
 
     #[test]
