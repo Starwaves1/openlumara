@@ -98,6 +98,11 @@ pub fn rstrip(s: &str) -> &str {
     s.trim_end_matches(py_isspace)
 }
 
+/// python `str.strip()` (whitespace, with the same U+001C..U+001F set as `py_isspace`)
+pub fn strip(s: &str) -> &str {
+    s.trim_matches(py_isspace)
+}
+
 /// python `for line in open(path, encoding="utf-8")` as far as it gets before a decode error.
 /// The file is decoded in 8 KB chunks, and python yields every complete line decoded from the
 /// chunks before the one holding the bad byte. Returns the (universal-newline translated) text of

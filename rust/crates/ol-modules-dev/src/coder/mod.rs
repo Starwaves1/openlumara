@@ -245,27 +245,48 @@ fn re_search(re: &fancy_regex::Regex, line: &str) -> R<bool> {
 
 /// the `folder_blacklist` config value as python's `d not in blacklist` reads it: a list or dict
 /// matches whole names (only str list items can match a str name), a str matches a name that is
-/// a substring of it
+/// a substring of it. A truthy bool or number is not iterable, so python's `in` raises the
+/// TypeError the first time it is evaluated, which `contains` reproduces.
 enum Blacklist {
     Names(Vec<String>),
     Substring(String),
+    NotIterable(&'static str),
 }
 
 impl Blacklist {
     fn from_config(v: Option<Value>) -> Self {
         match v {
+            // python: `config.get(...) or []`, so every falsy value is an empty list
+            None | Some(Value::Null) | Some(Value::Bool(false)) => Blacklist::Names(Vec::new()),
+            Some(Value::Bool(true)) => Blacklist::NotIterable("bool"),
+            Some(Value::Number(n)) if n.as_f64() == Some(0.0) => Blacklist::Names(Vec::new()),
+            Some(Value::Number(n)) => Blacklist::NotIterable(if n.is_f64() { "float" } else { "int" }),
             Some(Value::String(s)) => Blacklist::Substring(s),
             Some(Value::Array(a)) => Blacklist::Names(a.into_iter().filter_map(|x| if let Value::String(s) = x { Some(s) } else { None }).collect()),
             Some(Value::Object(m)) => Blacklist::Names(m.keys().cloned().collect()),
-            _ => Blacklist::Names(Vec::new()),
         }
     }
 
-    fn contains(&self, name: &str) -> bool {
+    fn contains(&self, name: &str) -> R<bool> {
         match self {
-            Blacklist::Names(names) => names.iter().any(|n| n == name),
-            Blacklist::Substring(s) => s.contains(name),
+            Blacklist::Names(names) => Ok(names.iter().any(|n| n == name)),
+            Blacklist::Substring(s) => Ok(s.contains(name)),
+            Blacklist::NotIterable(t) => Err(format!("argument of type '{}' is not a container or iterable", t)),
         }
+    }
+
+    /// python `dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in blacklist
+    /// and keep(d)]`: hidden names are dropped before the blacklist is consulted
+    fn prune_dirs(&self, dirs: &mut Vec<String>, keep: impl Fn(&str) -> bool) -> R<()> {
+        let mut kept = Vec::with_capacity(dirs.len());
+        for d in dirs.iter() {
+            if d.starts_with('.') || self.contains(d)? || !keep(d) {
+                continue;
+            }
+            kept.push(d.clone());
+        }
+        *dirs = kept;
+        Ok(())
     }
 }
 
@@ -288,7 +309,10 @@ fn search_tree(
     let mut truncated = false;
     let mut fatal: Option<String> = None;
     pyos::walk::<()>(root, &mut |dirpath, dirnames, filenames| {
-        dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+        if let Err(e) = blacklist.prune_dirs(dirnames, |_| true) {
+            fatal = Some(e);
+            return ControlFlow::Break(());
+        }
         for fname in filenames {
             if fname.starts_with('.') {
                 continue;
@@ -412,11 +436,11 @@ async fn run_git_in(cwd: Option<&str>, args: &[&str], accept: &[i32]) -> (bool, 
     };
     // python's text=True decodes strictly (and translates newlines); a decode error is the failure
     let stdout = match pyos::decode_utf8(&out.stdout) {
-        Ok(s) => pyos::universal_newlines(&s).trim().to_string(),
+        Ok(s) => pyos::strip(&pyos::universal_newlines(&s)).to_string(),
         Err(e) => return (false, e),
     };
     let stderr = match pyos::decode_utf8(&out.stderr) {
-        Ok(s) => pyos::universal_newlines(&s).trim().to_string(),
+        Ok(s) => pyos::strip(&pyos::universal_newlines(&s)).to_string(),
         Err(e) => return (false, e),
     };
     let rc = out.status.code().unwrap_or(-1);
@@ -487,14 +511,14 @@ fn parse_log(raw: &[u8]) -> Vec<Value> {
     let text = String::from_utf8_lossy(raw);
     let mut entries = Vec::new();
     for line in py_splitlines(&text) {
-        if line.trim().is_empty() {
+        if pyos::strip(line).is_empty() {
             continue;
         }
         let (h, msg) = match line.split_once('\t') {
             Some((h, m)) => (h, m),
             None => (line, ""),
         };
-        entries.push(json!({"hash": h.trim(), "msg": msg}));
+        entries.push(json!({"hash": pyos::strip(h), "msg": msg}));
     }
     entries
 }
@@ -735,7 +759,14 @@ impl Coder {
         let mut total: i64 = 0;
         for m in matches {
             let rel = pyos::relpath(&m, &target_path);
-            if rel.split('/').any(|p| blacklist.contains(p)) {
+            let mut blacklisted = false;
+            for part in rel.split('/') {
+                if blacklist.contains(part).map_err(err)? {
+                    blacklisted = true;
+                    break;
+                }
+            }
+            if blacklisted {
                 continue;
             }
             total += 1;
@@ -792,8 +823,12 @@ impl Coder {
         };
 
         let mut matches: Vec<Value> = Vec::new();
+        let mut fatal: Option<String> = None;
         let early = pyos::walk(&target_path, &mut |dirpath, folders, files| {
-            folders.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+            if let Err(e) = blacklist.prune_dirs(folders, |_| true) {
+                fatal = Some(e);
+                return ControlFlow::Break(None);
+            }
             if matches.len() as i64 >= max_matches {
                 return ControlFlow::Break(None);
             }
@@ -832,6 +867,9 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = fatal {
+            anyhow::bail!(e);
+        }
         if let Some(Some(v)) = early {
             return Ok(self.result(v, true));
         }
@@ -1069,58 +1107,62 @@ impl Coder {
         }))
     }
 
-    fn route_tree(&self, q: &Map<String, Value>) -> Value {
+    fn route_tree(&self, q: &Map<String, Value>) -> anyhow::Result<Value> {
         let sandbox = sget(q, "sandbox");
         let rel_path = sget(q, "path");
         if sandbox.is_empty() {
-            return self.result("no sandbox given", false);
+            return Ok(self.result("no sandbox given", false));
         }
         let target = match self.get_sandbox_subpath(&sandbox, &rel_path) {
             Ok(t) => t,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
         };
         if !pyos::isdir(&target) {
-            return self.result("not a folder", false);
+            return Ok(self.result("not a folder", false));
         }
         let blacklist = self.blacklist();
         let names = match pyos::listdir(&target) {
             Ok(n) => n,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
         };
-        let mut entries: Vec<(bool, String, Value)> = names
-            .into_iter()
-            .map(|name| {
-                let full = pyos::join(&target, &name);
-                let is_dir = pyos::isdir(&full);
-                let child_rel = pyos::normpath(&pyos::join(&rel_path, &name));
-                let v = json!({
-                    "name": name,
-                    "path": child_rel,
-                    "is_dir": is_dir,
-                    "hidden": name.starts_with('.'),
-                    "blacklisted": is_dir && blacklist.contains(&name),
-                });
-                (is_dir, name.to_lowercase(), v)
-            })
-            .collect();
+        let mut entries: Vec<(bool, String, Value)> = Vec::new();
+        for name in names {
+            let full = pyos::join(&target, &name);
+            let is_dir = pyos::isdir(&full);
+            let child_rel = pyos::normpath(&pyos::join(&rel_path, &name));
+            // python: `is_dir and name in blacklist`, so the membership test only runs for dirs
+            let blacklisted = is_dir && blacklist.contains(&name).map_err(err)?;
+            let v = json!({
+                "name": name,
+                "path": child_rel,
+                "is_dir": is_dir,
+                "hidden": name.starts_with('.'),
+                "blacklisted": blacklisted,
+            });
+            entries.push((is_dir, name.to_lowercase(), v));
+        }
         entries.sort_by(|a, b| (!a.0, &a.1).cmp(&(!b.0, &b.1)));
-        json!({"path": rel_path, "entries": entries.into_iter().map(|e| e.2).collect::<Vec<_>>()})
+        Ok(json!({"path": rel_path, "entries": entries.into_iter().map(|e| e.2).collect::<Vec<_>>()}))
     }
 
-    fn route_files(&self, q: &Map<String, Value>) -> Value {
+    fn route_files(&self, q: &Map<String, Value>) -> anyhow::Result<Value> {
         let sandbox = sget(q, "sandbox");
         if sandbox.is_empty() {
-            return self.result("no sandbox given", false);
+            return Ok(self.result("no sandbox given", false));
         }
         let target = match self.get_full_sandbox_path(&sandbox) {
             Ok(Some(t)) if pyos::isdir(&t) => t,
-            Ok(_) => return self.result("sandbox not found", false),
-            Err(e) => return self.result(e, false),
+            Ok(_) => return Ok(self.result("sandbox not found", false)),
+            Err(e) => return Ok(self.result(e, false)),
         };
         let blacklist = self.blacklist();
         let mut files: Vec<String> = Vec::new();
+        let mut fatal: Option<String> = None;
         pyos::walk::<()>(&target, &mut |dirpath, folders, filenames| {
-            folders.retain(|d| !d.starts_with('.') && !blacklist.contains(d));
+            if let Err(e) = blacklist.prune_dirs(folders, |_| true) {
+                fatal = Some(e);
+                return ControlFlow::Break(());
+            }
             for name in filenames {
                 if name.starts_with('.') {
                     continue;
@@ -1129,8 +1171,11 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = fatal {
+            anyhow::bail!(e);
+        }
         files.sort();
-        json!({"files": files})
+        Ok(json!({"files": files}))
     }
 
     fn route_read(&self, q: &Map<String, Value>) -> Value {
@@ -1431,10 +1476,14 @@ impl Coder {
         if is_repo(&root) {
             repos.push(String::new());
         }
+        let mut fatal: Option<String> = None;
         pyos::walk::<()>(&root, &mut |dirpath, dirnames, _| {
             let rel = pyos::relpath(dirpath, &root);
             let depth = if rel == "." { 0 } else { rel.split('/').count() };
-            dirnames.retain(|d| !d.starts_with('.') && !blacklist.contains(d) && depth + 1 <= max_depth);
+            if let Err(e) = blacklist.prune_dirs(dirnames, |_| depth + 1 <= max_depth) {
+                fatal = Some(e);
+                return ControlFlow::Break(());
+            }
             if depth == 0 || depth > max_depth {
                 return ControlFlow::Continue(());
             }
@@ -1447,6 +1496,9 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
+        if let Some(e) = fatal {
+            anyhow::bail!(e);
+        }
         Ok(json!({"repos": repos}))
     }
 
@@ -2110,8 +2162,8 @@ impl Module for Coder {
         let q = &query;
         Ok(match path {
             "sandboxes" => self.route_sandboxes()?,
-            "tree" => self.route_tree(q),
-            "files" => self.route_files(q),
+            "tree" => self.route_tree(q)?,
+            "files" => self.route_files(q)?,
             "read" => self.route_read(q),
             "save" => self.route_save(&b),
             "lint" => self.route_lint(&b),
@@ -2348,11 +2400,50 @@ mod tests {
     #[test]
     fn folder_blacklist_follows_python_membership() {
         // a str is a substring test, a list matches whole str names only
-        assert!(Blacklist::from_config(Some(json!("modules"))).contains("modules"));
-        assert!(!Blacklist::from_config(Some(json!("node_modules"))).contains("src"));
-        assert!(Blacklist::from_config(Some(json!(["target", 5]))).contains("target"));
-        assert!(!Blacklist::from_config(Some(json!(["target", 5]))).contains("5"));
-        assert!(!Blacklist::from_config(Some(json!(""))).contains("target"));
+        assert!(Blacklist::from_config(Some(json!("modules"))).contains("modules").unwrap());
+        assert!(!Blacklist::from_config(Some(json!("node_modules"))).contains("src").unwrap());
+        assert!(Blacklist::from_config(Some(json!(["target", 5]))).contains("target").unwrap());
+        assert!(!Blacklist::from_config(Some(json!(["target", 5]))).contains("5").unwrap());
+        assert!(!Blacklist::from_config(Some(json!(""))).contains("target").unwrap());
+    }
+
+    #[test]
+    fn truthy_non_iterable_blacklist_fails_only_when_tested() {
+        // python: `d not in True` raises TypeError, but only once a subdirectory is tested
+        assert_eq!(
+            Blacklist::from_config(Some(json!(true))).contains("x").unwrap_err(),
+            "argument of type 'bool' is not a container or iterable"
+        );
+        assert_eq!(
+            Blacklist::from_config(Some(json!(5))).contains("x").unwrap_err(),
+            "argument of type 'int' is not a container or iterable"
+        );
+        assert_eq!(
+            Blacklist::from_config(Some(json!(1.5))).contains("x").unwrap_err(),
+            "argument of type 'float' is not a container or iterable"
+        );
+        // falsy values are `or []`, so nothing is blacklisted and nothing raises
+        assert!(!Blacklist::from_config(Some(json!(false))).contains("x").unwrap());
+        assert!(!Blacklist::from_config(Some(json!(0))).contains("x").unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("top.txt"), "hit\n").unwrap();
+        // a tree with no subdirectory never tests the blacklist, so the search still returns hits
+        let (results, _) = search_tree(root.to_str().unwrap(), None, &json!("hit"), &Blacklist::from_config(Some(json!(true))), 200).unwrap();
+        assert_eq!(results.len(), 1);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), "hit\n").unwrap();
+        let err = search_tree(root.to_str().unwrap(), None, &json!("hit"), &Blacklist::from_config(Some(json!(true))), 200).unwrap_err();
+        assert_eq!(err.to_string(), "argument of type 'bool' is not a container or iterable");
+    }
+
+    #[test]
+    fn git_log_strips_python_whitespace_set() {
+        // python str.strip() also removes the ASCII separators U+001C..U+001F, rust trim() does not
+        let entries = parse_log(b"\x1f\n\x1fabc1234\tfix the thing\x1f\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], json!({"hash": "abc1234", "msg": "fix the thing\x1f"}));
     }
 
     #[test]
