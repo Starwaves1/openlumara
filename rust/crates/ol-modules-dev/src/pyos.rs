@@ -442,10 +442,10 @@ fn which_in(cmd: &str, path: &str) -> Option<String> {
 /// os.walk (top-down, followlinks=False). `prune` receives the subdirectory names of each
 /// directory and can filter them in place (python: `folders[:] = [...]`). The visitor gets
 /// (dirpath, dirnames, filenames) and may break out early.
-pub fn walk<B>(
-    top: &str,
-    visit: &mut dyn FnMut(&str, &mut Vec<String>, &[String]) -> ControlFlow<B>,
-) -> Option<B> {
+/// the visitor `walk` calls per directory: (dirpath, dirnames, filenames)
+pub type WalkVisit<'a, B> = dyn FnMut(&str, &mut Vec<String>, &[String]) -> ControlFlow<B> + 'a;
+
+pub fn walk<B>(top: &str, visit: &mut WalkVisit<'_, B>) -> Option<B> {
     // python os.walk: an error reading this directory abandons it (nothing is yielded for it)
     let Ok(rd) = std::fs::read_dir(top) else { return None };
     let Ok(entries) = rd.collect::<io::Result<Vec<_>>>() else { return None };
@@ -701,10 +701,8 @@ fn iglob(pathname: &str, recursive: bool, dironly: bool) -> Vec<String> {
 pub fn glob(pathname: &str, recursive: bool) -> Vec<String> {
     let mut r = iglob(pathname, recursive, false);
     // python iglob drops a leading '' when the pattern starts with '**' (`_isrecursive(pathname[:2])`)
-    if (recursive && pathname.starts_with("**")) || pathname.is_empty() {
-        if r.first().map(|s| s.is_empty()).unwrap_or(false) {
-            r.remove(0);
-        }
+    if ((recursive && pathname.starts_with("**")) || pathname.is_empty()) && r.first().is_some_and(|s| s.is_empty()) {
+        r.remove(0);
     }
     r
 }

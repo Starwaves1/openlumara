@@ -548,7 +548,7 @@ fn unique_server_name(configs: &IndexMap<String, ServerCfg>, name: String) -> St
 /// python `_tool_name`: unique, legal `mcp_<server>_<tool>` name (at most 64 characters)
 fn unique_tool_name(used: &mut BTreeSet<String>, server: &str, tool: &str) -> String {
     let full: String = format!("mcp_{}_{}", sanitize(server), sanitize(tool)).chars().take(64).collect();
-    let mut name = full.trim_end_matches(|c| c == '_' || c == '-').to_string();
+    let mut name = full.trim_end_matches(['_', '-']).to_string();
     let base = name.clone();
     let mut counter = 2;
     while used.contains(&name) {
@@ -1287,7 +1287,7 @@ impl SseTransport {
 }
 
 pub enum Transport {
-    Stdio(StdioTransport),
+    Stdio(Box<StdioTransport>),
     Http(HttpTransport),
     Sse(SseTransport),
 }
@@ -1361,7 +1361,7 @@ impl Session {
     async fn connect(cfg: &ServerCfg, on_notify: NotifyFn) -> Result<Arc<Session>, McpError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let transport = match cfg {
-            ServerCfg::Stdio { command, args } => Transport::Stdio(StdioTransport::spawn(command, args, tx)?),
+            ServerCfg::Stdio { command, args } => Transport::Stdio(Box::new(StdioTransport::spawn(command, args, tx)?)),
             ServerCfg::Http { url } => Transport::Http(HttpTransport::new(url, tx)?),
             ServerCfg::Sse { url } => Transport::Sse(SseTransport::connect(url, tx).await?),
         };
@@ -2337,7 +2337,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
         let client = reqwest::Client::builder().timeout(Duration::from_millis(200)).build().expect("client");
-        let err = client.post(&url).send().await.err().expect("must time out");
+        let err = client.post(&url).send().await.expect_err("must time out");
         assert_eq!(flatten_error(&http_error(&err)), "ReadTimeout: timed out");
         drop(listener);
     }
