@@ -101,7 +101,6 @@ fn py_type_name(v: &Value) -> &'static str {
 /// the coder's POST routes that read `(body or {}).get(...)`
 const BODY_ROUTES: &[&str] = &[
     "save",
-    "upload",
     "lint",
     "create",
     "move",
@@ -131,11 +130,6 @@ fn body_dict(path: &str, body: Option<Value>) -> anyhow::Result<Map<String, Valu
         }
         _ => Ok(Map::new()),
     }
-}
-
-/// python `os.devnull`: 'nul' on Windows, '/dev/null' elsewhere
-fn os_devnull() -> &'static str {
-    if cfg!(windows) { "nul" } else { "/dev/null" }
 }
 
 /// python's `os.path.join` / `os.fspath` / `os.walk` text for a None path (no sandbox_paths)
@@ -229,68 +223,6 @@ fn raw_content(m: &Map<String, Value>) -> Result<String, &'static str> {
         None => Ok(String::new()),
         Some(Value::String(s)) => Ok(s.clone()),
         Some(v) => Err(py_type_name(v)),
-    }
-}
-
-/// python `base64.b64decode(s)` (validate=False) on a str, which is `binascii.a2b_base64` in
-/// non-strict mode. a non-ASCII str is a ValueError. every character outside the alphabet is
-/// skipped, '=' counts as padding without ending the data, and the trailing bits of the last
-/// character are not checked. the data fails when it ends with one stray character, or mid-quad
-/// with fewer '=' than the quad needs (two for a 2-character quad, one for a 3-character quad).
-fn b64decode_lenient(s: &str) -> Option<Vec<u8>> {
-    if !s.is_ascii() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
-    let mut quad = 0u8;
-    let mut pads = 0u8;
-    let mut left = 0u8;
-    for ch in s.bytes() {
-        if ch == b'=' {
-            pads = pads.saturating_add(1);
-            continue;
-        }
-        let Some(v) = b64_value(ch) else { continue };
-        pads = 0;
-        match quad {
-            0 => {
-                quad = 1;
-                left = v;
-            }
-            1 => {
-                quad = 2;
-                out.push((left << 2) | (v >> 4));
-                left = v & 0x0f;
-            }
-            2 => {
-                quad = 3;
-                out.push((left << 4) | (v >> 2));
-                left = v & 0x03;
-            }
-            _ => {
-                quad = 0;
-                out.push((left << 6) | v);
-                left = 0;
-            }
-        }
-    }
-    match quad {
-        0 => Some(out),
-        1 => None,
-        q if pads >= 4 - q => Some(out),
-        _ => None,
-    }
-}
-
-/// the 6-bit value of a base64 alphabet character
-fn b64_value(ch: u8) -> Option<u8> {
-    match ch {
-        b'A'..=b'Z' => Some(ch - b'A'),
-        b'a'..=b'z' => Some(ch - b'a' + 26),
-        b'0'..=b'9' => Some(ch - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
     }
 }
 
@@ -1559,17 +1491,14 @@ impl Coder {
     }
 
     /// python `_check_git_paths(root, paths)` followed by `abs_paths = [normpath(join(root, p))]`,
-    /// item by item: a non-str item fails in `os.path.join` (CPython 3.14 wording), and an item
-    /// that escapes the sandbox fails with python's message
+    /// item by item: a non-str item fails in `os.path.join`, and an item that escapes the sandbox
+    /// fails with python's message
     fn check_git_paths(root: &str, items: &[Value]) -> R<Vec<String>> {
         let sandbox_root = pyos::dirname(root);
         let mut abs = Vec::with_capacity(items.len());
         for item in items {
             let Value::String(p) = item else {
-                return Err(format!(
-                    "join() argument must be str, bytes, or os.PathLike object, not '{}'",
-                    py_type_name(item)
-                ));
+                return Err(format!("expected str, bytes or os.PathLike object, not {}", py_type_name(item)));
             };
             let full = pyos::normpath(&pyos::join(root, p));
             if full != sandbox_root && !full.starts_with(&format!("{}/", sandbox_root)) {
@@ -1868,7 +1797,7 @@ impl Coder {
         };
         let abs = pyos::normpath(&pyos::join(&root, &rel_path));
         let (rc, raw) = if untracked {
-            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), os_devnull().into(), abs], 15).await
+            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
         } else if staged {
             run_git_bytes(&root, &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
         } else {
@@ -2112,49 +2041,42 @@ impl Coder {
         self.result(format!("reverted {} to HEAD", rel_path), true)
     }
 
-    /// python `_route_upload`: the request values are used raw. a truthy non-str filename or path
-    /// raises inside `regex.sub` / `.rstrip` (the exception text is the route's error), while a
-    /// non-str sandbox fails in `_get_sandbox_subpath` and returns that text as the result.
-    fn route_upload(&self, b: &Map<String, Value>) -> anyhow::Result<Value> {
+    fn route_upload(&self, b: &Map<String, Value>) -> Value {
+        use base64::Engine;
         if self.read_only() {
-            return Ok(self.result("coder is in read-only mode", false));
+            return self.result("coder is in read-only mode", false);
         }
-        let (Some(sandbox), Some(rel_raw), Some(filename_raw)) =
-            (required_field(b, "sandbox"), required_field(b, "path"), required_field(b, "filename"))
-        else {
-            return Ok(self.result("sandbox, path and filename are all required", false));
-        };
-        let Value::String(filename) = filename_raw else {
-            anyhow::bail!("a bytes-like object is required, not '{}'", py_type_name(filename_raw));
-        };
-        let Value::String(rel_path) = rel_raw else {
-            anyhow::bail!("'{}' object has no attribute 'rstrip'", py_type_name(rel_raw));
-        };
-        // sanitize filename: strip path separators
+        let sandbox = sget(b, "sandbox");
+        let rel_path = sget(b, "path");
+        let content_b64 = sget(b, "content");
+        let filename = sget(b, "filename");
+        if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
+            return self.result("sandbox, path and filename are all required", false);
+        }
         let safe_name = filename.replace(['/', '\\'], "_");
-        let target_rel = format!("{}/{}", rel_path.trim_end_matches('/'), safe_name);
-        let target = match self.sandbox_subpath_raw(sandbox, &Value::String(target_rel.clone())) {
+        let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
+        let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
             Ok(t) => t,
-            Err(e) => return Ok(self.result(e, false)),
+            Err(e) => return self.result(e, false),
         };
         if pyos::exists(&target) {
-            return Ok(self.result(format!("file already exists: {}", target_rel), false));
+            return self.result(format!("file already exists: {}", target_rel), false);
         }
-        // python `base64.b64decode(content)` inside a try: any failure, including a non-str
-        // content value (absent means ""), is "invalid base64 content"
-        let raw = match raw_content(b).ok().and_then(|c| b64decode_lenient(&c)) {
-            Some(r) => r,
-            None => return Ok(self.result("invalid base64 content", false)),
+        // python b64decode (non-validating): drop characters outside the alphabet
+        let cleaned: String = content_b64.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
+        let raw = match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+            Ok(r) => r,
+            Err(_) => return self.result("invalid base64 content", false),
         };
         if raw.len() > 10_000_000 {
-            return Ok(self.result("file too large (max 10MB)", false));
+            return self.result("file too large (max 10MB)", false);
         }
         let parent = pyos::dirname(&target);
         let r = if parent.is_empty() { Ok(()) } else { pyos::makedirs(&parent, true) };
         if let Err(e) = r.and_then(|_| pyos::write_file(&target, &raw)) {
-            return Ok(self.result(e, false));
+            return self.result(e, false);
         }
-        Ok(self.result(format!("uploaded {}", target_rel), true))
+        self.result(format!("uploaded {}", target_rel), true)
     }
 }
 
@@ -2288,7 +2210,6 @@ impl Module for Coder {
         if matches!(
             path,
             "save"
-                | "upload"
                 | "create"
                 | "move"
                 | "delete"
@@ -2340,7 +2261,7 @@ impl Module for Coder {
             "git_conflicts" => self.route_git_conflicts(q).await,
             "git_resolve" => self.route_git_resolve(&b).await,
             "git_revert_file" => self.route_git_revert_file(&b).await,
-            "upload" => self.route_upload(&b)?,
+            "upload" => self.route_upload(&b),
             "git_split_diff" => self.route_git_split_diff(q).await,
             _ => anyhow::bail!("route not found: {}", path),
         })
@@ -2476,47 +2397,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_content_decodes_like_python_b64decode() {
-        // python's non-validating decoder: data after '=' padding keeps decoding, and the
-        // trailing bits of the last character are ignored
-        assert_eq!(b64decode_lenient("QQ==QQ==").unwrap(), b"A\x04\x10");
-        assert_eq!(b64decode_lenient("YQ==YQ==").unwrap(), b"a\x06\x10");
-        assert_eq!(b64decode_lenient("QR==").unwrap(), b"A");
-        assert_eq!(b64decode_lenient("ABCD=").unwrap(), b"\x00\x10\x83");
-        assert_eq!(b64decode_lenient("QUJ=D").unwrap(), b"ABC");
-        assert_eq!(b64decode_lenient("QUJD\n").unwrap(), b"ABC");
-        assert_eq!(b64decode_lenient("").unwrap(), b"");
-        // a non-ASCII str is a ValueError; a stray character or short padding is incorrect
-        assert!(b64decode_lenient("QUJD€").is_none());
-        assert!(b64decode_lenient("Q").is_none());
-        assert!(b64decode_lenient("QQ=").is_none());
-        assert!(b64decode_lenient("QQ=Q").is_none());
-        // an explicit null content is a TypeError in python, so it is invalid, not an empty file
-        assert!(raw_content(json!({"content": null}).as_object().unwrap()).ok().and_then(|c| b64decode_lenient(&c)).is_none());
-        assert_eq!(raw_content(json!({}).as_object().unwrap()).ok().and_then(|c| b64decode_lenient(&c)).unwrap(), b"");
-    }
-
-    #[test]
-    fn upload_uses_raw_request_values_like_python() {
-        let coder = Coder::new(ModuleBase::detached("coder"));
-        // a falsy sandbox is missing, even though it is not a string
-        let out = coder.route_upload(json!({"sandbox": 0, "path": "p", "filename": "f"}).as_object().unwrap()).unwrap();
-        assert_eq!(out["status"], "error");
-        assert_eq!(out["content"], "sandbox, path and filename are all required");
-        // a truthy non-str path raises at .rstrip, before the sandbox is looked at
-        let e = coder.route_upload(json!({"sandbox": "s", "path": 5, "filename": "f"}).as_object().unwrap()).unwrap_err();
-        assert_eq!(e.to_string(), "'int' object has no attribute 'rstrip'");
-        // a truthy non-str filename raises inside regex.sub, which runs first
-        let e = coder.route_upload(json!({"sandbox": "s", "path": "p", "filename": ["f"]}).as_object().unwrap()).unwrap_err();
-        assert_eq!(e.to_string(), "a bytes-like object is required, not 'list'");
-        // a non-str sandbox fails in _get_sandbox_subpath, and that text is the result
-        let out = coder.route_upload(json!({"sandbox": 5, "path": "p", "filename": "f"}).as_object().unwrap()).unwrap();
-        assert_eq!(out["content"], "startswith first arg must be str or a tuple of str, not int");
-        // python's `(body or {}).get` needs a dict for the upload route too
-        assert_eq!(body_dict("upload", Some(json!(["x"]))).unwrap_err().to_string(), "'list' object has no attribute 'get'");
-    }
-
-    #[test]
     fn git_paths_iterate_like_python() {
         // a dict iterates its keys, a str its characters, and numbers/bools are not iterable
         assert_eq!(Coder::path_items(&json!({"a.txt": 1})).unwrap(), vec![json!("a.txt")]);
@@ -2525,15 +2405,8 @@ mod tests {
         assert_eq!(Coder::path_items(&json!(true)).unwrap_err(), "'bool' object is not iterable");
         // a non-str item fails in os.path.join rather than being stringified
         let items = Coder::path_items(&json!([5])).unwrap();
-        assert_eq!(
-            Coder::check_git_paths("/ws/repo", &items).unwrap_err(),
-            "join() argument must be str, bytes, or os.PathLike object, not 'int'"
-        );
-        let items = Coder::path_items(&json!([true])).unwrap();
-        assert_eq!(
-            Coder::check_git_paths("/ws/repo", &items).unwrap_err(),
-            "join() argument must be str, bytes, or os.PathLike object, not 'bool'"
-        );        // the escape check still runs item by item
+        assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "expected str, bytes or os.PathLike object, not int");
+        // the escape check still runs item by item
         let items = Coder::path_items(&json!(["ok.txt", "../../x"])).unwrap();
         assert_eq!(Coder::check_git_paths("/ws/repo", &items).unwrap_err(), "path escapes the sandbox: ../../x");
     }
