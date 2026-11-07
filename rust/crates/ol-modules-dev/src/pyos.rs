@@ -514,7 +514,7 @@ pub fn fnmatch_translate(pat: &str) -> String {
                 if j >= n {
                     res.push_str("\\[");
                 } else {
-                    let mut stuff: String = chars[i..j].iter().collect();
+                    let stuff = py_bracket_stuff(&chars, i, j);
                     i = j + 1;
                     if stuff.is_empty() {
                         // python: empty range never matches
@@ -525,28 +525,20 @@ pub fn fnmatch_translate(pat: &str) -> String {
                         res.push('.');
                         continue;
                     }
-                    stuff = stuff.replace('\\', "\\\\");
-                    let negate = stuff.starts_with('!');
-                    if negate {
-                        stuff = stuff[1..].to_string();
-                    }
-                    // escape regex set operators the regex crate would interpret
-                    let mut esc = String::new();
-                    for ch in stuff.chars() {
-                        if matches!(ch, '[' | '&' | '~' | '|') {
-                            esc.push('\\');
-                        }
-                        esc.push(ch);
-                    }
-                    // only '!' negates in fnmatch; a leading '^' is a literal (python escapes it)
-                    if !negate && esc.starts_with('^') {
-                        esc.insert(0, '\\');
-                    }
                     res.push('[');
-                    if negate {
-                        res.push('^');
+                    for (idx, ch) in stuff.chars().enumerate() {
+                        // only a leading '!' negates in fnmatch; a leading '^' is a literal (python escapes it)
+                        if idx == 0 && ch == '!' {
+                            res.push('^');
+                            continue;
+                        }
+                        // escape regex set operators the regex crate would interpret; a leading ']' is
+                        // a literal in python re but not in the regex crate (`[]-a]` would be `]`, `-`, `a`)
+                        if (idx == 0 && (ch == '^' || ch == ']')) || matches!(ch, '[' | '&' | '~' | '|') {
+                            res.push('\\');
+                        }
+                        res.push(ch);
                     }
-                    res.push_str(&esc);
                     res.push(']');
                 }
             }
@@ -555,6 +547,46 @@ pub fn fnmatch_translate(pat: &str) -> String {
     }
     res.push('$');
     res
+}
+
+/// The text of a bracket class `pat[i..j]` as CPython 3.14 `fnmatch._translate` builds it:
+/// when the class has a '-', the ranges are split into chunks and a reversed range (lo > hi)
+/// is merged into its neighbour, so `[z-a]` ends up empty and `[z-ab-c]` becomes `b-c`.
+fn py_bracket_stuff(pat: &[char], i: usize, j: usize) -> String {
+    let body = &pat[i..j];
+    if !body.contains(&'-') {
+        return body.iter().collect::<String>().replace('\\', "\\\\");
+    }
+    let mut chunks: Vec<Vec<char>> = Vec::new();
+    let mut start = i;
+    let mut k = if pat[i] == '!' { i + 2 } else { i + 1 };
+    while let Some(dash) = (k..j).find(|&x| pat[x] == '-') {
+        chunks.push(pat[start..dash].to_vec());
+        start = dash + 1;
+        k = dash + 3;
+    }
+    let tail = pat[start..j].to_vec();
+    if !tail.is_empty() {
+        chunks.push(tail);
+    } else if let Some(last) = chunks.last_mut() {
+        last.push('-');
+    }
+    // python: "Remove empty ranges -- invalid in RE"
+    for k in (1..chunks.len()).rev() {
+        if let (Some(&lo_end), Some(&hi_start)) = (chunks[k - 1].last(), chunks[k].first()) {
+            if lo_end > hi_start {
+                let rest: Vec<char> = chunks[k][1..].to_vec();
+                chunks[k - 1].pop();
+                chunks[k - 1].extend(rest);
+                chunks.remove(k);
+            }
+        }
+    }
+    chunks
+        .iter()
+        .map(|c| c.iter().collect::<String>().replace('\\', "\\\\").replace('-', "\\-"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 pub fn fnmatch(name: &str, pat: &str) -> bool {
@@ -822,10 +854,53 @@ pub fn copytree(src: &str, dst: &str) -> Result<(), String> {
 /// shutil.rmtree
 pub fn rmtree(p: &str) -> Result<(), String> {
     // shutil.rmtree refuses symlinks instead of unlinking them; CPython 3.14 raises it with errno None
-    if std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-        return Err(format!("[Errno None] None: {}", py_quote(p)));
+    match std::fs::symlink_metadata(p) {
+        Err(e) => return Err(os_err(&e, p)),
+        Ok(m) if m.file_type().is_symlink() => return Err(format!("[Errno None] None: {}", py_quote(p))),
+        Ok(_) => {}
     }
-    std::fs::remove_dir_all(p).map_err(|e| os_err(&e, p))
+    rmtree_walk(p, true)
+}
+
+/// One directory of CPython 3.14's fd-based rmtree walk (`_rmtree_safe_fd_step`), run with the
+/// default onexc, which re-raises. That re-raise carries `filename` = the directory whose step
+/// failed, so the message names that directory (a file that cannot be unlinked is reported as
+/// its parent), not the file itself. FileNotFoundError is ignored below the top-level path.
+fn rmtree_walk(path: &str, top: bool) -> Result<(), String> {
+    let fail = |e: io::Error| -> Result<(), String> {
+        if !top && e.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(os_err(&e, path))
+        }
+    };
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => match rd.collect::<io::Result<Vec<_>>>() {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        },
+        Err(e) => return fail(e),
+    };
+    // python unlinks this directory's files first, then walks the subdirectories last-pushed-first
+    let mut subdirs = Vec::new();
+    for entry in entries {
+        let full = join(path, &entry.file_name().to_string_lossy());
+        // DirEntry::file_type does not follow symlinks, so a link to a directory is unlinked
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            subdirs.push(full);
+        } else if let Err(e) = std::fs::remove_file(&full) {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(os_err(&e, path));
+            }
+        }
+    }
+    for sub in subdirs.iter().rev() {
+        rmtree_walk(sub, false)?;
+    }
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) => fail(e),
+    }
 }
 
 /// shutil.move
@@ -944,6 +1019,30 @@ mod tests {
         assert!(fnmatch("a1", "a[0-9]"));
         assert!(!fnmatch("a1", "a[!0-9]"));
         assert!(fnmatch("[x", "[x"));
+    }
+
+    #[test]
+    fn fnmatch_reversed_ranges_match_cpython() {
+        // expected matches taken from CPython 3.14 fnmatch.fnmatch over the same names
+        let names = ["x", "zx", "ax", "a", "b", "c", "d", "e", "-", "0", "1", "z", "]", "!", "\\", "\\x", "bx", "cx", "ex"];
+        let cases: &[(&str, &[&str])] = &[
+            ("[z-a]x", &[]),
+            ("[!z-a]x", &["zx", "ax", "\\x", "bx", "cx", "ex"]),
+            ("[a-c-e]", &["a", "b", "c", "e", "-"]),
+            ("[z-ab-c]", &["b", "c"]),
+            ("[a-]", &["a", "-"]),
+            ("[]-a]", &["a", "]"]),
+            ("[!-a]", &["x", "b", "c", "d", "e", "0", "1", "z", "]", "!", "\\"]),
+            ("[\\-a]", &["a", "]", "\\"]),
+            ("[a-c]", &["a", "b", "c"]),
+            ("[--0]", &["-", "0"]),
+            ("[c-a-]", &["-"]),
+            ("[ab-]", &["a", "b", "-"]),
+        ];
+        for (pat, expect) in cases {
+            let got: Vec<&str> = names.iter().copied().filter(|n| fnmatch(n, pat)).collect();
+            assert_eq!(&got[..], *expect, "pattern {}", pat);
+        }
     }
 
     #[test]
@@ -1134,6 +1233,37 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(rmtree(&link).unwrap_err(), format!("[Errno None] None: {}", py_quote(&link)));
         assert!(isdir(&real));
+    }
+
+    #[test]
+    fn rmtree_unlinks_symlink_inside_tree_and_keeps_target() {
+        // python: a symlink found while walking is unlinked, never followed
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let real = join(&root, "real");
+        makedirs(&real, false).unwrap();
+        std::fs::write(join(&real, "keep"), b"").unwrap();
+        let tree = join(&root, "tree");
+        makedirs(&tree, false).unwrap();
+        std::os::unix::fs::symlink(&real, join(&tree, "link")).unwrap();
+        rmtree(&tree).unwrap();
+        assert!(!lexists(&tree));
+        assert!(exists(&join(&real, "keep")));
+    }
+
+    #[test]
+    fn rmtree_error_names_the_directory_that_failed() {
+        // python 3.14 on linux: EACCES unlinking 'f' inside 'sub' is raised with filename 'sub'
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        let sub = join(&root, "sub");
+        makedirs(&sub, false).unwrap();
+        std::fs::write(join(&sub, "f"), b"").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = rmtree(&root);
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(res.unwrap_err(), format!("[Errno 13] Permission denied: {}", py_quote(&sub)));
     }
 
     #[test]
