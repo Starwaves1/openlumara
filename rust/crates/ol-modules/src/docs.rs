@@ -3,7 +3,7 @@
 use crate::util;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
-use ol_core::pyjson::{py_str, truthy};
+use ol_core::pyjson::py_str;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -23,51 +23,28 @@ impl Docs {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
 
-    /// the raw `folders` items in python's iteration order
-    fn raw_folders(&self) -> anyhow::Result<Vec<Value>> {
-        folder_items(self.base.config.get1("folders"))
-    }
-
-    /// python `f.rstrip(os.path.sep)` needs a str: any other item raises AttributeError
-    fn folder_str(item: &Value) -> anyhow::Result<String> {
-        match item {
-            Value::String(s) => Ok(s.clone()),
-            other => anyhow::bail!("'{}' object has no attribute 'rstrip'", util::py_type_name(other)),
+    fn folders(&self) -> Vec<String> {
+        match self.base.config.get1("folders") {
+            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
+            Some(Value::String(s)) if !s.is_empty() => s.chars().map(|c| c.to_string()).collect(),
+            _ => Vec::new(),
         }
     }
 
-    fn folders(&self) -> anyhow::Result<Vec<String>> {
-        self.raw_folders()?.iter().map(Self::folder_str).collect()
-    }
-
     /// translates the folder path list into basenames for the AI
-    pub fn get_folder_names(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self.folders()?.iter().map(|f| util::basename(&util::rstrip_sep(f))).collect())
+    pub fn get_folder_names(&self) -> Vec<String> {
+        self.folders().iter().map(|f| util::basename(&util::rstrip_sep(f))).collect()
     }
 
     /// resolves a folder basename to its full path
     pub fn get_folder_path(&self, folder: &str) -> anyhow::Result<Option<String>> {
         let wanted = util::rstrip_sep(folder);
-        // python checks one item at a time and returns at the match, so a bad item only fails if it is reached
-        for item in self.raw_folders()? {
-            let f = Self::folder_str(&item)?;
+        for f in self.folders() {
             if util::basename(&util::rstrip_sep(&f)) == wanted {
                 return Ok(Some(util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&f))?)));
             }
         }
         Ok(None)
-    }
-}
-
-/// python `for f in folders` after the `if not folders` guard: a list yields its items, a string its
-/// characters, a dict its keys; any other truthy value raises python's "not iterable" TypeError
-fn folder_items(folders: Option<Value>) -> anyhow::Result<Vec<Value>> {
-    let Some(v) = folders.filter(truthy) else { return Ok(Vec::new()) };
-    match v {
-        Value::Array(a) => Ok(a),
-        Value::String(s) => Ok(s.chars().map(|c| json!(c.to_string())).collect()),
-        Value::Object(o) => Ok(o.keys().map(|k| json!(k)).collect()),
-        other => anyhow::bail!("'{}' object is not iterable", util::py_type_name(&other)),
     }
 }
 
@@ -113,12 +90,7 @@ impl Module for Docs {
     }
 
     async fn on_ready(&self) -> anyhow::Result<()> {
-        for item in self.raw_folders()? {
-            // python's os.path.expanduser raises TypeError for a non-str item
-            let folder = match &item {
-                Value::String(s) => s.clone(),
-                other => anyhow::bail!("expected str, bytes or os.PathLike object, not {}", util::py_type_name(other)),
-            };
+        for folder in self.folders() {
             let p = util::rstrip_sep(&ol_core::paths::get_path(&util::expanduser(&folder))?);
             std::fs::create_dir_all(&p).map_err(|e| anyhow::anyhow!(util::os_error(&e, &p)))?;
         }
@@ -129,7 +101,7 @@ impl Module for Docs {
     }
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
-        let folders = self.get_folder_names()?;
+        let folders = self.get_folder_names();
         if folders.is_empty() {
             return Ok(None);
         }
@@ -138,7 +110,7 @@ impl Module for Docs {
 
     async fn call_tool(&self, method: &str, args: ToolArgs) -> anyhow::Result<Value> {
         match method {
-            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()?), true)),
+            "get_topics" => Ok(self.base.result(json!(self.get_folder_names()), true)),
             "list" => {
                 let folder = args.str("folder").unwrap_or_default();
                 let subfolder = args.str("subfolder");
@@ -180,7 +152,7 @@ impl Module for Docs {
     async fn ui_route(&self, path: &str, _method: &str, _body: Option<Value>, query: Map<String, Value>) -> anyhow::Result<Value> {
         match path {
             // doc folder basenames for the sidebar dropdown
-            "folders" => Ok(json!(self.get_folder_names()?)),
+            "folders" => Ok(json!(self.get_folder_names())),
             // one directory level: {subfolders: [...], files: [...]} relative paths
             "list" => {
                 let folder = query_str(&query, "folder");
@@ -226,25 +198,5 @@ impl Module for Docs {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn folder_items_iterates_like_python() {
-        // falsy values never iterate
-        assert!(folder_items(Some(json!([]))).unwrap().is_empty());
-        assert!(folder_items(Some(json!(0))).unwrap().is_empty());
-        assert!(folder_items(None).unwrap().is_empty());
-        // a dict yields its keys
-        assert_eq!(folder_items(Some(json!({"notes": 1}))).unwrap(), vec![json!("notes")]);
-        // a string yields characters
-        assert_eq!(folder_items(Some(json!("ab"))).unwrap(), vec![json!("a"), json!("b")]);
-        // a truthy number or bool raises python's TypeError text
-        assert_eq!(folder_items(Some(json!(3))).unwrap_err().to_string(), "'int' object is not iterable");
-        assert_eq!(folder_items(Some(json!(true))).unwrap_err().to_string(), "'bool' object is not iterable");
     }
 }

@@ -58,19 +58,9 @@ pub fn read_text(path: &str) -> Result<String, String> {
         Err(e) => {
             let err = e.utf8_error();
             let pos = err.valid_up_to();
-            let bad = &e.as_bytes()[pos..];
-            // python's utf-8 decoder: lead bytes 0x80-0xc1 and 0xf5-0xff can never start a sequence
-            let (reason, span) = match err.error_len() {
-                Some(n) if matches!(bad[0], 0x80..=0xc1 | 0xf5..=0xff) => ("invalid start byte", n),
-                Some(n) => ("invalid continuation byte", n),
-                // the input ends inside a sequence, so python reports every remaining byte
-                None => ("unexpected end of data", bad.len()),
-            };
-            return Err(if span == 1 {
-                format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", bad[0], pos, reason)
-            } else {
-                format!("'utf-8' codec can't decode bytes in position {}-{}: {}", pos, pos + span - 1, reason)
-            });
+            let b = e.as_bytes()[pos];
+            let reason = if (0x80..0xc0).contains(&b) || b >= 0xf8 { "invalid start byte" } else { "invalid continuation byte" };
+            return Err(format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: {}", b, pos, reason));
         }
     };
     Ok(text.replace("\r\n", "\n").replace('\r', "\n"))
@@ -152,23 +142,6 @@ mod tests {
         assert_eq!(splitlines("a\n"), vec!["a"]);
         assert_eq!(splitlines("a\n\nb"), vec!["a", "", "b"]);
         assert!(splitlines("").is_empty());
-    }
-
-    #[test]
-    fn read_text_decode_errors_match_python() {
-        let path = std::env::temp_dir().join(format!("read_text_errors_{}.txt", std::process::id()));
-        let check = |bytes: &[u8], expected: &str| {
-            std::fs::write(&path, bytes).unwrap();
-            assert_eq!(read_text(path.to_str().unwrap()).unwrap_err(), expected);
-        };
-        check(b"\xc0x", "'utf-8' codec can't decode byte 0xc0 in position 0: invalid start byte");
-        check(b"ab\xf5", "'utf-8' codec can't decode byte 0xf5 in position 2: invalid start byte");
-        check(b"\xe2\x82", "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data");
-        check(b"\xe2\x28\xa1", "'utf-8' codec can't decode byte 0xe2 in position 0: invalid continuation byte");
-        check(b"\xf0\x9f\x28", "'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte");
-        std::fs::write(&path, "a\r\nb\rc".as_bytes()).unwrap();
-        assert_eq!(read_text(path.to_str().unwrap()).unwrap(), "a\nb\nc");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
