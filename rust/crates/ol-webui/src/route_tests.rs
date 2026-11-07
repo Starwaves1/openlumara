@@ -1761,3 +1761,165 @@ async fn characters_lookups_strip_python_separator_whitespace() {
     assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "Ann", "success": true}));
 }
 
+
+// ---------------- /api/ext/characters (add, edit, all, delete, remove, import) ----------------
+
+#[tokio::test]
+async fn characters_add_validates_then_stores_a_stripped_character_in_python_shape() {
+    let h = harness_with_characters().await;
+    let add = |body: &str| post_json("/api/ext/characters/add", body);
+
+    let blank_name = h.send(add(r#"{"name": "   ", "profile": "p"}"#)).await;
+    assert_eq!(blank_name.json(), json!({"data": "character name cannot be empty", "success": false}));
+    let blank_profile = h.send(add(r#"{"name": "Ann", "profile": " \n "}"#)).await;
+    assert_eq!(blank_profile.json(), json!({"data": "character profile must not be blank", "success": false}));
+
+    // name, profile, scenario and tags are stripped; a comma string becomes a tag list without empties
+    let added = h
+        .send(add(r#"{"name": "  Ann  ", "profile": " A profile ", "scenario": "Cafe", "category": " ", "tags": "a, b,, c "}"#))
+        .await;
+    assert_eq!(added.json(), json!({"data": "character Ann added", "success": true}), "{}", added.body);
+
+    let dup = h.send(add(r#"{"name": "ann", "profile": "p"}"#)).await;
+    assert_eq!(dup.json(), json!({"data": "a character with that name already exists", "success": false}));
+
+    assert_eq!(
+        h.get("/api/ext/characters/all").await.json(),
+        json!({"data": [{
+            "key": "Ann",
+            "name": "Ann",
+            "profile": "A profile",
+            "scenario": "Cafe",
+            "first_message": "",
+            "post_history": "",
+            "category": "",
+            "tags": ["a", "b", "c"]
+        }], "success": true})
+    );
+}
+
+#[tokio::test]
+async fn characters_all_sorts_by_lowercase_name_and_keeps_python_key_order() {
+    let h = harness_with_characters().await;
+    add_character(&h, "bob", "", &[], "").await;
+    add_character(&h, "Ann", "", &[], "").await;
+    add_character(&h, "cara", "", &[], "").await;
+
+    let resp = h.get("/api/ext/characters/all").await;
+    let data = resp.json()["data"].clone();
+    let names: Vec<&str> = data.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Ann", "bob", "cara"]);
+    let keys: Vec<&str> = data[0].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["key", "name", "profile", "scenario", "first_message", "post_history", "category", "tags"]);
+}
+
+#[tokio::test]
+async fn characters_edit_renames_restamps_the_chat_and_clears_fields_left_out() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "Hello there").await;
+    add_character(&h, "Bob", "", &[], "").await;
+    let switched = h.send(post_json("/api/ext/characters/switch", r#"{"name": "Ann"}"#)).await;
+    assert_eq!(switched.json()["success"], json!(true), "{}", switched.body);
+
+    let missing = h.send(post_json("/api/ext/characters/edit", r#"{"key": "nobody", "name": "x", "profile": "p"}"#)).await;
+    assert_eq!(missing.json(), json!({"data": "character not found", "success": false}));
+    let blank = h.send(post_json("/api/ext/characters/edit", r#"{"key": "Ann", "name": " ", "profile": "p"}"#)).await;
+    assert_eq!(blank.json(), json!({"data": "character name cannot be empty", "success": false}));
+    let no_profile = h.send(post_json("/api/ext/characters/edit", r#"{"key": "Ann", "name": "Ann", "profile": ""}"#)).await;
+    assert_eq!(no_profile.json(), json!({"data": "character profile must not be blank", "success": false}));
+    let clash = h.send(post_json("/api/ext/characters/edit", r#"{"key": "Ann", "name": "BOB", "profile": "p"}"#)).await;
+    assert_eq!(clash.json(), json!({"data": "a character with that name already exists", "success": false}));
+
+    // a rename re-keys the entry and re-stamps the open chat that used it
+    let renamed = h
+        .send(post_json("/api/ext/characters/edit", r#"{"key": "Ann", "name": "Anna", "profile": "New profile", "tags": "x"}"#))
+        .await;
+    assert_eq!(renamed.json(), json!({"data": "character edited", "success": true}), "{}", renamed.body);
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "Anna", "success": true}));
+    assert_eq!(
+        h.get("/api/ext/characters/get?name=anna").await.json(),
+        json!({"data": {"name": "Anna", "profile": "New profile", "scenario": "", "first_message": "", "post_history": "", "category": null, "tags": ["x"]}, "success": true})
+    );
+
+    // a case-only rename is not a clash with itself, and an omitted first_message is cleared like python
+    let case_only = h.send(post_json("/api/ext/characters/edit", r#"{"key": "Anna", "name": "anna", "profile": "P"}"#)).await;
+    assert_eq!(case_only.json(), json!({"data": "character edited", "success": true}));
+    assert_eq!(h.get("/api/ext/characters/current").await.json(), json!({"data": "anna", "success": true}));
+    assert_eq!(h.get("/api/ext/characters/get?name=anna").await.json()["data"]["first_message"], json!(""));
+}
+
+#[tokio::test]
+async fn characters_delete_and_remove_report_their_python_messages() {
+    let h = harness_with_characters().await;
+    add_character(&h, "Ann", "", &[], "").await;
+    add_character(&h, "Bob", "", &[], "").await;
+
+    let deleted = h.send(post_json("/api/ext/characters/delete", r#"{"name": " ann "}"#)).await;
+    assert_eq!(deleted.json(), json!({"data": "deleted character Ann", "success": true}), "{}", deleted.body);
+    let again = h.send(post_json("/api/ext/characters/delete", r#"{"name": "Ann"}"#)).await;
+    assert_eq!(again.json(), json!({"data": "character not found", "success": false}));
+
+    // remove reports through the tool's delete(): its own wording, and a success flag of false when missing
+    let removed = h.send(post_json("/api/ext/characters/remove", r#"{"name": "BOB"}"#)).await;
+    assert_eq!(removed.json(), json!({"data": "character Bob deleted", "success": true}), "{}", removed.body);
+    let missing = h.send(post_json("/api/ext/characters/remove", r#"{"name": "Bob"}"#)).await;
+    assert_eq!(missing.json(), json!({"data": "character doesn't exist!", "success": false}));
+    assert_eq!(h.get("/api/ext/characters/all").await.json(), json!({"data": [], "success": true}));
+}
+
+#[tokio::test]
+async fn characters_delete_rejects_non_string_names_and_non_object_bodies_like_python() {
+    let h = harness_with_characters().await;
+    // with no characters the name is never lowercased, so it is simply not found
+    let empty = h.send(post_json("/api/ext/characters/delete", r#"{"name": null}"#)).await;
+    assert_eq!(empty.json(), json!({"data": "character not found", "success": false}));
+
+    add_character(&h, "Ann", "", &[], "").await;
+    let number = h.send(post_json("/api/ext/characters/delete", r#"{"name": 5}"#)).await;
+    assert_eq!(number.json(), json!({"data": "'int' object has no attribute 'lower'", "success": false}));
+    let null = h.send(post_json("/api/ext/characters/delete", r#"{"name": null}"#)).await;
+    assert_eq!(null.json(), json!({"data": "'NoneType' object has no attribute 'lower'", "success": false}));
+    // a missing name is "" and simply matches nothing
+    let missing = h.send(post_json("/api/ext/characters/delete", "{}")).await;
+    assert_eq!(missing.json(), json!({"data": "character not found", "success": false}));
+    let array = h.send(post_json("/api/ext/characters/remove", "[1]")).await;
+    assert_eq!(array.json(), json!({"data": "'list' object has no attribute 'get'", "success": false}));
+    let add_array = h.send(post_json("/api/ext/characters/add", "[1]")).await;
+    assert_eq!(add_array.json(), json!({"data": "'list' object has no attribute 'get'", "success": false}));
+}
+
+#[tokio::test]
+async fn characters_import_accepts_json_text_or_objects_and_reports_python_errors() {
+    let h = harness_with_characters().await;
+    let card = json!({"name": "Neo", "description": "The one", "tags": ["a"]});
+
+    // a card object is dumped back to text, so it imports the same as its json text
+    let as_object = h.send(post_json("/api/ext/characters/import", &json!({"json_code": card}).to_string())).await;
+    assert_eq!(as_object.json(), json!({"data": "character successfully imported", "success": true}), "{}", as_object.body);
+    let updated = json!({"name": "Neo", "description": "Reworked"}).to_string();
+    let as_text = h.send(post_json("/api/ext/characters/import", &json!({"json_code": updated}).to_string())).await;
+    assert_eq!(as_text.json(), json!({"data": "character successfully imported", "success": true}));
+
+    // re-importing updates the existing character in place
+    let all = h.get("/api/ext/characters/all").await.json();
+    assert_eq!(all["data"].as_array().unwrap().len(), 1);
+    assert_eq!(all["data"][0]["profile"], json!("Reworked"));
+    assert_eq!(all["data"][0]["tags"], json!([]));
+
+    // python: json.loads of a non-str raises its TypeError, a missing json_code is the empty text
+    let null = h.send(post_json("/api/ext/characters/import", r#"{"json_code": null}"#)).await;
+    assert_eq!(null.json(), json!({"data": "error: the JSON object must be str, bytes or bytearray, not NoneType", "success": false}));
+    let number = h.send(post_json("/api/ext/characters/import", r#"{"json_code": 5}"#)).await;
+    assert_eq!(number.json(), json!({"data": "error: the JSON object must be str, bytes or bytearray, not int", "success": false}));
+
+    // an empty dict, a non-dict document, and a card with no profile are each rejected
+    let empty = h.send(post_json("/api/ext/characters/import", r#"{"json_code": "{}"}"#)).await;
+    assert_eq!(empty.json(), json!({"data": "error: character card was empty", "success": false}));
+    let list = h.send(post_json("/api/ext/characters/import", r#"{"json_code": "[1]"}"#)).await;
+    assert_eq!(list.json(), json!({"data": "error: character card was empty", "success": false}));
+    let no_profile = h.send(post_json("/api/ext/characters/import", r#"{"json_code": "{\"name\": \"X\"}"}"#)).await;
+    assert_eq!(
+        no_profile.json(),
+        json!({"data": "error: failed to extract a usable name and profile from this character card", "success": false})
+    );
+}

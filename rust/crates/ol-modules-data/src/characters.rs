@@ -4,7 +4,7 @@
 #[path = "../../../generated/modules/characters.rs"]
 pub mod meta;
 
-use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_type};
+use crate::util::{b64decode, body_get, body_str, dict_body, eq_ci_strip, py_strip, py_type};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -226,8 +226,8 @@ fn item_assignment_error(v: &Value) -> String {
 /// tags arrive from the form as a comma-separated string (or a list)
 fn clean_tags(raw: Option<&Value>) -> Vec<Value> {
     match raw {
-        Some(Value::String(s)) => s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).map(|t| json!(t)).collect(),
-        Some(Value::Array(a)) => a.iter().map(|t| py_str(t).trim().to_string()).filter(|t| !t.is_empty()).map(Value::String).collect(),
+        Some(Value::String(s)) => s.split(',').map(py_strip).filter(|t| !t.is_empty()).map(|t| json!(t)).collect(),
+        Some(Value::Array(a)) => a.iter().map(|t| py_strip(&py_str(t)).to_string()).filter(|t| !t.is_empty()).map(Value::String).collect(),
         _ => vec![],
     }
 }
@@ -737,29 +737,37 @@ impl Characters {
         Ok(json!({"categories": categories}))
     }
 
-    fn route_all(&self) -> Value {
-        let mut chars: Vec<Value> = self
-            .all()
-            .into_iter()
-            .map(|(key, ch)| {
+    /// python `_route_all`: a stored value that is not a dict raises at `.get`, and the sort key
+    /// `c["name"].lower()` raises for a non-str name
+    fn route_all(&self) -> anyhow::Result<Value> {
+        let mut chars: Vec<(String, Value)> = Vec::new();
+        for (key, ch) in self.all() {
+            if !ch.is_object() {
+                anyhow::bail!("'{}' object has no attribute 'get'", py_type(&ch));
+            }
+            let name = or_value(ch.get("name"), json!(key));
+            let sort_key = str_for_lower(&name)?.to_lowercase();
+            chars.push((
+                sort_key,
                 json!({
                     "key": key,
-                    "name": or_value(ch.get("name"), json!(key)),
+                    "name": name,
                     "profile": ch.get("profile").cloned().unwrap_or(json!("")),
                     "scenario": ch.get("scenario").cloned().unwrap_or(json!("")),
                     "first_message": ch.get("first_message").cloned().unwrap_or(json!("")),
                     "post_history": ch.get("post_history").cloned().unwrap_or(json!("")),
                     "category": or_value(ch.get("category"), json!("")),
                     "tags": or_value(ch.get("tags"), json!([])),
-                })
-            })
-            .collect();
-        chars.sort_by_key(|c| lower_key(&c["name"]));
-        Value::Array(chars)
+                }),
+            ));
+        }
+        // python list.sort is stable, and sort_by is too
+        chars.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Value::Array(chars.into_iter().map(|(_, v)| v).collect()))
     }
 
     fn form_entry(body: &Option<Value>, name: &str, profile: &str) -> Value {
-        let category = body_str(body, "category", "").trim().to_string();
+        let category = py_strip(&body_str(body, "category", "")).to_string();
         json!({
             "name": name,
             "profile": profile,
@@ -772,8 +780,8 @@ impl Characters {
     }
 
     fn route_add(&self, body: &Option<Value>) -> anyhow::Result<Value> {
-        let name = body_str(body, "name", "").trim().to_string();
-        let profile = body_str(body, "profile", "").trim().to_string();
+        let name = py_strip(&body_str(body, "name", "")).to_string();
+        let profile = py_strip(&body_str(body, "profile", "")).to_string();
         if name.is_empty() {
             return Ok(self.base.result("character name cannot be empty", false));
         }
@@ -792,18 +800,18 @@ impl Characters {
     }
 
     fn route_edit(&self, body: &Option<Value>) -> anyhow::Result<Value> {
-        let Some(key) = self.find_char_name(&body_str(body, "key", "")) else {
+        let Some(key) = self.find_char_name(&body_str(body, "key", "")).filter(|k| !k.is_empty()) else {
             return Ok(self.base.result("character not found", false));
         };
-        let new_name = body_str(body, "name", "").trim().to_string();
-        let profile = body_str(body, "profile", "").trim().to_string();
+        let new_name = py_strip(&body_str(body, "name", "")).to_string();
+        let profile = py_strip(&body_str(body, "profile", "")).to_string();
         if new_name.is_empty() {
             return Ok(self.base.result("character name cannot be empty", false));
         }
         if profile.is_empty() {
             return Ok(self.base.result("character profile must not be blank", false));
         }
-        if let Some(clash) = self.find_char_name(&new_name) {
+        if let Some(clash) = self.find_char_name(&new_name).filter(|c| !c.is_empty()) {
             if clash.to_lowercase() != key.to_lowercase() {
                 return Ok(self.base.result("a character with that name already exists", false));
             }
@@ -836,6 +844,46 @@ impl Characters {
         }
         self.save_chars()?;
         Ok(self.base.result("character edited", true))
+    }
+
+    /// python `(body or {}).get("name", "")` handed to `_find_character`, which calls `name.lower()` once per
+    /// stored character: a non-str name only fails when there is a character to compare it with
+    fn lookup_name(&self, raw: &Value) -> anyhow::Result<String> {
+        if !self.all().is_empty() {
+            str_for_lower(raw)?;
+        }
+        Ok(py_str(raw))
+    }
+
+    /// python `_route_delete`: a missing or falsy character is "character not found"
+    fn route_delete(&self, body: &Option<Value>) -> anyhow::Result<Value> {
+        let raw = body_get(body, "name").unwrap_or_else(|| json!(""));
+        let name = self.lookup_name(&raw)?;
+        if self.find_character(&name).is_none() {
+            return Ok(self.base.result("character not found", false));
+        }
+        let Some(key) = self.find_char_name(&name) else {
+            return Ok(self.base.result("character not found", false));
+        };
+        self.with_chars(|c| {
+            c.data.shift_remove(&key);
+            c.save()
+        })??;
+        Ok(self.base.result(format!("deleted character {}", key), true))
+    }
+
+    /// python `_route_import`: a dict or list is dumped back to text, any other non-str value reaches
+    /// `json.loads` and raises its TypeError
+    async fn route_import(&self, body: &Option<Value>) -> anyhow::Result<Value> {
+        let raw = body_get(body, "json_code").unwrap_or_else(|| json!(""));
+        match raw {
+            Value::Object(_) | Value::Array(_) => self.import_json(&ol_core::pyjson::dumps(&raw)).await,
+            Value::String(code) => self.import_json(&code).await,
+            other => Ok(self.base.result(
+                format!("error: the JSON object must be str, bytes or bytearray, not {}", py_type(&other)),
+                false,
+            )),
+        }
     }
 
     async fn route_import_file(&self, body: &Option<Value>) -> anyhow::Result<Value> {
@@ -1132,28 +1180,26 @@ impl Module for Characters {
                 Ok(self.base.result("switched to default character", true))
             }
             ("delete", "POST") => {
-                let name = body_str(&body, "name", "");
-                let Some(key) = self.find_char_name(&name) else {
-                    return Ok(self.base.result("character not found", false));
-                };
-                self.with_chars(|c| {
-                    c.data.shift_remove(&key);
-                    c.save()
-                })??;
-                Ok(self.base.result(format!("deleted character {}", key), true))
+                dict_body(&body)?;
+                self.route_delete(&body)
             }
             ("import", "POST") => {
-                let code = match body_get(&body, "json_code") {
-                    Some(v @ (Value::Object(_) | Value::Array(_))) => ol_core::pyjson::dumps(&v),
-                    Some(v) => py_str(&v),
-                    None => String::new(),
-                };
-                self.import_json(&code).await
+                dict_body(&body)?;
+                self.route_import(&body).await
             }
-            ("remove", "POST") => self.delete(&body_str(&body, "name", "")).await,
-            ("all", "GET") => Ok(self.route_all()),
-            ("add", "POST") => self.route_add(&body),
-            ("edit", "POST") => self.route_edit(&body),
+            ("remove", "POST") => {
+                dict_body(&body)?;
+                self.delete(&body_str(&body, "name", "")).await
+            }
+            ("all", "GET") => self.route_all(),
+            ("add", "POST") => {
+                dict_body(&body)?;
+                self.route_add(&body)
+            }
+            ("edit", "POST") => {
+                dict_body(&body)?;
+                self.route_edit(&body)
+            }
             ("import_file", "POST") => self.route_import_file(&body).await,
             ("names", "GET") => Ok(self.route_names()),
             ("chats_count", "GET") => self.route_chats_count(),
