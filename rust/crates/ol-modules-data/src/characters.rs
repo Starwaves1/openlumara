@@ -697,10 +697,16 @@ impl Characters {
             Value::String(card_name) => self.find_char_name(&card_name).filter(|k| !k.is_empty()).unwrap_or(card_name),
             other => {
                 // python's lookup calls `.lower()` on the name for every stored key, so a non-str name
-                // raises once any character is stored; with an empty store it is stored under its text
+                // raises once any character is stored
                 if !self.all().is_empty() {
                     anyhow::bail!("'{}' object has no attribute 'lower'", py_type(&other));
                 }
+                // python `self.characters[name] = ...` with an empty store: a list or dict is unhashable
+                if matches!(other, Value::Array(_) | Value::Object(_)) {
+                    anyhow::bail!("unhashable type: '{}'", py_type(&other));
+                }
+                // a truthy scalar name (int, float, bool) is stored under its text; python keeps the
+                // number as the dict key, but every later name lookup or /all sort raises on `.lower()`
                 py_str(&other)
             }
         };

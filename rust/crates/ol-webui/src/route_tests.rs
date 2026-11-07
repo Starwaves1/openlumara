@@ -1923,3 +1923,19 @@ async fn characters_import_accepts_json_text_or_objects_and_reports_python_error
         json!({"data": "error: failed to extract a usable name and profile from this character card", "success": false})
     );
 }
+
+#[tokio::test]
+async fn characters_import_rejects_an_unhashable_name_on_an_empty_store_like_python() {
+    let h = harness_with_characters().await;
+    // python: a truthy list or dict name passes the usable-card check, then `self.characters[name] = ...` raises
+    let list = h
+        .send(post_json("/api/ext/characters/import", r#"{"json_code": "{\"name\": [\"a\"], \"profile\": \"x\"}"}"#))
+        .await;
+    assert_eq!(list.json(), json!({"data": "unhashable type: 'list'", "success": false}));
+    let dict = h
+        .send(post_json("/api/ext/characters/import", r#"{"json_code": "{\"name\": {\"a\": 1}, \"profile\": \"x\"}"}"#))
+        .await;
+    assert_eq!(dict.json(), json!({"data": "unhashable type: 'dict'", "success": false}));
+    // nothing was stored
+    assert_eq!(h.get("/api/ext/characters/all").await.json(), json!({"data": [], "success": true}));
+}
