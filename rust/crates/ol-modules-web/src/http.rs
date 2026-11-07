@@ -759,34 +759,71 @@ impl HttpCore {
 
     // ==================== SSRF Protection ====================
 
-    /// python matches the unicode hostname against the config entries as typed; the URL parser hands us
-    /// punycode, so both sides are compared in unicode form.
-    fn config_list(&self, key: &str) -> Vec<String> {
-        let entries: Vec<String> = match self.config.get1(key) {
-            Some(Value::Array(a)) => a.iter().map(|v| py_str(v).to_lowercase()).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_lowercase().to_string()).collect(),
-            _ => vec![],
+    /// python's `[d.lower() for d in self.config.get(key, [])]` in `_check_domain_policy`. A list yields its
+    /// entries, a string its characters and a dict its keys. Null and numbers raise TypeError, and a non-string
+    /// entry raises AttributeError on `.lower()`. `value` is the config value (None = key absent).
+    pub fn domain_entries(value: Option<Value>, normalise: fn(&str) -> String) -> Result<Vec<String>, String> {
+        let items: Vec<Value> = match value {
+            None => return Ok(vec![]),
+            Some(Value::Array(a)) => a,
+            Some(Value::Object(m)) => m.keys().map(|k| Value::String(k.clone())).collect(),
+            Some(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+            Some(other) => return Err(format!("'{}' object is not iterable", py_type_name(&other))),
         };
-        entries.iter().map(|e| unicode_host(e)).collect()
+        items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => Ok(normalise(&s.to_lowercase())),
+                other => Err(format!("'{}' object has no attribute 'lower'", py_type_name(other))),
+            })
+            .collect()
     }
 
-    /// Whitelist / blacklist / metadata-hostname checks (no DNS).
-    pub fn check_domain_policy(&self, hostname: &str) -> Result<(), String> {
-        let hostname = unicode_host(&hostname.to_lowercase());
-        let whitelist = self.config_list("domain_whitelist");
-        let blacklist = self.config_list("domain_blacklist");
+    /// Whitelist / blacklist / metadata-hostname checks (no DNS) over the two config values. `normalise`
+    /// is applied to the hostname and to every entry. Err(Blocked) is a policy rejection; Err(Unexpected)
+    /// is python raising while it reads the lists.
+    pub fn domain_policy_verdict(
+        hostname: &str,
+        whitelist: Option<Value>,
+        blacklist: Option<Value>,
+        normalise: fn(&str) -> String,
+    ) -> Result<(), UrlCheck> {
+        let hostname = normalise(&hostname.to_lowercase());
+        let whitelist = Self::domain_entries(whitelist, normalise).map_err(UrlCheck::Unexpected)?;
+        let blacklist = Self::domain_entries(blacklist, normalise).map_err(UrlCheck::Unexpected)?;
         for blocked in &blacklist {
             if hostname == *blocked || hostname.ends_with(&format!(".{}", blocked)) {
-                return Err(format!("Blocked by domain blacklist: {}", hostname));
+                return Err(UrlCheck::Blocked(format!("Blocked by domain blacklist: {}", hostname)));
             }
         }
         if !whitelist.is_empty() && !whitelist.iter().any(|d| hostname == *d || hostname.ends_with(&format!(".{}", d))) {
-            return Err(format!("Blocked by domain whitelist: {}", hostname));
+            return Err(UrlCheck::Blocked(format!("Blocked by domain whitelist: {}", hostname)));
         }
         if METADATA_HOST.is_match(&hostname) {
-            return Err("Blocked metadata endpoint".into());
+            return Err(UrlCheck::Blocked("Blocked metadata endpoint".into()));
         }
         Ok(())
+    }
+
+    /// The fetch path (`is_safe_url`): reqwest hands us punycode, so both sides are compared in unicode form.
+    pub fn check_domain_policy(&self, hostname: &str) -> Result<(), UrlCheck> {
+        Self::domain_policy_verdict(
+            hostname,
+            self.config.get1("domain_whitelist"),
+            self.config.get1("domain_blacklist"),
+            unicode_host,
+        )
+    }
+
+    /// python's `_check_domain_policy` as it runs on the urlparse hostname: the hostname and the entries are
+    /// compared exactly as typed, with no IDNA conversion on either side.
+    pub fn check_domain_policy_as_typed(&self, hostname: &str) -> Result<(), UrlCheck> {
+        Self::domain_policy_verdict(
+            hostname,
+            self.config.get1("domain_whitelist"),
+            self.config.get1("domain_blacklist"),
+            |h: &str| h.to_string(),
+        )
     }
 
     /// Resolve a hostname and validate ALL resolved addresses. Only a resolver failure that python reports
@@ -839,7 +876,7 @@ impl HttpCore {
                 return Err(UrlCheck::Blocked(format!("Port {} is blocked", p)));
             }
         }
-        self.check_domain_policy(hostname).map_err(UrlCheck::Blocked)?;
+        self.check_domain_policy(hostname)?;
         if self.config.get_bool("block_local_network_access") && (hostname == "localhost" || hostname == "0.0.0.0") {
             return Err(UrlCheck::Blocked("Blocked localhost access".into()));
         }
@@ -866,7 +903,7 @@ impl HttpCore {
                 return Err(UrlCheck::Blocked(format!("Port {} is blocked", p)));
             }
         }
-        self.check_domain_policy(&hostname).map_err(UrlCheck::Blocked)?;
+        self.check_domain_policy(&hostname)?;
         if self.config.get_bool("block_local_network_access") && (hostname == "localhost" || hostname == "0.0.0.0") {
             return Err(UrlCheck::Blocked("Blocked localhost access".into()));
         }
@@ -940,10 +977,12 @@ impl HttpCore {
                 Ok(parsed) => match parsed.hostname() {
                     Some(hostname) => match self.check_domain_policy(&hostname.to_lowercase()) {
                         Ok(()) => safe_urls.push(url.to_string()),
-                        Err(err) => {
+                        Err(UrlCheck::Blocked(err)) => {
                             self.log(&format!("Blocked unsafe URL in content: {}", err));
                             safe_urls.push("[URL_BLOCKED]".into());
                         }
+                        // python raised inside its try block
+                        Err(UrlCheck::Unexpected(_)) => safe_urls.push("[URL_ERROR]".into()),
                     },
                     None => safe_urls.push(url.to_string()),
                 },

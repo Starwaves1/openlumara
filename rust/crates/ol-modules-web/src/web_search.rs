@@ -10,13 +10,14 @@ pub mod meta;
 
 use crate::ddgs::results::Record;
 use crate::ddgs::{Category, Ddgs, SearchArgs};
-use crate::http::{http_log, HttpCore, ALLOWED_SCHEMES, DANGEROUS_PORTS};
+use crate::http::{http_log, HttpCore, UrlCheck, ALLOWED_SCHEMES, DANGEROUS_PORTS};
 use crate::pytext::{py_strip, urlsplit};
 use crate::sanitize::{py_list_repr, ContentSanitizer};
+use crate::util::py_int;
 use anyhow::bail;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
-use ol_core::pyjson::{as_i64, truthy};
+use ol_core::pyjson::truthy;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
@@ -94,7 +95,12 @@ impl WebSearch {
         if parsed.port()?.is_some_and(|port| DANGEROUS_PORTS.contains(&port)) {
             return Ok(false);
         }
-        Ok(self.core.check_domain_policy(&hostname).is_ok())
+        // python's `_check_domain_policy` compares the hostname as typed; an unreadable list is an exception
+        match self.core.check_domain_policy_as_typed(&hostname) {
+            Ok(()) => Ok(true),
+            Err(UrlCheck::Blocked(_)) => Ok(false),
+            Err(UrlCheck::Unexpected(e)) => Err(e),
+        }
     }
 
     /// `_clamp_max_results`: `max_results or config["max_results"]`, int(), at least 1
@@ -105,7 +111,7 @@ impl WebSearch {
             self.core.config.get1("max_results").unwrap_or(json!(5))
         };
         // int() of a value it cannot convert raises, and python falls back to 5
-        as_i64(&requested).unwrap_or(5).max(1) as usize
+        py_int(&requested).unwrap_or(5).max(1) as usize
     }
 
     /// the keyword arguments python passes to `DDGS.<kind>(query, **kwargs)`
@@ -314,6 +320,63 @@ mod tests {
         assert_eq!(ws.clamp_max_results(&json!("7")), 7);
         assert_eq!(ws.clamp_max_results(&json!(2.9)), 2);
         assert_eq!(ws.clamp_max_results(&json!("abc")), 5);
+    }
+
+    #[test]
+    fn max_results_parses_strings_like_python_int() {
+        let ws = detached();
+        // int("1_000") is 1000 and int("99999999999999999999") is a big int; ours saturates at i64::MAX
+        assert_eq!(ws.clamp_max_results(&json!("1_000")), 1000);
+        assert_eq!(ws.clamp_max_results(&json!(" +7 ")), 7);
+        assert_eq!(ws.clamp_max_results(&json!("99999999999999999999")), i64::MAX as usize);
+        // python's int() rejects these, so the fallback of 5 applies
+        assert_eq!(ws.clamp_max_results(&json!("1__0")), 5);
+        assert_eq!(ws.clamp_max_results(&json!("1_")), 5);
+    }
+
+    fn as_typed(host: &str) -> String {
+        host.to_string()
+    }
+
+    #[test]
+    fn domain_policy_compares_hostnames_as_typed() {
+        // python compares the urlparse hostname as typed, with no IDNA conversion on either side
+        // a punycode host does not match a unicode blacklist entry, so python allows it
+        assert!(HttpCore::domain_policy_verdict("xn--bcher-kva.de", None, Some(json!(["bücher.de"])), as_typed).is_ok());
+        // the unicode host itself matches and is blocked
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("bücher.de", None, Some(json!(["bücher.de"])), as_typed),
+            Err(UrlCheck::Blocked(m)) if m == "Blocked by domain blacklist: bücher.de"
+        ));
+        // a unicode whitelist entry does not admit a punycode host
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("xn--bcher-kva.de", Some(json!(["bücher.de"])), None, as_typed),
+            Err(UrlCheck::Blocked(m)) if m == "Blocked by domain whitelist: xn--bcher-kva.de"
+        ));
+    }
+
+    #[test]
+    fn unreadable_domain_lists_raise_like_python() {
+        // null and numbers are not iterable: python raises TypeError inside _check_domain_policy
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("example.com", Some(Value::Null), None, as_typed),
+            Err(UrlCheck::Unexpected(m)) if m == "'NoneType' object is not iterable"
+        ));
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("example.com", None, Some(json!(5)), as_typed),
+            Err(UrlCheck::Unexpected(m)) if m == "'int' object is not iterable"
+        ));
+        // a non-string entry raises AttributeError on .lower()
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("example.com", Some(json!(["ok.com", 7])), None, as_typed),
+            Err(UrlCheck::Unexpected(m)) if m == "'int' object has no attribute 'lower'"
+        ));
+        // a dict iterates its keys
+        assert!(HttpCore::domain_policy_verdict("example.com", Some(json!({"example.com": true})), None, as_typed).is_ok());
+        assert!(matches!(
+            HttpCore::domain_policy_verdict("evil.com", Some(json!({"example.com": true})), None, as_typed),
+            Err(UrlCheck::Blocked(m)) if m == "Blocked by domain whitelist: evil.com"
+        ));
     }
 
     #[tokio::test]

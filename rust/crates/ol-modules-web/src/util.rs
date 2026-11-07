@@ -803,6 +803,38 @@ pub fn py_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// python `int(v)` for a tool argument or setting. A str is parsed like `int(str)`: surrounding whitespace,
+/// an optional sign, and digits with single underscores between them. Other values use the numeric
+/// conversion. Past i64 the value saturates, since python keeps the big int and callers only clamp it.
+pub fn py_int(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::String(s) => py_int_str(s),
+        other => ol_core::pyjson::as_i64(other),
+    }
+}
+
+fn py_int_str(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (negative, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    // underscores only sit between two digits: no leading, trailing or doubled underscore
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') || digits.contains("__") {
+        return None;
+    }
+    const LIMIT: i128 = i64::MAX as i128 + 1;
+    let mut value: i128 = 0;
+    for c in digits.chars().filter(|c| *c != '_') {
+        // ASCII digits only; python also accepts other unicode decimal digits
+        let d = c.to_digit(10)? as i128;
+        value = (value * 10 + d).min(LIMIT);
+    }
+    let signed = if negative { -value } else { value };
+    Some(signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
 /// python `str(pathlib.Path(s))` on posix: repeated slashes, trailing slashes and `.` components
 /// are dropped, a leading `//` is kept, and an empty path is `.`
 pub fn py_path(s: &str) -> String {
