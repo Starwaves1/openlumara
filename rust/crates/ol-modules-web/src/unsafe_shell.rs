@@ -90,9 +90,12 @@ fn shell_argv(cmd: Option<&Value>) -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// one element of a list cmd; popen only accepts str arguments
+/// one element of a list cmd; popen only accepts str arguments. popen converts the items in
+/// index order and stops at the first bad one, so the NUL check belongs here, per item, and
+/// the first failing item decides the error (["a\0b", 3] is ValueError, [3, "a\0b"] is TypeError).
 fn argv_item(v: &Value) -> anyhow::Result<String> {
     match v {
+        Value::String(s) if s.contains('\0') => anyhow::bail!("embedded null byte"),
         Value::String(s) => Ok(s.clone()),
         other => anyhow::bail!("expected str, bytes or os.PathLike object, not {}", py_type_name(other)),
     }
@@ -264,6 +267,16 @@ mod tests {
         assert_eq!(err, "embedded null byte");
         let err = m.exec_tool(Some(&json!(["echo", "a\u{0}b"]))).await.unwrap_err().to_string();
         assert_eq!(err, "embedded null byte");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exec_tool_list_error_follows_python_item_order() {
+        // python popen converts argv items in order: the first bad item decides the error
+        let m = UnsafeShell::new_for_test();
+        let err = m.exec_tool(Some(&json!(["a\u{0}b", 3]))).await.unwrap_err().to_string();
+        assert_eq!(err, "embedded null byte");
+        let err = m.exec_tool(Some(&json!([3, "a\u{0}b"]))).await.unwrap_err().to_string();
+        assert_eq!(err, "expected str, bytes or os.PathLike object, not int");
     }
 
     #[tokio::test(flavor = "multi_thread")]
