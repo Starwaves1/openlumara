@@ -19,13 +19,21 @@ regex.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 reqwest = { workspace = true, features = ["gzip", "deflate"] }
+hyper = "1"
 url.workspace = true
 base64.workspace = true
 rand.workspace = true
 scraper = "0.27"
+# same versions scraper 0.27 builds on; used to parse with scripting disabled (ddgs/html.rs)
+html5ever = "0.39"
+tendril = "0.5"
 unicode-normalization = "0.1"
 encoding_rs = "0.8"
+flate2 = "1"
+idna = "1"
 libc = "0.2"
+# only to recognise TLS failures by type (reqwest hides them behind its error chain)
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile.workspace = true
