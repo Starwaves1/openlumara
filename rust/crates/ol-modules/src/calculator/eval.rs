@@ -9,12 +9,15 @@
 //!
 //! Not supported (reported as an error, never guessed): f-strings, bytes, complex numbers, attribute
 //! access such as `"abc".upper()`, printf-style `%` formatting of strings, and results that python
-//! would return as complex numbers.
+//! would return as complex numbers. Unicode decimal digits are not accepted by `int()`.
+//!
+//! Results that python serializes as bare JSON numbers but serde_json cannot hold are sent as strings:
+//! ints outside the u64/i64 range and the non-finite floats (python's `Infinity` / `NaN`).
 
 use crate::util::py_strip;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
-use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 use ol_core::pyjson::{float_repr, py_repr};
 use serde_json::Value as Json;
 use std::cmp::Ordering;
@@ -136,16 +139,61 @@ fn display(v: &Val) -> String {
     }
 }
 
-/// python `str(value)`: what the module returns as the tool result. Like cpython, converting an int
-/// with more than 4300 digits to a string fails.
-pub fn format_result(v: &Val) -> Res<String> {
-    if let Val::Int(i) = v {
-        // 4300 digits is about 14284 bits: anything smaller is safely under the limit
-        if i.bits() > 14_000 && i.magnitude().to_string().len() > 4300 {
-            return fail("Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit");
-        }
+/// cpython's default `sys.get_int_max_str_digits()`
+const MAX_STR_DIGITS: usize = 4300;
+
+/// `str(int)` / `json.dumps(int)` above the digit limit (cpython's message has no digit count here)
+const INT_STR_LIMIT: &str = "Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit";
+
+/// python `str(value)` for an int: fails above the digit limit like cpython does. 2**14200 has at most
+/// 4276 digits and 2**14300 has at least 4306, so only the band in between needs the exact count.
+fn int_str(i: &BigInt) -> Res<String> {
+    let bits = i.bits();
+    if bits >= 14_300 {
+        return fail(INT_STR_LIMIT);
     }
-    Ok(display(v))
+    let s = i.to_string();
+    if bits > 14_200 && s.trim_start_matches('-').len() > MAX_STR_DIGITS {
+        return fail(INT_STR_LIMIT);
+    }
+    Ok(s)
+}
+
+/// python `str(value)` where the conversion can fail (used inside error messages, where python
+/// formats the operands too)
+fn py_str(v: &Val) -> Res<String> {
+    match v {
+        Val::Int(i) => int_str(i),
+        other => Ok(display(other)),
+    }
+}
+
+/// python `json.dumps(value)` of the raw value a successful evaluation returns, which the
+/// dispatcher serializes. Ints and floats stay JSON numbers when serde_json can hold them.
+/// Ints outside the u64/i64 range and non-finite floats are carried as their python `str()` text
+/// because serde_json cannot represent them (python would emit bare digits / Infinity / NaN).
+/// Values python cannot serialize (functions, classes) fail with json's TypeError text.
+pub fn to_json(v: &Val) -> Res<Json> {
+    Ok(match v {
+        Val::Int(i) => {
+            let text = int_str(i)?;
+            if let Ok(n) = i64::try_from(i) {
+                Json::from(n)
+            } else if let Ok(n) = u64::try_from(i) {
+                Json::from(n)
+            } else {
+                Json::String(text)
+            }
+        }
+        Val::Bool(b) => Json::Bool(*b),
+        Val::Float(f) => match serde_json::Number::from_f64(*f) {
+            Some(n) => Json::Number(n),
+            None => Json::String(float_str(*f)),
+        },
+        Val::Str(s) => Json::String(s.clone()),
+        Val::None => Json::Null,
+        Val::Func(_) => return fail(format!("Object of type {} is not JSON serializable", type_name(v))),
+    })
 }
 
 fn truthy(v: &Val) -> bool {
@@ -456,6 +504,10 @@ impl Lexer {
                     }
                 }
                 '(' | '[' | '{' => {
+                    // cpython's tokenizer refuses the 201st open bracket (MAXLEVEL 200)
+                    if self.open.len() >= 200 {
+                        return Err(syntax_error("too many nested parentheses", self.line));
+                    }
                     self.open.push((c, self.line));
                     self.i += 1;
                     self.push(Tok::Op(bracket_op(c)));
@@ -542,7 +594,13 @@ impl Lexer {
                 self.eat_digits();
             }
         }
-        let text: String = self.src[start..self.i].iter().filter(|c| **c != '_').collect();
+        // an underscore is only allowed between two digits (cpython: "1__0" and "1_" are invalid)
+        let raw = &self.src[start..self.i];
+        let well_placed = |k: usize| k > 0 && raw[k - 1].is_ascii_digit() && raw.get(k + 1).is_some_and(|n| n.is_ascii_digit());
+        if raw.iter().enumerate().any(|(k, &c)| c == '_' && !well_placed(k)) {
+            return Err(syntax_error("invalid decimal literal", line));
+        }
+        let text: String = raw.iter().filter(|c| **c != '_').collect();
         if matches!(self.at(0), Some('j' | 'J')) {
             self.i += 1;
             return Ok(Tok::Fail("complex numbers are not supported by this calculator".into()));
@@ -559,6 +617,16 @@ impl Lexer {
         }
         if text.len() > 1 && text.starts_with('0') && text.chars().any(|c| c != '0') {
             return Err(syntax_error("leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers", line));
+        }
+        // cpython converts decimal literals under the same 4300 digit limit (and suggests hex)
+        let digits = text.trim_start_matches('0').len().max(1);
+        if digits > MAX_STR_DIGITS {
+            return Err(syntax_error(
+                &format!(
+                    "Exceeds the limit (4300 digits) for integer string conversion: value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit - Consider hexadecimal for huge integer literals to avoid decimal conversion limits."
+                ),
+                line,
+            ));
         }
         BigInt::parse_bytes(text.as_bytes(), 10).map(|v| Tok::Num(Val::Int(v))).ok_or_else(|| syntax_error("invalid syntax", line))
     }
@@ -684,7 +752,14 @@ struct Parser {
     pos: usize,
     /// the expression as the caller gave it (simpleeval reports this text in its messages)
     source: String,
+    /// nesting of unary / `not` / `**` levels being parsed
+    depth: usize,
 }
+
+/// simpleeval recurses through two python frames per expression node, and cpython's default recursion
+/// limit of 1000 stops it at about 495 nested nodes (measured on python 3.14). Nesting beyond this
+/// fails with the same RecursionError text instead of overflowing the rust stack.
+const MAX_NODE_DEPTH: usize = 495;
 
 fn is_keyword(s: &str) -> bool {
     KEYWORDS.contains(&s)
@@ -769,7 +844,41 @@ impl Parser {
     }
 
     fn invalid<T>(&self) -> Res<T> {
-        Err(syntax_error("invalid syntax", self.line()))
+        let msg = if self.two_values_in_brackets() { "invalid syntax. Perhaps you forgot a comma?" } else { "invalid syntax" };
+        Err(syntax_error(msg, self.line()))
+    }
+
+    /// cpython's `invalid_expression` hint: an expression directly followed by another expression,
+    /// inside brackets (a name directly followed by a string is excluded, as in cpython)
+    fn two_values_in_brackets(&self) -> bool {
+        let Some(prev) = self.pos.checked_sub(1).map(|p| &self.toks[p].tok) else { return false };
+        let is_value_name = |n: &str| !is_keyword(n) || matches!(n, "True" | "False" | "None");
+        let ends_expr = match prev {
+            Tok::Num(_) | Tok::Str(_) => true,
+            Tok::Name(n) => is_value_name(n.as_str()),
+            Tok::Op(o) => matches!(*o, ")" | "]" | "}"),
+            _ => false,
+        };
+        let starts_expr = match self.tok() {
+            Tok::Num(_) | Tok::Str(_) => true,
+            Tok::Name(n) => is_value_name(n.as_str()) || n == "not",
+            Tok::Op(o) => matches!(*o, "(" | "[" | "{"),
+            _ => false,
+        };
+        if !ends_expr || !starts_expr || matches!((prev, self.tok()), (Tok::Name(_), Tok::Str(_))) {
+            return false;
+        }
+        let mut depth = 0i64;
+        for t in &self.toks[..self.pos] {
+            if let Tok::Op(o) = &t.tok {
+                match *o {
+                    "(" | "[" | "{" => depth += 1,
+                    ")" | "]" | "}" => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        depth > 0
     }
 
     fn expect_op(&mut self, op: &str) -> Res<()> {
@@ -970,12 +1079,29 @@ impl Parser {
     }
 
     fn not_test(&mut self) -> Res<Expr> {
+        self.enter()?;
+        let r = self.not_test_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn not_test_inner(&mut self) -> Res<Expr> {
         if self.is_kw("not") {
             self.bump();
             let inner = self.not_test()?;
             return Ok(Expr::Unary(UnOp::Not, Box::new(inner)));
         }
         self.comparison()
+    }
+
+    /// one more level of recursive nesting (unary operators, `not`, `**`); python's evaluator gives up
+    /// at about this depth with RecursionError
+    fn enter(&mut self) -> Res<()> {
+        if self.depth >= MAX_NODE_DEPTH {
+            return fail("maximum recursion depth exceeded");
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn cmp_op(&self) -> Option<(CmpOp, usize)> {
@@ -1057,6 +1183,13 @@ impl Parser {
     }
 
     fn factor(&mut self) -> Res<Expr> {
+        self.enter()?;
+        let r = self.factor_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn factor_inner(&mut self) -> Res<Expr> {
         let op = match self.tok() {
             Tok::Op("-") => Some(UnOp::Neg),
             Tok::Op("+") => Some(UnOp::Pos),
@@ -1285,7 +1418,7 @@ impl Parser {
 
 fn parse(text: &str, source: &str) -> Res<Vec<Stmt>> {
     let toks = lex(text)?;
-    Parser { toks, pos: 0, source: source.to_string() }.parse_module()
+    Parser { toks, pos: 0, source: source.to_string(), depth: 0 }.parse_module()
 }
 
 // ---------------------------------------------------------------- operators
@@ -1310,15 +1443,40 @@ fn unary(op: UnOp, v: &Val) -> Res<Val> {
     }
 }
 
-fn binary(op: BinOp, l: &Val, r: &Val) -> Res<Val> {
-    if op == BinOp::Pow {
-        // simpleeval's safe_power calls abs() on both operands before anything else
-        for v in [l, r] {
-            if num_of(v).is_none() {
-                return fail(format!("bad operand type for abs(): '{}'", type_name(v)));
-            }
-        }
+/// `abs(v) > limit` as python evaluates it for any operand type (abs() raises for non-numbers)
+fn abs_exceeds(v: &Val, int_limit: &BigInt, float_limit: f64) -> Res<bool> {
+    match num_of(v) {
+        Some(Num::I(i)) => Ok(i.abs() > *int_limit),
+        Some(Num::F(f)) => Ok(f.abs() > float_limit),
+        None => fail(format!("bad operand type for abs(): '{}'", type_name(v))),
     }
+}
+
+/// simpleeval's safe_power / safe_lshift / safe_rshift guards. They run for every operand type,
+/// before the operator itself, in the same order simpleeval checks them.
+fn limit_guards(op: BinOp, l: &Val, r: &Val) -> Res<()> {
+    let exceeded = match op {
+        // `abs(a) > MAX_POWER or abs(b) > MAX_POWER`
+        BinOp::Pow => {
+            let max = BigInt::from(MAX_POWER);
+            abs_exceeds(l, &max, MAX_POWER as f64)? || abs_exceeds(r, &max, MAX_POWER as f64)?
+        }
+        // `abs(b) > MAX_SHIFT or abs(a) > MAX_SHIFT_BASE`
+        BinOp::LShift | BinOp::RShift => {
+            let max_shift = BigInt::from(MAX_SHIFT);
+            let max_base = BigInt::from_f64(f64::MAX).unwrap_or_default();
+            abs_exceeds(r, &max_shift, MAX_SHIFT as f64)? || abs_exceeds(l, &max_base, f64::MAX)?
+        }
+        _ => false,
+    };
+    if exceeded {
+        return fail(format!("Sorry! I don't want to evaluate {} {} {}", py_str(l)?, op.symbol(), py_str(r)?));
+    }
+    Ok(())
+}
+
+fn binary(op: BinOp, l: &Val, r: &Val) -> Res<Val> {
+    limit_guards(op, l, r)?;
     if let (Some(a), Some(b)) = (num_of(l), num_of(r)) {
         return numeric_binary(op, a, b, l, r);
     }
@@ -1362,18 +1520,6 @@ fn repeat_str(s: &str, n: &Val) -> Res<Val> {
 }
 
 fn numeric_binary(op: BinOp, a: Num, b: Num, l: &Val, r: &Val) -> Res<Val> {
-    if op == BinOp::Pow {
-        // simpleeval's safe_power: refuse huge bases and exponents before computing anything
-        let too_big = |n: &Num| match n {
-            Num::I(i) => i.abs() > BigInt::from(MAX_POWER),
-            Num::F(f) => f.abs() > MAX_POWER as f64,
-        };
-        let big_base = too_big(&a);
-        let big_exp = too_big(&b);
-        if big_base || big_exp {
-            return fail(format!("Sorry! I don't want to evaluate {} ** {}", display(l), display(r)));
-        }
-    }
     match (a, b) {
         (Num::I(x), Num::I(y)) => {
             let both_bool = matches!((l, r), (Val::Bool(_), Val::Bool(_)));
@@ -1393,6 +1539,52 @@ fn numeric_binary(op: BinOp, a: Num, b: Num, l: &Val, r: &Val) -> Res<Val> {
     }
 }
 
+/// python `int / int` (cpython long_true_divide): the quotient correctly rounded to a double. Operands
+/// that are exact doubles divide directly. Otherwise the quotient is scaled to 55+ significant bits and
+/// rounded half-to-even with the remainder as the sticky bit. Results too large for a double raise.
+fn int_true_div(a: &BigInt, b: &BigInt) -> Res<f64> {
+    let negative = a.is_negative() != b.is_negative();
+    let (x, y) = (a.magnitude(), b.magnitude());
+    let magnitude = if x.is_zero() {
+        0.0
+    } else if x.bits() <= 53 && y.bits() <= 53 {
+        x.to_f64().unwrap_or(0.0) / y.to_f64().unwrap_or(1.0)
+    } else {
+        let shift = 55 + y.bits() as i64 - x.bits() as i64;
+        let (num, den) = if shift >= 0 {
+            (x << shift as usize, y.clone())
+        } else {
+            (x.clone(), y << (-shift) as usize)
+        };
+        let (q, rem) = num.div_rem(&den);
+        let drop = q.bits() as i64 - 53;
+        let mant = &q >> drop as usize;
+        let low = &q - (&mant << drop as usize);
+        let half = BigUint::one() << (drop - 1) as usize;
+        let round_up = low > half || (low == half && (!rem.is_zero() || mant.is_odd()));
+        let m = mant.to_f64().unwrap_or(0.0) + if round_up { 1.0 } else { 0.0 };
+        let f = ldexp(m, drop - shift);
+        if !f.is_finite() {
+            return fail("integer division result too large for a float");
+        }
+        f
+    };
+    Ok(if negative { -magnitude } else { magnitude })
+}
+
+/// `x * 2**e`, applied in steps so the power of two stays representable
+fn ldexp(mut x: f64, mut e: i64) -> f64 {
+    while e > 1000 {
+        x *= 2f64.powi(1000);
+        e -= 1000;
+    }
+    while e < -1000 {
+        x *= 2f64.powi(-1000);
+        e += 1000;
+    }
+    x * 2f64.powi(e as i32)
+}
+
 fn int_binary(op: BinOp, x: BigInt, y: BigInt, both_bool: bool) -> Res<Val> {
     match op {
         BinOp::Add => Ok(Val::Int(x + y)),
@@ -1402,7 +1594,7 @@ fn int_binary(op: BinOp, x: BigInt, y: BigInt, both_bool: bool) -> Res<Val> {
             if y.is_zero() {
                 return fail("division by zero");
             }
-            Ok(Val::Float(int_to_f64(&x)? / int_to_f64(&y)?))
+            Ok(Val::Float(int_true_div(&x, &y)?))
         }
         BinOp::FloorDiv => {
             if y.is_zero() {
@@ -1428,10 +1620,7 @@ fn int_binary(op: BinOp, x: BigInt, y: BigInt, both_bool: bool) -> Res<Val> {
             Ok(Val::Float(int_to_f64(&x)?.powf(int_to_f64(&y)?)))
         }
         BinOp::LShift | BinOp::RShift => {
-            let max_base = BigInt::from_f64(f64::MAX).unwrap_or_default();
-            if y.abs() > BigInt::from(MAX_SHIFT) || x.abs() > max_base {
-                return fail(format!("Sorry! I don't want to evaluate {x} {} {y}", op.symbol()));
-            }
+            // the simpleeval limits were checked in limit_guards
             if y.is_negative() {
                 return fail("negative shift count");
             }
@@ -1842,6 +2031,13 @@ fn parse_int_str(s: &str, base: i64) -> Res<Val> {
             return invalid();
         }
     }
+    // cpython limits the digits of every base that is not a power of two
+    if !matches!(radix, 2 | 4 | 8 | 16 | 32) && clean.len() > MAX_STR_DIGITS {
+        return fail(format!(
+            "Exceeds the limit (4300 digits) for integer string conversion: value has {} digits; use sys.set_int_max_str_digits() to increase the limit",
+            clean.len()
+        ));
+    }
     let Some(v) = BigInt::parse_bytes(clean.as_bytes(), radix) else { return invalid() };
     Ok(Val::Int(if neg { -v } else { v }))
 }
@@ -1900,7 +2096,7 @@ fn str_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
         };
     }
     match first_arg(args, kwargs) {
-        Some(v) => Ok(Val::Str(format_result(&v)?)),
+        Some(v) => Ok(Val::Str(py_str(&v)?)),
         None => Ok(Val::Str(String::new())),
     }
 }
@@ -1910,6 +2106,8 @@ fn str_call(args: Vec<Val>, kwargs: Vec<(String, Val)>) -> Res<Val> {
 struct Evaluator<'a> {
     /// the expression as the caller gave it (simpleeval reports this text in its messages)
     expression: &'a str,
+    /// nodes currently being evaluated (see MAX_NODE_DEPTH)
+    depth: std::cell::Cell<usize>,
 }
 
 impl Evaluator<'_> {
@@ -1921,6 +2119,17 @@ impl Evaluator<'_> {
     }
 
     fn eval(&self, e: &Expr) -> Res<Val> {
+        let depth = self.depth.get() + 1;
+        if depth > MAX_NODE_DEPTH {
+            return fail("maximum recursion depth exceeded");
+        }
+        self.depth.set(depth);
+        let result = self.eval_node(e);
+        self.depth.set(depth - 1);
+        result
+    }
+
+    fn eval_node(&self, e: &Expr) -> Res<Val> {
         match e {
             Expr::Const(v) => {
                 if let Val::Str(s) = v {
@@ -2054,9 +2263,10 @@ impl Evaluator<'_> {
 /// simpleeval.simple_eval(expression): parse, then evaluate the first statement.
 /// Like simpleeval, a multi-statement input is parsed in full and only its first statement runs.
 pub fn simple_eval(expression: &str) -> Res<Val> {
-    let stmts = parse(expression.trim(), expression)?;
+    // simpleeval parses `expr.strip()`, python's strip (which also removes U+001C..U+001F)
+    let stmts = parse(py_strip(expression), expression)?;
     let Some(first) = stmts.first() else {
         return fail("Sorry, cannot evaluate empty string");
     };
-    Evaluator { expression }.exec(first)
+    Evaluator { expression, depth: std::cell::Cell::new(0) }.exec(first)
 }
