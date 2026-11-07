@@ -2,14 +2,13 @@
 //! extension routes (file tree/editor/search and git panel).
 
 #[path = "../../../../generated/modules/coder.rs"]
-mod meta;
+pub mod meta;
 pub mod syntax;
 
 use crate::pyos;
 use anyhow::anyhow;
 use ol_core::module::{CommandSpec, Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
 use ol_core::pyjson::{py_str, truthy};
-use ol_core::registry::{ModuleDescriptor, Registry};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::ops::ControlFlow;
@@ -20,18 +19,6 @@ const REGEX_BACKTRACK_LIMIT: usize = 1_000_000;
 const BUILTIN_TEMPLATES_PATH: &str = "modules/coder/templates";
 /// files the webui editor refuses to open (binary / huge)
 const UI_MAX_READ_BYTES: u64 = 1_000_000;
-
-pub fn register(r: &mut Registry) {
-    r.add_module(ModuleDescriptor {
-        name: "coder",
-        class_name: meta::CLASS_NAME,
-        doc: meta::DOC,
-        settings: meta::settings,
-        unsafe_: meta::UNSAFE,
-        category: meta::CATEGORY,
-        factory: |base| Arc::new(Coder::new(base)),
-    });
-}
 
 pub struct Coder {
     base: ModuleBase,
@@ -58,6 +45,74 @@ fn present(m: &Map<String, Value>, key: &str) -> bool {
     m.get(key).map(truthy).unwrap_or(false)
 }
 
+/// python `base64.b64decode(s)` on a str (validate=False). `None` = python raises.
+/// non-ASCII text is a ValueError; characters outside the alphabet are skipped; '=' is
+/// skipped too and only decides the end: a trailing quad must be completed by padding.
+/// non-zero trailing bits are accepted. checked against python 3.14 (see tests).
+fn py_b64decode(s: &str) -> Option<Vec<u8>> {
+    if !s.is_ascii() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut quad_pos = 0u8;
+    let mut left = 0u8;
+    let mut pads = 0u8;
+    for c in s.bytes() {
+        if c == b'=' {
+            pads += 1;
+            continue;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => continue,
+        };
+        pads = 0;
+        match quad_pos {
+            0 => left = v,
+            1 => {
+                out.push((left << 2) | (v >> 4));
+                left = v & 0x0f;
+            }
+            2 => {
+                out.push((left << 4) | (v >> 2));
+                left = v & 0x03;
+            }
+            _ => out.push((left << 6) | v),
+        }
+        quad_pos = (quad_pos + 1) % 4;
+    }
+    match quad_pos {
+        0 => Some(out),
+        1 => None,
+        q if q + pads >= 4 => Some(out),
+        _ => None,
+    }
+}
+
+const PARSE_FAILED_MSG: &str = "Failed to parse the file for syntax errors. For safety, the file was not written to disk.";
+
+/// python `_check_syntax`: the errors that block a write (empty = the write may go ahead).
+/// Languages whose grammar is not compiled in pass, see `syntax.rs`.
+fn check_syntax(code: &str, file_path: &str) -> Vec<String> {
+    let Some(lang) = syntax::detect_language_from_path(file_path) else { return Vec::new() };
+    if matches!(lang, "vimdoc" | "html" | "htm") || !syntax::is_supported(lang) {
+        return Vec::new();
+    }
+    gate_errors(syntax::diagnostics(code, lang))
+}
+
+/// python: a falsy tree-sitter result is reported as the single parse-failure error
+fn gate_errors(diags: Option<Vec<syntax::Diagnostic>>) -> Vec<String> {
+    match diags {
+        None => vec![PARSE_FAILED_MSG.to_string()],
+        Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
+    }
+}
+
 /// compile a user regex like python's `regex.compile(pattern, flags)`
 fn compile_regex(pattern: &str, ignore_case: bool) -> R<fancy_regex::Regex> {
     let mut b = fancy_regex::RegexBuilder::new(pattern);
@@ -66,11 +121,18 @@ fn compile_regex(pattern: &str, ignore_case: bool) -> R<fancy_regex::Regex> {
     b.build().map_err(|e| e.to_string())
 }
 
-/// `pattern.search(line)`; lines keep their trailing newline in python, where `$` also
-/// matches just before it - search without it so anchors behave the same.
+/// `pattern.search(line)` where `line` keeps its trailing newline, as python's readlines and
+/// line iteration do: patterns such as `return\s` or `\n` can consume it. python's `$` also
+/// matches just before that newline, which fancy_regex's `$` does not, so the line also counts
+/// when the pattern matches it without the newline.
 fn re_search(re: &fancy_regex::Regex, line: &str) -> R<bool> {
-    let l = line.strip_suffix('\n').unwrap_or(line);
-    re.is_match(l).map_err(|e| e.to_string())
+    if re.is_match(line).map_err(|e| e.to_string())? {
+        return Ok(true);
+    }
+    match line.strip_suffix('\n') {
+        Some(l) => re.is_match(l).map_err(|e| e.to_string()),
+        None => Ok(false),
+    }
 }
 
 /// python list slicing helper for possibly negative start
@@ -107,10 +169,22 @@ fn context_lists(all_lines: &[&str], line_num: usize, context: i64) -> (Vec<Valu
     (before.into_iter().map(Value::String).collect(), after.into_iter().map(Value::String).collect())
 }
 
-/// run git; returns (returncode, raw stdout)
-async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
+/// python's `os.path` error for a None root (`_git_root` is None when no sandbox_paths are set)
+const NONE_ROOT_ERR: &str = "expected str, bytes or os.PathLike object, not NoneType";
+
+/// python `subprocess.run(cwd=None)`: no root runs git in the server's own working directory
+fn git_command(root: Option<&str>, args: &[impl AsRef<std::ffi::OsStr>]) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+    cmd.args(args).kill_on_drop(true).stdin(std::process::Stdio::null());
+    if let Some(root) = root {
+        cmd.current_dir(root);
+    }
+    cmd
+}
+
+/// run git; returns (returncode, raw stdout)
+async fn run_git_bytes(root: Option<&str>, args: &[String], timeout: u64) -> (i32, Vec<u8>) {
+    let mut cmd = git_command(root, args);
     match tokio::time::timeout(Duration::from_secs(timeout), cmd.output()).await {
         Err(_) => (124, b"git command timed out".to_vec()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (127, b"git executable not found".to_vec()),
@@ -120,17 +194,25 @@ async fn run_git_bytes(root: &str, args: &[String], timeout: u64) -> (i32, Vec<u
 }
 
 /// run git; returns (ok, output)
-async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(args).current_dir(root).kill_on_drop(true).stdin(std::process::Stdio::null());
+async fn run_git(root: Option<&str>, args: &[&str], accept: &[i32]) -> (bool, String) {
+    let mut cmd = git_command(root, args);
     let out = match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Err(_) => return (false, "git command timed out".into()),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return (false, "git executable not found".into()),
         Ok(Err(e)) => return (false, e.to_string()),
         Ok(Ok(o)) => o,
     };
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    // python runs this in text mode: strict utf-8 (stdout is decoded before stderr, and a
+    // decode error wins over the return code) and universal newlines
+    let decode = |bytes: &[u8]| pyos::decode_utf8(bytes).map(|s| pyos::universal_newlines(&s));
+    let stdout = match decode(&out.stdout) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => return (false, e),
+    };
+    let stderr = match decode(&out.stderr) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => return (false, e),
+    };
     let rc = out.status.code().unwrap_or(-1);
     if !accept.contains(&rc) {
         let msg = if !stderr.is_empty() {
@@ -145,7 +227,7 @@ async fn run_git(root: &str, args: &[&str], accept: &[i32]) -> (bool, String) {
     (true, if stdout.is_empty() { stderr } else { stdout })
 }
 
-async fn git(root: &str, args: &[&str]) -> (bool, String) {
+async fn git(root: Option<&str>, args: &[&str]) -> (bool, String) {
     run_git(root, args, &[0]).await
 }
 
@@ -309,6 +391,10 @@ fn py_type(v: &Value) -> &'static str {
 }
 
 impl Coder {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
@@ -382,17 +468,6 @@ impl Coder {
 
     // ---------------- treesitter helpers
 
-    fn check_syntax(&self, code: &str, file_path: &str) -> Vec<String> {
-        let Some(lang) = syntax::detect_language_from_path(file_path) else { return Vec::new() };
-        if matches!(lang, "vimdoc" | "html" | "htm") {
-            return Vec::new();
-        }
-        match syntax::diagnostics(code, lang) {
-            // language not compiled in: like an unsupported language in python, pass
-            None => Vec::new(),
-            Some(diags) => diags.iter().map(|d| format!("Line {}, Col {}: {}", d.start_line + 1, d.start_column + 1, d.message)).collect(),
-        }
-    }
 
     // ---------------- template helpers
 
@@ -406,19 +481,17 @@ impl Coder {
 
     /// python _get_templates (on a listdir error python returns a result dict, whose keys
     /// then get listed by the system prompt - replicated)
-    fn get_templates(&self) -> Vec<String> {
+    fn get_templates(&self) -> R<Vec<String>> {
         let mut all = Vec::new();
         for folder in self.get_template_folders() {
-            let path = match ol_core::paths::get_path(&folder) {
-                Ok(p) => p,
-                Err(_) => return vec!["status".into(), "content".into()],
-            };
+            // python calls core.get_path outside its try: an error there propagates
+            let path = ol_core::paths::get_path(&folder).map_err(|e| e.to_string())?;
             match pyos::listdir(&path) {
                 Ok(t) => all.extend(t),
-                Err(_) => return vec!["status".into(), "content".into()],
+                Err(_) => return Ok(vec!["status".into(), "content".into()]),
             }
         }
-        all
+        Ok(all)
     }
 
     // ---------------- tools
@@ -553,7 +626,7 @@ impl Coder {
         let path = a.str_or("path", "");
         let content = a.str_or("content", "");
         let target = self.get_sandbox_subpath(&sandbox, &path).map_err(err)?;
-        let errors = self.check_syntax(&content, &target);
+        let errors = check_syntax(&content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -752,7 +825,7 @@ impl Coder {
         if new_content == content {
             return Ok(self.result("Failed to match your original code string against the file contents. Try again!", false));
         }
-        let errors = self.check_syntax(&new_content, &target);
+        let errors = check_syntax(&new_content, &target);
         if !errors.is_empty() {
             return Ok(self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false));
         }
@@ -766,7 +839,8 @@ impl Coder {
 
     fn route_sandboxes(&self) -> anyhow::Result<Value> {
         let mode = self.cfg("editor_mode").filter(truthy).map(|v| py_str(&v)).unwrap_or_else(|| "standard".into());
-        let autosave = self.cfg("autosave_interval").filter(truthy).and_then(|v| ol_core::pyjson::as_f64(&v)).map(|f| f as i64).unwrap_or(0);
+        // python: int(self.config.get("autosave_interval") or 0)
+        let autosave = py_int(self.cfg("autosave_interval").filter(truthy).as_ref(), 0)?;
         Ok(json!({
             "sandboxes": self.get_sandbox_paths().map_err(err)?,
             "read_only": self.read_only(),
@@ -878,7 +952,7 @@ impl Coder {
             Ok(t) => t,
             Err(e) => return self.result(e, false),
         };
-        let errors = self.check_syntax(&content, &target);
+        let errors = check_syntax(&content, &target);
         if !errors.is_empty() {
             return self.result(json!({"errors": errors, "message": "Syntax errors detected! File was not written to disk."}), false);
         }
@@ -1041,7 +1115,7 @@ impl Coder {
         if sandbox.is_empty() || needle.is_empty() {
             return Ok(self.result("sandbox and query are both required", false));
         }
-        let root = match self.full_sandbox(&sandbox) {
+        let root = match self.get_full_sandbox_path(&sandbox) {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
@@ -1052,6 +1126,11 @@ impl Coder {
             }
         } else {
             None
+        };
+        // python: with no sandbox_paths the root is None and os.walk(None) raises outside any
+        // try, so the exception escapes the route instead of becoming a result
+        let Some(root) = root else {
+            return Err(err("expected str, bytes or os.PathLike object, not NoneType"));
         };
         let needle_lower = needle.to_lowercase();
         let blacklist = self.blacklist();
@@ -1069,8 +1148,11 @@ impl Coder {
                     Ok(_) => {}
                     Err(_) => continue,
                 }
-                let Ok(content) = pyos::read_text(&fpath) else { continue };
-                for (i, line) in pyos::readlines(&content).iter().enumerate() {
+                // python route streams the file (`for line in f`): lines completed before a bad utf-8 chunk still count
+                let Ok((lines, _decode_err)) = pyos::stream_lines(&fpath) else { continue };
+                // python only breaks the line loop here: the file loop has no truncated
+                // check, so later files can still append (and the walk stops per folder)
+                for (i, line) in lines.iter().enumerate() {
                     let hit = match &pattern {
                         Some(p) => match re_search(p, line) {
                             Ok(h) => h,
@@ -1087,9 +1169,6 @@ impl Coder {
                         }
                     }
                 }
-                if truncated {
-                    break;
-                }
             }
             if truncated {
                 ControlFlow::Break(())
@@ -1102,15 +1181,27 @@ impl Coder {
 
     // ---------------- git
 
-    fn git_root(&self, sandbox: &str, subpath: &str) -> R<String> {
-        let full = self.full_sandbox(sandbox)?;
+    /// python `_git_root`: the folder git runs in, `None` when no sandbox_paths are configured
+    /// (python's `_get_full_sandbox_path` returns None and git then runs in the server's cwd)
+    fn git_root(&self, sandbox: &str, subpath: &str) -> R<Option<String>> {
+        let full = self.get_full_sandbox_path(sandbox)?;
         if subpath.is_empty() {
             return Ok(full);
         }
-        ol_core::paths::sandbox_path(&full, Some(subpath)).map_err(|e| e.to_string())
+        // python: core.sandbox_path(None, subpath) fails on `None.replace`
+        let base = full.ok_or_else(|| "'NoneType' object has no attribute 'replace'".to_string())?;
+        ol_core::paths::sandbox_path(&base, Some(subpath)).map(Some).map_err(|e| e.to_string())
     }
 
-    fn check_git_paths(root: &str, paths: &[String]) -> R<()> {
+    /// the root as a path for `os.path` calls: python raises TypeError on a None root
+    fn root_str(root: &Option<String>) -> R<&str> {
+        root.as_deref().ok_or_else(|| NONE_ROOT_ERR.to_string())
+    }
+
+    /// python `_check_git_paths`: `os.path.dirname(root)` runs before the loop, so a None root
+    /// raises even when there are no paths
+    fn check_git_paths(root: Option<&str>, paths: &[String]) -> R<()> {
+        let root = root.ok_or_else(|| NONE_ROOT_ERR.to_string())?;
         let sandbox_root = pyos::dirname(root);
         for p in paths {
             let full = pyos::normpath(&pyos::join(root, p));
@@ -1121,14 +1212,19 @@ impl Coder {
         Ok(())
     }
 
-    fn route_git_repos(&self, q: &Map<String, Value>) -> Value {
+    fn route_git_repos(&self, q: &Map<String, Value>) -> anyhow::Result<Value> {
         let sandbox = sget(q, "sandbox");
         if sandbox.is_empty() {
-            return self.result("no sandbox given", false);
+            return Ok(self.result("no sandbox given", false));
         }
-        let root = match self.full_sandbox(&sandbox) {
+        let root = match self.get_full_sandbox_path(&sandbox) {
             Ok(r) => r,
-            Err(e) => return self.result(e, false),
+            Err(e) => return Ok(self.result(e, false)),
+        };
+        // python: with no sandbox_paths the root is None and os.path.join(None, '.git') raises
+        // outside any try, so the exception escapes the route
+        let Some(root) = root else {
+            return Err(err(NONE_ROOT_ERR));
         };
         let blacklist = self.blacklist();
         let max_depth = 6usize;
@@ -1157,7 +1253,7 @@ impl Coder {
             }
             ControlFlow::Continue(())
         });
-        json!({"repos": repos})
+        Ok(json!({"repos": repos}))
     }
 
     async fn route_git_status(&self, q: &Map<String, Value>) -> Value {
@@ -1169,14 +1265,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let (ok, _) = git(root.as_deref(), &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return json!({"is_repo": false, "read_only": self.read_only()});
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (ok_b, b_out) = git(&root, &["branch", "--format=%(refname:short)"]).await;
+        let (_, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok_b, b_out) = git(root.as_deref(), &["branch", "--format=%(refname:short)"]).await;
         let branches: Vec<String> = if ok_b { b_out.split('\n').map(|b| b.trim()).filter(|b| !b.is_empty()).map(String::from).collect() } else { Vec::new() };
-        let (rc, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1", "-z"]), 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["status", "--porcelain=v1", "-z"]), 15).await;
         let changes = if rc == 0 { parse_porcelain_z(&raw) } else { Vec::new() };
         json!({"is_repo": true, "branch": branch, "branches": branches, "changes": changes, "read_only": self.read_only()})
     }
@@ -1191,24 +1287,53 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (ok, _) = git(&root, &["rev-parse", "--is-inside-work-tree"]).await;
+        let (ok, _) = git(root.as_deref(), &["rev-parse", "--is-inside-work-tree"]).await;
         if !ok {
             return Ok(json!({"is_repo": false}));
         }
-        let (_, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (_, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             return Ok(json!({"is_repo": true, "branch": branch, "log": []}));
         }
         Ok(json!({"is_repo": true, "branch": branch, "log": parse_log(&raw)}))
     }
 
-    fn body_paths(b: &Map<String, Value>) -> Vec<String> {
-        match b.get("paths") {
-            Some(Value::Array(a)) => a.iter().map(py_str).collect(),
-            Some(Value::String(s)) => s.chars().map(|c| c.to_string()).collect(),
-            _ => Vec::new(),
+    /// python `for p in paths` over the request's truthy `paths` value: a list (elements must be
+    /// str, else os.path.join raises), a string (its characters) or a dict (its keys). any other
+    /// value raises when iteration starts. each item is an `Err` when python would raise on it.
+    fn py_path_items(paths: &Value) -> R<Vec<R<String>>> {
+        let not_pathlike = |v: &Value| -> R<String> {
+            Err(format!("join() argument must be str, bytes, or os.PathLike object, not '{}'", py_type(v)))
+        };
+        Ok(match paths {
+            Value::Array(a) => a
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s.clone()),
+                    other => not_pathlike(other),
+                })
+                .collect(),
+            Value::String(s) => s.chars().map(|c| Ok(c.to_string())).collect(),
+            Value::Object(m) => m.keys().map(|k| Ok(k.clone())).collect(),
+            other => return Err(format!("'{}' object is not iterable", py_type(other))),
+        })
+    }
+
+    /// python `_check_git_paths` + `abs_paths` over the request's `paths`, checked in order:
+    /// the first bad item stops with python's error text
+    fn checked_git_paths(root: Option<&str>, paths: &Value) -> R<Vec<String>> {
+        // python's dirname(root) inside _check_git_paths runs before the paths are iterated
+        if root.is_none() {
+            return Err(NONE_ROOT_ERR.to_string());
         }
+        let mut out = Vec::new();
+        for item in Self::py_path_items(paths)? {
+            let p = item?;
+            Self::check_git_paths(root, std::slice::from_ref(&p))?;
+            out.push(p);
+        }
+        Ok(out)
     }
 
     async fn route_git_stage(&self, b: &Map<String, Value>, unstage: bool) -> Value {
@@ -1216,18 +1341,25 @@ impl Coder {
             return self.result("coder is in read-only mode", false);
         }
         let sandbox = sget(b, "sandbox");
-        let paths = Self::body_paths(b);
         if sandbox.is_empty() || !present(b, "paths") {
             return self.result("sandbox and paths are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, &paths).map(|_| r)) {
+        let paths_val = b.get("paths").cloned().unwrap_or(Value::Null);
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs: Vec<String> = paths.iter().map(|p| pyos::normpath(&pyos::join(&root, p))).collect();
+        let paths = match Self::checked_git_paths(root.as_deref(), &paths_val) {
+            Ok(p) => p,
+            Err(e) => return self.result(e, false),
+        };
+        let abs: Vec<String> = match Self::root_str(&root) {
+            Ok(r) => paths.iter().map(|p| pyos::normpath(&pyos::join(r, p))).collect(),
+            Err(e) => return self.result(e, false),
+        };
         let mut args: Vec<&str> = if unstage { vec!["restore", "--staged", "--"] } else { vec!["add", "--"] };
         args.extend(abs.iter().map(|s| s.as_str()));
-        let (ok, out) = git(&root, &args).await;
+        let (ok, out) = git(root.as_deref(), &args).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1247,7 +1379,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = git(&root, &["commit", "-m", &message]).await;
+        let (ok, out) = git(root.as_deref(), &["commit", "-m", &message]).await;
         self.result(out, ok)
     }
 
@@ -1264,14 +1396,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = git(&root, &["switch", &name]).await;
+        let (ok, out) = git(root.as_deref(), &["switch", &name]).await;
         if !ok {
             return self.result(out, false);
         }
         self.result(if out.is_empty() { format!("switched to {}", name) } else { out }, true)
     }
 
-    async fn pick_remote(root: &str) -> Option<String> {
+    async fn pick_remote(root: Option<&str>) -> Option<String> {
         let (ok, out) = git(root, &["remote"]).await;
         let remotes: Vec<String> = if ok { out.split_whitespace().map(String::from).collect() } else { Vec::new() };
         if remotes.is_empty() {
@@ -1289,23 +1421,23 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
         if branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let has_upstream = upstream.contains('/');
         let (target, (rc, raw)) = if has_upstream {
-            (upstream.clone(), run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
+            (upstream.clone(), run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("{}..HEAD", upstream), "-n100".into()], 15).await)
         } else {
-            (format!("{}/{}", remote, branch), run_git_bytes(&root, &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
+            (format!("{}/{}", remote, branch), run_git_bytes(root.as_deref(), &s(&["log", "--pretty=%h%x09%s", "HEAD", "--not", "--remotes", "-n100"]), 15).await)
         };
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
@@ -1314,13 +1446,13 @@ impl Coder {
         let ahead = parse_log(&raw);
         let mut behind = 0i64;
         if has_upstream {
-            let (ok, out) = git(&root, &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
+            let (ok, out) = git(root.as_deref(), &["rev-list", "--count", &format!("HEAD..{}", upstream)]).await;
             let o = out.trim();
             if ok && !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()) {
                 behind = o.parse().unwrap_or(0);
             }
         }
-        let (_, raw) = run_git_bytes(&root, &s(&["status", "--porcelain=v1"]), 15).await;
+        let (_, raw) = run_git_bytes(root.as_deref(), &s(&["status", "--porcelain=v1"]), 15).await;
         let dirty = !String::from_utf8_lossy(&raw).trim().is_empty();
         json!({
             "branch": branch,
@@ -1346,21 +1478,21 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pushing", false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes, nowhere to push to", false);
         };
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let upstream = if ok { upstream.trim().to_string() } else { String::new() };
         let args: Vec<String> = if let Some((up_remote, up_branch)) = upstream.split_once('/') {
             vec!["push".into(), up_remote.into(), format!("{}:{}", branch, up_branch)]
         } else {
             vec!["push".into(), "-u".into(), remote, branch]
         };
-        let (rc, raw) = run_git_bytes(&root, &args, 180).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &args, 180).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git push failed".into() } else { out }, false);
@@ -1378,7 +1510,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return Ok(self.result(e, false)),
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("-n{}", limit)], 15).await;
         if rc != 0 {
             let t = String::from_utf8_lossy(&raw).trim().to_string();
             return Ok(self.result(if t.is_empty() { "git log failed".into() } else { t }, false));
@@ -1395,17 +1527,20 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return Err(self.result("sandbox and path are both required", false));
         }
-        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(q, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return Err(self.result(e, false)),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return Err(self.result(e, false)),
+        };
         let (rc, raw) = if untracked {
-            run_git_bytes(&root, &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--no-index".into(), "--".into(), "/dev/null".into(), abs], 15).await
         } else if staged {
-            run_git_bytes(&root, &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--staged".into(), "--".into(), abs], 15).await
         } else {
-            run_git_bytes(&root, &[String::from("diff"), "--".into(), abs], 15).await
+            run_git_bytes(root.as_deref(), &[String::from("diff"), "--".into(), abs], 15).await
         };
         Ok((rc, raw, untracked))
     }
@@ -1448,22 +1583,22 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok {
             return self.result(branch, false);
         }
-        let Some(remote) = Self::pick_remote(&root).await else {
+        let Some(remote) = Self::pick_remote(root.as_deref()).await else {
             return self.result("this repo has no remotes", false);
         };
-        let (rc, raw) = run_git_bytes(&root, &[String::from("fetch"), remote, "--prune".into()], 120).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &[String::from("fetch"), remote, "--prune".into()], 120).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
             return self.result(if out.is_empty() { "git fetch failed".into() } else { out }, false);
         }
-        let (ok, upstream) = git(&root, &["rev-parse", "--abbrev-ref", "@{u}"]).await;
+        let (ok, upstream) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "@{u}"]).await;
         let mut incoming = Vec::new();
         if ok && upstream.trim().contains('/') {
-            let (rc2, raw2) = run_git_bytes(&root, &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream.trim()), "-n100".into()], 15).await;
+            let (rc2, raw2) = run_git_bytes(root.as_deref(), &[String::from("log"), "--pretty=%h%x09%s".into(), format!("HEAD..{}", upstream.trim()), "-n100".into()], 15).await;
             if rc2 == 0 {
                 incoming = parse_log(&raw2);
             }
@@ -1483,14 +1618,14 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, branch) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (ok, branch) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if !ok || branch == "HEAD" {
             return self.result("detached HEAD: switch to a branch before pulling", false);
         }
-        let (rc, raw) = run_git_bytes(&root, &s(&["pull"]), 120).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["pull"]), 120).await;
         let out = String::from_utf8_lossy(&raw).trim().to_string();
         if rc != 0 {
-            let (_, craw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+            let (_, craw) = run_git_bytes(root.as_deref(), &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
             let craw = String::from_utf8_lossy(&craw).to_string();
             let conflicts: Vec<&str> = py_splitlines(&craw).into_iter().filter(|l| !l.trim().is_empty()).collect();
             if !conflicts.is_empty() {
@@ -1519,7 +1654,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (ok, out) = if checkout { git(&root, &["switch", "-c", &name]).await } else { git(&root, &["branch", &name]).await };
+        let (ok, out) = if checkout { git(root.as_deref(), &["switch", "-c", &name]).await } else { git(root.as_deref(), &["branch", &name]).await };
         if !ok {
             return self.result(out, false);
         }
@@ -1540,11 +1675,11 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (_, current) = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).await;
+        let (_, current) = git(root.as_deref(), &["rev-parse", "--abbrev-ref", "HEAD"]).await;
         if current.trim() == name {
             return self.result("cannot delete the branch you are currently on", false);
         }
-        let (ok, out) = git(&root, &["branch", if force { "-D" } else { "-d" }, &name]).await;
+        let (ok, out) = git(root.as_deref(), &["branch", if force { "-D" } else { "-d" }, &name]).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1560,7 +1695,7 @@ impl Coder {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let (rc, raw) = run_git_bytes(&root, &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
+        let (rc, raw) = run_git_bytes(root.as_deref(), &s(&["diff", "--name-only", "--diff-filter=U"]), 15).await;
         if rc != 0 {
             return json!({"conflicts": []});
         }
@@ -1582,14 +1717,17 @@ impl Coder {
         if !matches!(strategy.as_str(), "ours" | "theirs" | "both") {
             return self.result("strategy must be 'ours', 'theirs', or 'both'", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return self.result(e, false),
+        };
         let (ok, out) = match strategy.as_str() {
-            "ours" => git(&root, &["checkout", "--ours", "--", &rel_path]).await,
-            "theirs" => git(&root, &["checkout", "--theirs", "--", &rel_path]).await,
+            "ours" => git(root.as_deref(), &["checkout", "--ours", "--", &rel_path]).await,
+            "theirs" => git(root.as_deref(), &["checkout", "--theirs", "--", &rel_path]).await,
             _ => {
                 let re = regex::Regex::new(r"(?s)<<<<<<< [^\n]*\n(.*?)=======\n(.*?)>>>>>>> [^\n]*\n").unwrap();
                 match pyos::read_text(&abs) {
@@ -1607,7 +1745,7 @@ impl Coder {
         if !ok {
             return self.result(out, false);
         }
-        git(&root, &["add", "--", &abs]).await;
+        git(root.as_deref(), &["add", "--", &abs]).await;
         self.result(format!("resolved {} ({})", rel_path, strategy), true)
     }
 
@@ -1620,12 +1758,15 @@ impl Coder {
         if sandbox.is_empty() || rel_path.is_empty() {
             return self.result("sandbox and path are both required", false);
         }
-        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(&r, std::slice::from_ref(&rel_path)).map(|_| r)) {
+        let root = match self.git_root(&sandbox, &sget(b, "subpath")).and_then(|r| Self::check_git_paths(r.as_deref(), std::slice::from_ref(&rel_path)).map(|_| r)) {
             Ok(r) => r,
             Err(e) => return self.result(e, false),
         };
-        let abs = pyos::normpath(&pyos::join(&root, &rel_path));
-        let (ok, out) = git(&root, &["restore", "--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
+        let abs = match Self::root_str(&root) {
+            Ok(r) => pyos::normpath(&pyos::join(r, &rel_path)),
+            Err(e) => return self.result(e, false),
+        };
+        let (ok, out) = git(root.as_deref(), &["restore", "--source=HEAD", "--staged", "--worktree", "--", &abs]).await;
         if !ok {
             return self.result(out, false);
         }
@@ -1633,17 +1774,21 @@ impl Coder {
     }
 
     fn route_upload(&self, b: &Map<String, Value>) -> Value {
-        use base64::Engine;
         if self.read_only() {
             return self.result("coder is in read-only mode", false);
         }
         let sandbox = sget(b, "sandbox");
         let rel_path = sget(b, "path");
-        let content_b64 = sget(b, "content");
         let filename = sget(b, "filename");
         if sandbox.is_empty() || rel_path.is_empty() || filename.is_empty() {
             return self.result("sandbox, path and filename are all required", false);
         }
+        // python: body.get("content", ""); b64decode raises for any non-str value (None here)
+        let content_b64: Option<String> = match b.get("content") {
+            None => Some(String::new()),
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => None,
+        };
         let safe_name = filename.replace(['/', '\\'], "_");
         let target_rel = if rel_path.is_empty() { safe_name } else { format!("{}/{}", rel_path.trim_end_matches('/'), safe_name) };
         let target = match self.get_sandbox_subpath(&sandbox, &target_rel) {
@@ -1653,11 +1798,9 @@ impl Coder {
         if pyos::exists(&target) {
             return self.result(format!("file already exists: {}", target_rel), false);
         }
-        // python b64decode (non-validating): drop characters outside the alphabet
-        let cleaned: String = content_b64.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')).collect();
-        let raw = match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
-            Ok(r) => r,
-            Err(_) => return self.result("invalid base64 content", false),
+        let raw = match content_b64.as_deref().and_then(py_b64decode) {
+            Some(r) => r,
+            None => return self.result("invalid base64 content", false),
         };
         if raw.len() > 10_000_000 {
             return self.result("file too large (max 10MB)", false);
@@ -1718,7 +1861,7 @@ impl Module for Coder {
 
     async fn on_system_prompt(&self) -> anyhow::Result<Option<String>> {
         let mut out: Vec<String> = Vec::new();
-        let templates = self.get_templates();
+        let templates = self.get_templates().map_err(err)?;
         if !templates.is_empty() {
             let list: Vec<String> = templates.iter().map(|t| format!("- {}", t)).collect();
             out.push(format!("## Templates you can read using read_template:\n{}", list.join("\n")));
@@ -1810,7 +1953,7 @@ impl Module for Coder {
             "delete" => self.route_delete(&b),
             "duplicate" => self.route_duplicate(&b),
             "search" => self.route_search(&b)?,
-            "git_repos" => self.route_git_repos(q),
+            "git_repos" => self.route_git_repos(q)?,
             "git_status" => self.route_git_status(q).await,
             "git_recent" => self.route_git_recent(q).await?,
             "git_stage" => self.route_git_stage(&b, false).await,
@@ -1869,5 +2012,182 @@ mod tests {
         // python quirk: context_lines[:1] includes the line *after* the match
         assert_eq!(b, vec![json!("b")]);
         assert_eq!(a, vec![json!("b")]);
+    }
+
+    fn call(rt: &tokio::runtime::Runtime, c: &Coder, method: &str, args: Value) -> Value {
+        let map = args.as_object().cloned().unwrap_or_default();
+        rt.block_on(c.call_tool(method, ToolArgs::new(map))).unwrap()
+    }
+
+    #[test]
+    fn syntax_gate_matches_python_blocking_rules() {
+        // valid code passes, broken code is reported with python's "Line N, Col M:" prefix
+        assert!(check_syntax("x = 1\n", "a.py").is_empty());
+        let errs = check_syntax("def f(:\n    return 1\n", "a.py");
+        assert!(!errs.is_empty());
+        assert!(errs[0].starts_with("Line 1, Col "), "{:?}", errs);
+        // html and plaintext are never checked; neither is a language whose grammar is not compiled in
+        assert!(check_syntax("<div>", "a.html").is_empty());
+        assert!(check_syntax("notes", "a.txt").is_empty());
+        assert!(check_syntax("puts 'x'", "a.rb").is_empty());
+        // python's falsy-result branch: the single parse-failure error, verbatim
+        assert_eq!(
+            gate_errors(None),
+            vec!["Failed to parse the file for syntax errors. For safety, the file was not written to disk.".to_string()]
+        );
+    }
+
+    #[test]
+    fn upload_base64_matches_python_b64decode() {
+        // expected values are python 3.14 `base64.b64decode(s)` results (None = raises)
+        let cases: [(&str, Option<&[u8]>); 14] = [
+            ("aGk=", Some(b"hi")),
+            ("QR==", Some(b"A")),
+            ("QUJD=REVG", Some(b"ABCDEF")),
+            ("QUJ=", Some(b"AB")),
+            ("=QUJD", Some(b"ABC")),
+            ("QQ==QQ==", Some(b"A\x04\x10")),
+            ("QQ=QQ", Some(b"A\x04\x10")),
+            ("QUJD\n RE VG", Some(b"ABCDEF")),
+            ("QQ=", None),
+            ("Q==", None),
+            ("QUJ=RE", None),
+            ("QUJDRA=A", None),
+            ("QUJ\n", None),
+            ("\u{e9}", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(py_b64decode(input).as_deref(), want, "input {:?}", input);
+        }
+    }
+
+    #[test]
+    fn regex_line_match_matches_python() {
+        // lines keep their '\n' in python: `\s` and `\n` can consume it, `$` matches before it
+        let line = "return\n";
+        assert!(re_search(&compile_regex("return\\s", false).unwrap(), line).unwrap());
+        assert!(re_search(&compile_regex("return$", false).unwrap(), line).unwrap());
+        assert!(re_search(&compile_regex("a\\n", false).unwrap(), "a\n").unwrap());
+        assert!(!re_search(&compile_regex("return\\s", false).unwrap(), "return").unwrap());
+        assert!(!re_search(&compile_regex("^$", false).unwrap(), line).unwrap());
+    }
+
+    #[test]
+    fn git_path_items_match_python_iteration() {
+        // python `for p in paths`: a non-iterable raises at the start of the loop
+        let err = Coder::py_path_items(&json!(5)).err();
+        assert_eq!(err.as_deref(), Some("'int' object is not iterable"));
+        // list elements must be str for os.path.join
+        let items = Coder::py_path_items(&json!(["a.txt", 1])).unwrap();
+        assert_eq!(items[0].as_deref(), Ok("a.txt"));
+        assert_eq!(items[1].as_ref().err().map(String::as_str), Some("join() argument must be str, bytes, or os.PathLike object, not 'int'"));
+        // a dict iterates its keys, a string its characters
+        let mut keys: Vec<String> = Coder::py_path_items(&json!({"x.rs": 1})).unwrap().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(keys.pop().as_deref(), Some("x.rs"));
+        let chars: Vec<String> = Coder::py_path_items(&json!("ab")).unwrap().into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(chars, vec!["a".to_string(), "b".to_string()]);
+        // the escape check runs in order and reports python's message
+        let root = "/x/sb/repo";
+        let ok = Coder::checked_git_paths(Some(root), &json!(["a.txt"])).unwrap();
+        assert_eq!(ok, vec!["a.txt".to_string()]);
+        let esc = Coder::checked_git_paths(Some(root), &json!(["../../etc"])).err();
+        assert_eq!(esc.as_deref(), Some("path escapes the sandbox: ../../etc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_output_is_decoded_strictly_like_python_text_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let git_in = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&root).args(args).status().unwrap();
+        assert!(git_in(&["init", "-q"]).success());
+        std::fs::write(dir.path().join(std::ffi::OsStr::from_bytes(b"\xff.txt")), "x").unwrap();
+        assert!(git_in(&["add", "--", "."]).success());
+        // `ls-files -z` prints the raw name bytes: python's text-mode decode raises, and that
+        // error is what the route reports
+        let (ok, out) = rt.block_on(run_git(Some(&root), &["ls-files", "-z"], &[0]));
+        assert!(!ok);
+        assert_eq!(out, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte");
+        // without a root, git runs in the server's own working directory (python cwd=None)
+        let (ok, out) = rt.block_on(run_git(None, &["--version"], &[0]));
+        assert!(ok && out.starts_with("git version"), "{out}");
+    }
+
+    #[test]
+    fn none_root_raises_python_os_path_error() {
+        // python: with no sandbox_paths `_check_git_paths` fails in os.path.dirname even when
+        // there is nothing to check
+        assert_eq!(Coder::check_git_paths(None, &[]).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::checked_git_paths(None, &json!([])).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::root_str(&None).err().as_deref(), Some(NONE_ROOT_ERR));
+        assert_eq!(Coder::root_str(&Some("/x".into())).unwrap(), "/x");
+    }
+
+    /// one test owns the process-wide config (set_for_tests), so every tool check lives here
+    #[test]
+    fn tool_return_strings_match_python() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sb");
+        std::fs::create_dir_all(&root).unwrap();
+        ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
+            "sandbox_paths": [root.to_string_lossy()],
+            "enable_builtin_templates": false,
+            "template_paths": [],
+            "folder_blacklist": ["venv", "__pycache__"],
+            "global_line_limit": 1000,
+            "read-only": false,
+        }}}}));
+        let c = Coder::new(ModuleBase::detached("coder"));
+
+        // syntax gate: the file must not be written
+        let v = call(&rt, &c, "file_create", json!({"sandbox": "sb", "path": "bad.py", "content": "def f(:\n    return 1\n"}));
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["content"]["message"], "Syntax errors detected! File was not written to disk.");
+        assert!(!root.join("bad.py").exists());
+
+        let v = call(&rt, &c, "file_create", json!({"sandbox": "sb", "path": "a.py", "content": "x = 1\n# foo bar\n"}));
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["content"], "File a.py successfully created. Syntax verification passed - no need to verify further.");
+
+        // plain read of a small file: raw dict, no status wrapper
+        let v = call(&rt, &c, "file_read", json!({"sandbox": "sb", "path": "a.py"}));
+        assert_eq!(v["content"], "x = 1\n# foo bar\n");
+        assert_eq!(v["truncated"], false);
+        assert_eq!(v["success"], true);
+
+        let v = call(&rt, &c, "file_grep", json!({"sandbox": "sb", "file_path": "a.py", "regex_pattern": "foo"}));
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["content"][0]["line_num"], 2);
+        assert_eq!(v["content"][0]["line"], "# foo bar");
+
+        let v = call(&rt, &c, "folder_grep", json!({"sandbox": "sb", "sub_path": "", "regex_pattern": "zzz"}));
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["content"], "No matches found");
+
+        let v = call(&rt, &c, "file_edit", json!({"sandbox": "sb", "path": "a.py", "original_code": "x = 1", "replacement_code": "x = 2"}));
+        assert_eq!(v["content"], "Successfully edited file a.py. Syntax verification passed - no need to verify further.");
+        assert_eq!(std::fs::read_to_string(root.join("a.py")).unwrap(), "x = 2\n# foo bar\n");
+
+        // webui route: flat search results, python shape
+        let out = rt
+            .block_on(c.ui_route("search", "POST", Some(json!({"sandbox": "sb", "query": "FOO"})), Map::new()))
+            .unwrap();
+        assert_eq!(out["truncated"], false);
+        assert_eq!(out["results"][0], json!({"file": "a.py", "line": 2, "text": "# foo bar"}));
+
+        // no sandbox_paths: python's _git_root is None (git runs in the server's cwd), and
+        // the repo listing dies on os.path.join(None, '.git') outside any try
+        ol_core::config::set_for_tests(json!({"modules": {"settings": {"coder": {
+            "sandbox_paths": [],
+            "folder_blacklist": [],
+            "read-only": false,
+        }}}}));
+        assert!(matches!(c.git_root("sb", ""), Ok(None)));
+        assert_eq!(c.git_root("sb", "repo").err().as_deref(), Some("'NoneType' object has no attribute 'replace'"));
+        let q = Map::from_iter([("sandbox".to_string(), json!("sb"))]);
+        assert_eq!(c.route_git_repos(&q).err().map(|e| e.to_string()).as_deref(), Some(NONE_ROOT_ERR));
     }
 }
