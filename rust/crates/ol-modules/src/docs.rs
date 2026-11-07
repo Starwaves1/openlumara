@@ -3,13 +3,14 @@
 use crate::util;
 use async_trait::async_trait;
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec, UiRoute};
+use std::sync::Arc;
 use ol_core::pyjson::py_str;
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
 #[path = "../../../generated/modules/docs.rs"]
-pub(crate) mod meta;
+pub mod meta;
 
 pub struct Docs {
     base: ModuleBase,
@@ -19,6 +20,10 @@ pub struct Docs {
 const INSTRUCTION: &str = "You can call docs_list again with a subfolder to navigate deeper, or use docs_read to read a file.";
 
 impl Docs {
+    pub fn factory(base: ModuleBase) -> Arc<dyn Module> {
+        Arc::new(Self::new(base))
+    }
+
     pub fn new(base: ModuleBase) -> Self {
         Self { base, disabled: Mutex::new(Vec::new()) }
     }
@@ -198,5 +203,125 @@ impl Module for Docs {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Map;
+
+    /// the config is process-wide: tests that install one hold this lock while they run
+    use crate::util::CONFIG_TEST_LOCK as CONFIG_LOCK;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    fn args(v: Value) -> ToolArgs {
+        ToolArgs::new(v.as_object().unwrap().clone())
+    }
+
+    fn query(v: Value) -> Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    /// installs a docs config whose only folder is `<tmp>/guide` (absolute, so it bypasses the project root)
+    /// and returns the module plus the tempdir guard
+    fn setup(insert_system_prompt: bool) -> (Docs, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let guide = dir.path().join("guide");
+        std::fs::create_dir_all(guide.join("sub")).unwrap();
+        std::fs::write(guide.join("a.md"), "hello docs\r\nsecond line").unwrap();
+        std::fs::write(guide.join("sub").join("b.md"), "nested").unwrap();
+        let settings: Map<String, Value> = Map::from_iter([
+            ("folders".to_string(), json!([guide.to_string_lossy()])),
+            ("insert_system_prompt".to_string(), json!(insert_system_prompt)),
+        ]);
+        let data = json!({"modules": {"settings": {"docs": settings}}});
+        ol_core::config::set_for_tests(data.clone());
+        // set_for_tests() keeps a config file from an earlier test, and every read reloads that file,
+        // so the same data is written to it (JSON is valid YAML)
+        let path = ol_core::config::config_path().expect("test config path");
+        std::fs::write(&path, data.to_string()).expect("write test config");
+        (Docs::new(ModuleBase::detached("docs")), dir)
+    }
+
+    #[test]
+    fn list_tool_returns_subfolders_files_and_instruction() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, _dir) = setup(true);
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide"})))).unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "status": "success",
+                "content": {
+                    "subfolders": ["sub"],
+                    "files": ["a.md"],
+                    "instruction": "You can call docs_list again with a subfolder to navigate deeper, or use docs_read to read a file."
+                }
+            })
+        );
+        // a relative subfolder gets its own prefix on every entry
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide", "subfolder": "sub"})))).unwrap();
+        assert_eq!(out["content"]["files"], json!(["sub/b.md"]));
+        assert_eq!(out["content"]["subfolders"], json!([]));
+        // a subfolder that repeats the folder name is stripped first
+        let out = block_on(m.call_tool("list", args(json!({"folder": "guide", "subfolder": "guidesub"})))).unwrap();
+        assert_eq!(out["content"]["files"], json!(["sub/b.md"]));
+    }
+
+    #[test]
+    fn unknown_folder_and_read_return_python_strings() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, _dir) = setup(true);
+        let out = block_on(m.call_tool("list", args(json!({"folder": "nope"})))).unwrap();
+        assert_eq!(
+            out,
+            json!({"status": "error", "content": "Folder 'nope' does not exist within the docs module configuration."})
+        );
+        let out = block_on(m.call_tool("read", args(json!({"folder": "nope", "path": "a.md"})))).unwrap();
+        assert_eq!(out, json!({"status": "error", "content": "Folder 'nope' does not exist within the docs module configuration."}));
+
+        // read normalizes CRLF like python universal newlines, and strips a doubled folder prefix
+        let out = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": "guide/a.md"})))).unwrap();
+        assert_eq!(out, json!({"status": "success", "content": "hello docs\nsecond line"}));
+
+        let out = block_on(m.call_tool("read", args(json!({"folder": "guide", "path": "missing.md"})))).unwrap();
+        assert_eq!(out["status"], "error");
+        assert!(out["content"].as_str().unwrap().starts_with("[Errno 2] No such file or directory: "), "{}", out);
+    }
+
+    #[test]
+    fn system_prompt_and_get_topics_follow_config() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, _dir) = setup(true);
+        let prompt = block_on(m.on_system_prompt()).unwrap();
+        assert_eq!(prompt.as_deref(), Some("## Documentation can be fetched from these folders:\nguide"));
+        let topics = block_on(m.call_tool("get_topics", ToolArgs::default())).unwrap();
+        assert_eq!(topics, json!({"status": "success", "content": ["guide"]}));
+
+        // insert_system_prompt true disables the get_topics tool, as the python on_ready does
+        block_on(m.on_ready()).unwrap();
+        assert_eq!(m.disabled_tools(), vec!["get_topics".to_string()]);
+
+        let (m2, _dir2) = setup(false);
+        block_on(m2.on_ready()).unwrap();
+        assert!(m2.disabled_tools().is_empty());
+    }
+
+    #[test]
+    fn webui_routes_list_and_read() {
+        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (m, _dir) = setup(true);
+        let folders = block_on(m.ui_route("folders", "GET", None, Map::new())).unwrap();
+        assert_eq!(folders, json!(["guide"]));
+        let listed = block_on(m.ui_route("list", "GET", None, query(json!({"folder": "guide"})))).unwrap();
+        assert_eq!(listed, json!({"subfolders": ["sub"], "files": ["a.md"]}));
+        let read = block_on(m.ui_route("read", "GET", None, query(json!({"folder": "guide", "path": "a.md"})))).unwrap();
+        assert_eq!(read, json!({"path": "a.md", "content": "hello docs\nsecond line"}));
+        let bad = block_on(m.ui_route("read", "GET", None, query(json!({"folder": "guide"})))).unwrap();
+        assert_eq!(bad, json!({"status": "error", "content": "folder and path are both required"}));
     }
 }

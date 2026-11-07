@@ -2,6 +2,7 @@
 
 pub mod channel;
 pub mod chats;
+pub mod docs;
 pub mod identity;
 pub mod lists;
 pub mod models;
@@ -115,5 +116,14 @@ pub fn register(r: &mut Registry) {
         unsafe_: channel::meta::UNSAFE,
         category: channel::meta::CATEGORY,
         factory: channel::ChannelModule::factory,
+    });
+    r.add_module(ModuleDescriptor {
+        name: "docs",
+        class_name: docs::meta::CLASS_NAME,
+        doc: docs::meta::DOC,
+        settings: docs::meta::settings,
+        unsafe_: docs::meta::UNSAFE,
+        category: docs::meta::CATEGORY,
+        factory: docs::Docs::factory,
     });
 }
