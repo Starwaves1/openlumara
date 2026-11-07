@@ -96,6 +96,11 @@ fn language(lang: &str) -> Option<Language> {
         "bash" => tree_sitter_bash::LANGUAGE.into(),
         "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
         "yaml" => tree_sitter_yaml::LANGUAGE.into(),
+        "ruby" => tree_sitter_ruby::LANGUAGE.into(),
+        "php" => tree_sitter_php::LANGUAGE_PHP.into(),
+        "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
+        "lua" => tree_sitter_lua::LANGUAGE.into(),
+        "html" => tree_sitter_html::LANGUAGE.into(),
         _ => return None,
     })
 }
@@ -344,6 +349,49 @@ mod tests {
             assert!(diagnostics("", lang).is_some(), "{}", lang);
         }
         assert!(!diagnostics("{\"a\": }", "json").unwrap().is_empty());
+    }
+
+    #[test]
+    fn detects_new_grammar_languages() {
+        assert_eq!(detect_language_from_path("/a/app.rb"), Some("ruby"));
+        assert_eq!(detect_language_from_path("/a/index.php"), Some("php"));
+        assert_eq!(detect_language_from_path("/a/Program.cs"), Some("csharp"));
+        assert_eq!(detect_language_from_path("/a/init.lua"), Some("lua"));
+        assert_eq!(detect_language_from_path("/a/index.html"), Some("html"));
+        assert_eq!(detect_language_from_path("/a/page.htm"), Some("html"));
+        for lang in ["ruby", "php", "csharp", "lua", "html"] {
+            assert!(is_supported(lang), "{}", lang);
+        }
+    }
+
+    #[test]
+    fn ruby_parses() {
+        assert!(diagnostics("class A\n  def m(x)\n    x + 1\n  end\nend\n", "ruby").unwrap().is_empty());
+        assert!(!diagnostics("class A\n  def m(x\n    x +\n  end end\n", "ruby").unwrap().is_empty());
+    }
+
+    #[test]
+    fn php_parses() {
+        assert!(diagnostics("<?php\nfunction f($a) { return $a + 1; }\n", "php").unwrap().is_empty());
+        assert!(!diagnostics("<?php\nfunction f($a) { return $a + ; }\n", "php").unwrap().is_empty());
+    }
+
+    #[test]
+    fn csharp_parses() {
+        assert!(diagnostics("class A { int M(int x) { return x + 1; } }\n", "csharp").unwrap().is_empty());
+        assert!(!diagnostics("class A { int M(int x { return x + 1 }\n", "csharp").unwrap().is_empty());
+    }
+
+    #[test]
+    fn lua_parses() {
+        assert!(diagnostics("local function f(a)\n  return a + 1\nend\n", "lua").unwrap().is_empty());
+        assert!(!diagnostics("local function f(a\n  return a +\n", "lua").unwrap().is_empty());
+    }
+
+    #[test]
+    fn html_parses() {
+        assert!(diagnostics("<div><p>hi</p></div>\n", "html").unwrap().is_empty());
+        assert!(!diagnostics("<div class=\"a", "html").unwrap().is_empty());
     }
 
     #[test]
