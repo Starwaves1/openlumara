@@ -6,14 +6,15 @@ pub mod meta;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use chrono::{Datelike, Offset, Timelike, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, Offset, Timelike, Utc};
 use chrono_tz::{OffsetComponents, OffsetName};
 use ol_core::module::{Module, ModuleBase, ToolArgs, ToolSpec};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::os::raw::c_char;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const METHOD_END_PROMPT: &str = "end prompt";
@@ -51,15 +52,16 @@ pub fn settings() -> Value {
     })
 }
 
-/// python `TIMEZONES`: "local" first, then every available zone name in sorted order
+/// python `TIMEZONES`: "local" first, then every available zone name in sorted order. The names are the
+/// host's TZif files (python's `available_timezones()`) plus chrono-tz's compiled list, which keeps the
+/// built-in zones available on hosts without tzdata.
 fn timezone_options() -> Value {
+    let mut names = host_zone_names();
+    names.extend(chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name().to_string()));
     let mut options = Map::new();
     options.insert("local".into(), json!("Use your device's local timezone"));
-    let mut names: Vec<&str> = chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect();
-    names.sort_unstable();
-    names.dedup();
     for name in names {
-        options.insert(name.to_string(), json!(format!("Set your timezone to {}", name)));
+        options.insert(name.clone(), json!(format!("Set your timezone to {}", name)));
     }
     Value::Object(options)
 }
@@ -99,20 +101,22 @@ fn local_stamp() -> Stamp {
     }
 }
 
-/// python `zoneinfo.ZoneInfo(key)` + `datetime.now(tz=...)`
+/// python `zoneinfo.ZoneInfo(key)` + `datetime.now(tz=...)`. chrono-tz is tried first; a key it lacks
+/// (a host-only name such as Factory or localtime) is read from the host's TZif file on TZPATH.
 fn zone_stamp(key: &str) -> anyhow::Result<Stamp> {
     validate_zone_key(key)?;
+    let utc_now = Utc::now();
     let tz: chrono_tz::Tz = match key.parse() {
         Ok(tz) => tz,
-        Err(_) => return Err(tzfile_error(key)),
+        Err(_) => return host_zone_stamp(key, utc_now),
     };
-    let now = Utc::now().with_timezone(&tz);
+    let now = utc_now.with_timezone(&tz);
     let tzname = now.offset().abbreviation().unwrap_or("").to_string();
     // python's timetuple() flag: 1 when dst() is non-zero, else 0
     let isdst = if now.offset().dst_offset().num_seconds() != 0 { 1 } else { 0 };
     Ok(Stamp {
         naive: now.naive_local(),
-        micros: now.timestamp_subsec_micros(),
+        micros: utc_now.timestamp_subsec_micros(),
         offset_secs: now.offset().fix().local_minus_utc(),
         tzname,
         isdst,
@@ -136,23 +140,454 @@ fn tzpath() -> Vec<PathBuf> {
     }
 }
 
-/// the error python's ZoneInfo gives for a key chrono-tz does not know. python loads the first file
-/// for the key on TZPATH, so an existing file that is not TZif raises ValueError. A valid TZif file
-/// that chrono-tz lacks is still reported as not found: chrono-tz is the only zone source here.
-fn tzfile_error(key: &str) -> anyhow::Error {
-    for dir in tzpath() {
-        let path = dir.join(key);
-        if path.is_file() {
-            if let Ok(file) = std::fs::File::open(&path) {
-                let mut magic = Vec::new();
-                if file.take(4).read_to_end(&mut magic).is_ok() && magic != b"TZif" {
-                    return anyhow!("Invalid TZif file: magic not found");
-                }
+/// python `zoneinfo._tzpath.find_tzfile`: the first file for `key` on TZPATH
+fn find_tzfile(key: &str) -> Option<PathBuf> {
+    tzpath().into_iter().map(|dir| dir.join(key)).find(|path| path.is_file())
+}
+
+/// python `ZoneInfo(key)` for a key chrono-tz does not know: the host's TZif file for it. A file that is
+/// not TZif raises ValueError, and a key with no file is not found.
+fn host_zone_stamp(key: &str, utc_now: DateTime<Utc>) -> anyhow::Result<Stamp> {
+    let path = find_tzfile(key).ok_or_else(|| anyhow!("'No time zone found with key {}'", key))?;
+    let data = std::fs::read(&path)?;
+    let ty = parse_tzif(&data)?.type_at(&utc_now);
+    let offset = FixedOffset::east_opt(ty.utoff).ok_or_else(|| {
+        anyhow!("offset must be a timedelta strictly between -timedelta(hours=24) and timedelta(hours=24).")
+    })?;
+    let local = utc_now.with_timezone(&offset);
+    Ok(Stamp {
+        naive: local.naive_local(),
+        micros: utc_now.timestamp_subsec_micros(),
+        offset_secs: ty.utoff,
+        tzname: ty.abbr,
+        // python's timetuple() flag for dst(): 1 for a DST type, else 0
+        isdst: i32::from(ty.isdst),
+    })
+}
+
+/// one local time type of a TZif file (python `_ttinfo`)
+#[derive(Debug, Clone, PartialEq)]
+struct TzType {
+    utoff: i32,
+    isdst: bool,
+    abbr: String,
+}
+
+/// a POSIX TZ string (the TZif footer): a standard type, and optionally a DST type with its start and
+/// end rules
+#[derive(Debug, Clone)]
+struct PosixTz {
+    std: TzType,
+    dst: Option<(TzType, Rule, Rule)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DayRule {
+    /// `Jn`: day 1..=365 of the year, with Feb 29 never counted
+    Julian1(i64),
+    /// `n`: day 0..=365 of the year, with Feb 29 counted
+    Julian0(i64),
+    /// `Mm.w.d`: weekday d (0 = Sunday) of week w (5 = the last one) of month m
+    MonthWeekDay(i64, i64, i64),
+}
+
+/// a transition rule: the day, and the local wall-clock time of day in seconds
+#[derive(Debug, Clone, Copy)]
+struct Rule {
+    day: DayRule,
+    time: i64,
+}
+
+/// the zone after the last transition: a POSIX rule when the footer has DST, else a fixed type
+#[derive(Debug)]
+enum After {
+    Fixed(TzType),
+    Rule(PosixTz),
+}
+
+/// a parsed TZif file (python `_tzfile`)
+#[derive(Debug)]
+struct TzFile {
+    trans: Vec<i64>,
+    trans_types: Vec<TzType>,
+    before: TzType,
+    after: After,
+}
+
+impl TzFile {
+    /// python `ZoneInfo.fromutc()` for the instant `utc_now`: the local time type in effect then
+    fn type_at(&self, utc_now: &DateTime<Utc>) -> TzType {
+        let n = self.trans.len();
+        if n == 0 {
+            return match &self.after {
+                After::Fixed(ty) => ty.clone(),
+                After::Rule(rule) => rule.at(utc_now),
+            };
+        }
+        let t = utc_now.timestamp();
+        if t < self.trans[0] {
+            return self.before.clone();
+        }
+        if t > self.trans[n - 1] {
+            if let After::Rule(rule) = &self.after {
+                return rule.at(utc_now);
             }
-            break;
+        }
+        let idx = self.trans.partition_point(|&at| at <= t) - 1;
+        self.trans_types[idx].clone()
+    }
+}
+
+impl PosixTz {
+    /// python `_TZStr._get_trans_info_fromutc`: the type in effect at `utc_now` under the DST rules
+    fn at(&self, utc_now: &DateTime<Utc>) -> TzType {
+        let Some((dst, start_rule, end_rule)) = &self.dst else {
+            return self.std.clone();
+        };
+        let t = utc_now.timestamp();
+        let year = i64::from(utc_now.year());
+        let start = rule_epoch(year, start_rule) - i64::from(self.std.utoff);
+        let end = rule_epoch(year, end_rule) - i64::from(dst.utoff);
+        let in_dst = if start < end { start <= t && t < end } else { !(end <= t && t < start) };
+        if in_dst {
+            dst.clone()
+        } else {
+            self.std.clone()
         }
     }
-    anyhow!("'No time zone found with key {}'", key)
+}
+
+fn invalid_tzif(what: &str) -> anyhow::Error {
+    anyhow!("Invalid TZif file: {}", what)
+}
+
+/// the six header counts of the TZif header at `at`: isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+fn tzif_counts(data: &[u8], at: usize) -> anyhow::Result<[usize; 6]> {
+    if data.get(at..at + 4) != Some(b"TZif".as_slice()) {
+        return Err(invalid_tzif("magic not found"));
+    }
+    let header = data.get(at..at + 44).ok_or_else(|| invalid_tzif("truncated header"))?;
+    let mut counts = [0usize; 6];
+    for (i, slot) in counts.iter_mut().enumerate() {
+        let b = &header[20 + 4 * i..24 + 4 * i];
+        *slot = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    }
+    Ok(counts)
+}
+
+/// the byte length of a data block after its header, for `tsize`-byte transition times
+fn tzif_block_len(c: [usize; 6], tsize: usize) -> usize {
+    let [isut, isstd, leap, time, types, chars] = c;
+    time * tsize + time + types * 6 + chars + leap * (tsize + 4) + isstd + isut
+}
+
+/// the data block at `at`: transitions, the type of each transition, and every local time type
+fn parse_tzif_block(
+    data: &[u8],
+    at: usize,
+    c: [usize; 6],
+    tsize: usize,
+) -> anyhow::Result<(Vec<i64>, Vec<TzType>, Vec<TzType>)> {
+    let [_, _, _, time, types, chars] = c;
+    let body = data
+        .get(at..at + tzif_block_len(c, tsize))
+        .ok_or_else(|| invalid_tzif("truncated data"))?;
+    let times_end = time * tsize;
+    let idx_end = times_end + time;
+    let types_end = idx_end + types * 6;
+    let trans: Vec<i64> = body[..times_end]
+        .chunks_exact(tsize)
+        .map(|b| {
+            if tsize == 4 {
+                i64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            } else {
+                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            }
+        })
+        .collect();
+    let abbr_chars = &body[types_end..types_end + chars];
+    let mut all_types = Vec::with_capacity(types);
+    for b in body[idx_end..types_end].chunks_exact(6) {
+        let rest = abbr_chars.get(b[5] as usize..).ok_or_else(|| invalid_tzif("bad abbreviation index"))?;
+        let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+        all_types.push(TzType {
+            utoff: i32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            isdst: b[4] != 0,
+            abbr: String::from_utf8_lossy(&rest[..end]).into_owned(),
+        });
+    }
+    let mut trans_types = Vec::with_capacity(time);
+    for &i in &body[times_end..idx_end] {
+        let ty = all_types.get(i as usize).ok_or_else(|| invalid_tzif("bad transition type index"))?;
+        trans_types.push(ty.clone());
+    }
+    Ok((trans, trans_types, all_types))
+}
+
+/// python `zoneinfo._common.load_data` + `_load_file`: a TZif file, version 1 or 2+ (the 64-bit block
+/// and POSIX footer)
+fn parse_tzif(data: &[u8]) -> anyhow::Result<TzFile> {
+    let c1 = tzif_counts(data, 0)?;
+    let (trans, trans_types, types, footer) = if data[4] == 0 {
+        let (trans, trans_types, types) = parse_tzif_block(data, 44, c1, 4)?;
+        (trans, trans_types, types, String::new())
+    } else {
+        let second = 44 + tzif_block_len(c1, 4);
+        let c2 = tzif_counts(data, second)?;
+        let block_at = second + 44;
+        let (trans, trans_types, types) = parse_tzif_block(data, block_at, c2, 8)?;
+        let rest = &data[block_at + tzif_block_len(c2, 8)..];
+        let footer = match rest.first() {
+            Some(b'\n') => {
+                let body = &rest[1..];
+                let end = body.iter().position(|&c| c == b'\n').unwrap_or(body.len());
+                String::from_utf8_lossy(&body[..end]).into_owned()
+            }
+            _ => String::new(),
+        };
+        (trans, trans_types, types, footer)
+    };
+    if footer.is_empty() && types.is_empty() {
+        return Err(anyhow!("No time zone information found."));
+    }
+    let before = types
+        .iter()
+        .find(|t| !t.isdst)
+        .or_else(|| trans_types.first())
+        .or_else(|| types.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("No time zone information found."))?;
+    let after = if footer.is_empty() {
+        let last = trans_types.last().or_else(|| types.last()).cloned();
+        After::Fixed(last.ok_or_else(|| anyhow!("No time zone information found."))?)
+    } else {
+        let tz = parse_posix_tz(&footer).ok_or_else(|| invalid_tzif("bad TZ string footer"))?;
+        if tz.dst.is_none() {
+            After::Fixed(tz.std)
+        } else {
+            After::Rule(tz)
+        }
+    };
+    Ok(TzFile { trans, trans_types, before, after })
+}
+
+/// a cursor over a POSIX TZ string
+struct PosixParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl PosixParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, c: u8) -> bool {
+        let hit = self.peek() == Some(c);
+        if hit {
+            self.pos += 1;
+        }
+        hit
+    }
+
+    /// a standard or DST abbreviation: `<...>` quoted, or at least three letters
+    fn name(&mut self) -> Option<String> {
+        if self.eat(b'<') {
+            let start = self.pos;
+            while self.peek()? != b'>' {
+                self.pos += 1;
+            }
+            let name = String::from_utf8_lossy(&self.s[start..self.pos]).into_owned();
+            self.pos += 1;
+            return Some(name);
+        }
+        let start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            self.pos += 1;
+        }
+        if self.pos - start < 3 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&self.s[start..self.pos]).into_owned())
+    }
+
+    fn number(&mut self) -> Option<i64> {
+        let start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        std::str::from_utf8(&self.s[start..self.pos]).ok()?.parse().ok()
+    }
+
+    /// `[+|-]hh[:mm[:ss]]` in seconds, with the sign as written
+    fn offset(&mut self) -> Option<i64> {
+        let sign = if self.eat(b'-') {
+            -1
+        } else {
+            self.eat(b'+');
+            1
+        };
+        let mut secs = self.number()? * 3600;
+        if self.eat(b':') {
+            secs += self.number()? * 60;
+            if self.eat(b':') {
+                secs += self.number()?;
+            }
+        }
+        Some(sign * secs)
+    }
+
+    /// one transition rule with its optional `/time` (default 02:00:00)
+    fn rule(&mut self) -> Option<Rule> {
+        let day = if self.eat(b'M') {
+            let m = self.number()?;
+            if !self.eat(b'.') {
+                return None;
+            }
+            let w = self.number()?;
+            if !self.eat(b'.') {
+                return None;
+            }
+            let d = self.number()?;
+            if !((1..=12).contains(&m) && (1..=5).contains(&w) && (0..=6).contains(&d)) {
+                return None;
+            }
+            DayRule::MonthWeekDay(m, w, d)
+        } else if self.eat(b'J') {
+            let n = self.number()?;
+            if !(1..=365).contains(&n) {
+                return None;
+            }
+            DayRule::Julian1(n)
+        } else {
+            let n = self.number()?;
+            if !(0..=365).contains(&n) {
+                return None;
+            }
+            DayRule::Julian0(n)
+        };
+        let time = if self.eat(b'/') { self.offset()? } else { 7200 };
+        Some(Rule { day, time })
+    }
+}
+
+/// python `zoneinfo._parse_tz_str`: `std offset [dst [offset] [,start[/time],end[/time]]]`
+fn parse_posix_tz(s: &str) -> Option<PosixTz> {
+    let mut p = PosixParser { s: s.as_bytes(), pos: 0 };
+    let std_name = p.name()?;
+    // POSIX offsets are positive west of Greenwich, so the UT offset is the negation
+    let std = TzType { utoff: i32::try_from(-p.offset()?).ok()?, isdst: false, abbr: std_name };
+    if p.peek().is_none() {
+        return Some(PosixTz { std, dst: None });
+    }
+    let dst_name = p.name()?;
+    let dst_utoff = if matches!(p.peek(), None | Some(b',')) {
+        std.utoff + 3600
+    } else {
+        i32::try_from(-p.offset()?).ok()?
+    };
+    let (start, end) = if p.eat(b',') {
+        let start = p.rule()?;
+        if !p.eat(b',') {
+            return None;
+        }
+        (start, p.rule()?)
+    } else {
+        // python's default DST rules when the footer gives none
+        (
+            Rule { day: DayRule::MonthWeekDay(3, 2, 0), time: 7200 },
+            Rule { day: DayRule::MonthWeekDay(11, 1, 0), time: 7200 },
+        )
+    };
+    if p.peek().is_some() {
+        return None;
+    }
+    let dst = TzType { utoff: dst_utoff, isdst: true, abbr: dst_name };
+    Some(PosixTz { std, dst: Some((dst, start, end)) })
+}
+
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// days since 1970-01-01 of a proleptic Gregorian date
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// python `_DayOffset` / `_CalendarOffset.year_to_epoch`: the rule's local date and time of day as
+/// seconds since the epoch (the local wall-clock fields read as if they were UTC)
+fn rule_epoch(year: i64, rule: &Rule) -> i64 {
+    let jan1 = days_from_civil(year, 1, 1);
+    let day = match rule.day {
+        DayRule::Julian1(n) => jan1 + n - 1 + if is_leap(year) && n >= 60 { 1 } else { 0 },
+        DayRule::Julian0(n) => jan1 + n,
+        DayRule::MonthWeekDay(m, w, d) => {
+            let first = days_from_civil(year, m, 1);
+            // 1970-01-01 was a Thursday (weekday 4, with Sunday = 0)
+            let first_weekday = (first + 4).rem_euclid(7);
+            let mut day = first + (d - first_weekday).rem_euclid(7) + (w - 1) * 7;
+            let (next_year, next_month) = if m == 12 { (year + 1, 1) } else { (year, m + 1) };
+            let next_month_start = days_from_civil(next_year, next_month, 1);
+            // week 5 means the last such weekday: step back a week while past the month's end
+            while day >= next_month_start {
+                day -= 7;
+            }
+            day
+        }
+    };
+    day * 86400 + rule.time
+}
+
+/// python `zoneinfo.available_timezones()` on this host: every TZif file under TZPATH, keyed by its path
+/// relative to that root. At the root `right/` and `posix/` are skipped, symlinked directories are listed
+/// but not descended into, and "posixrules" is dropped.
+fn host_zone_names() -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for root in tzpath() {
+        if root.exists() {
+            collect_zone_names(&root, &root, &mut names);
+        }
+    }
+    names.remove("posixrules");
+    names
+}
+
+fn collect_zone_names(root: &Path, dir: &Path, names: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // os.walk classifies entries with is_dir() (which follows links) but descends only into real directories
+        let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        if is_dir {
+            let is_link = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+            let skipped = dir == root && matches!(entry.file_name().to_str(), Some("right") | Some("posix"));
+            if !is_link && !skipped {
+                collect_zone_names(root, &path, names);
+            }
+        } else if is_tzif_file(&path) {
+            if let Ok(key) = path.strip_prefix(root) {
+                names.insert(key.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
+/// python's `valid_key`: the file starts with the TZif magic
+fn is_tzif_file(path: &Path) -> bool {
+    let mut magic = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(4).read_to_end(&mut magic)).is_ok() && magic == b"TZif"
 }
 
 /// the base python's `zoneinfo._tzpath._validate_tzfile_path` checks keys against (`_TEST_PATH`)
@@ -226,10 +661,14 @@ fn current_stamp(timezone: &Value) -> anyhow::Result<Stamp> {
     }
 }
 
-/// python `strftime()` format argument: only a str is accepted
+/// python `strftime()` format argument: only a str is accepted. The C-level argument error spells None
+/// as "None" (the ZoneInfo error in `current_stamp` uses the "NoneType" spelling).
 fn format_arg(v: &Value) -> anyhow::Result<&str> {
-    v.as_str()
-        .ok_or_else(|| anyhow!("strftime() argument 1 must be str, not {}", py_type_name(v)))
+    let type_name = match v {
+        Value::Null => "None",
+        other => py_type_name(other),
+    };
+    v.as_str().ok_or_else(|| anyhow!("strftime() argument 1 must be str, not {}", type_name))
 }
 
 /// `%z` / `%:z` as python formats it: sign, HHMM (HH:MM with `sep` ":"), plus SS when the offset has seconds
@@ -437,7 +876,7 @@ mod tests {
         let fmt_cases = [
             (json!(5), "strftime() argument 1 must be str, not int"),
             (json!(false), "strftime() argument 1 must be str, not bool"),
-            (Value::Null, "strftime() argument 1 must be str, not NoneType"),
+            (Value::Null, "strftime() argument 1 must be str, not None"),
         ];
         for (value, msg) in fmt_cases {
             assert_eq!(format_arg(&value).unwrap_err().to_string(), msg, "value {value}");
@@ -560,5 +999,125 @@ mod tests {
         let end = rt.block_on(m.on_end_prompt()).unwrap().unwrap();
         assert_eq!(end, format!("Current time/date is {} UTC", Utc::now().format("%Y")));
         assert_eq!(rt.block_on(m.on_message_inject()).unwrap(), None);
+    }
+
+    /// a TZif version 2 file: the (empty) version 1 block, then the given transitions (time, type index),
+    /// local time types (utoff, isdst, abbreviation) and POSIX footer
+    fn tzif_bytes(trans: &[(i64, u8)], types: &[(i32, bool, &str)], footer: &str) -> Vec<u8> {
+        fn header(out: &mut Vec<u8>, counts: [u32; 6]) {
+            out.extend_from_slice(b"TZif2");
+            out.extend_from_slice(&[0u8; 15]);
+            for c in counts {
+                out.extend_from_slice(&c.to_be_bytes());
+            }
+        }
+        let mut chars = Vec::new();
+        let mut abbr_at = Vec::new();
+        for (_, _, abbr) in types {
+            abbr_at.push(chars.len() as u8);
+            chars.extend_from_slice(abbr.as_bytes());
+            chars.push(0);
+        }
+        let mut out = Vec::new();
+        header(&mut out, [0; 6]);
+        header(&mut out, [0, 0, 0, trans.len() as u32, types.len() as u32, chars.len() as u32]);
+        for (at, _) in trans {
+            out.extend_from_slice(&at.to_be_bytes());
+        }
+        for (_, idx) in trans {
+            out.push(*idx);
+        }
+        for (i, (utoff, isdst, _)) in types.iter().enumerate() {
+            out.extend_from_slice(&utoff.to_be_bytes());
+            out.push(u8::from(*isdst));
+            out.push(abbr_at[i]);
+        }
+        out.extend_from_slice(&chars);
+        out.extend_from_slice(format!("\n{footer}\n").as_bytes());
+        out
+    }
+
+    #[test]
+    fn host_tzif_zone_gives_its_offset_and_abbreviation() {
+        let _g = crate::util::CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // a key chrono-tz does not know is read from the TZif file on TZPATH, like python's ZoneInfo
+        let dir = std::env::temp_dir().join(format!("time-host-zone-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Test")).unwrap();
+        std::fs::write(dir.join("Test/Fixed"), tzif_bytes(&[], &[(-19800, false, "TST")], "TST5:30")).unwrap();
+        let saved = std::env::var_os("PYTHONTZPATH");
+        std::env::set_var("PYTHONTZPATH", &dir);
+        let stamp = zone_stamp("Test/Fixed");
+        match saved {
+            Some(v) => std::env::set_var("PYTHONTZPATH", v),
+            None => std::env::remove_var("PYTHONTZPATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let stamp = stamp.unwrap();
+        assert_eq!(stamp.offset_secs, -19800);
+        assert_eq!(stamp.tzname, "TST");
+        assert_eq!(stamp.isdst, 0);
+        assert_eq!(time_info(&stamp, "%H:%M %Z", false).unwrap(), format!("{} TST", stamp.naive.format("%H:%M")));
+        assert_eq!(time_info(&stamp, "%H:%M", true).unwrap(), format!("{} TST", stamp.naive.format("%H:%M")));
+    }
+
+    #[test]
+    fn tzif_transitions_pick_the_type_in_effect() {
+        let data = tzif_bytes(&[(1000, 0), (2000, 1)], &[(3600, false, "AAA"), (7200, true, "BBB")], "");
+        let tz = parse_tzif(&data).unwrap();
+        let at = |t: i64| DateTime::from_timestamp(t, 0).unwrap();
+        // before the first transition: the first standard type
+        assert_eq!(tz.type_at(&at(500)).abbr, "AAA");
+        assert_eq!(tz.type_at(&at(1500)).abbr, "AAA");
+        assert_eq!(tz.type_at(&at(2000)).abbr, "BBB");
+        // after the last transition with no footer rule: the last transition's type
+        let later = tz.type_at(&at(9999));
+        assert_eq!((later.abbr.as_str(), later.utoff, later.isdst), ("BBB", 7200, true));
+    }
+
+    #[test]
+    fn posix_footer_rule_switches_at_the_us_transitions() {
+        let rule = parse_posix_tz("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let at = |y: i32, mo: u32, d: u32, h: u32, mi: u32| {
+            chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap().and_utc()
+        };
+        // 2026-03-08 is the second Sunday of March: DST starts at 02:00 EST, which is 07:00 UTC
+        assert_eq!(rule.at(&at(2026, 3, 8, 6, 59)).utoff, -18000);
+        assert_eq!(rule.at(&at(2026, 3, 8, 7, 0)).utoff, -14400);
+        // 2026-11-01 is the first Sunday of November: DST ends at 02:00 EDT, which is 06:00 UTC
+        assert_eq!(rule.at(&at(2026, 11, 1, 5, 59)).utoff, -14400);
+        let winter = rule.at(&at(2026, 11, 1, 6, 0));
+        assert_eq!((winter.utoff, winter.abbr.as_str(), winter.isdst), (-18000, "EST", false));
+        assert_eq!(rule.at(&at(2026, 7, 1, 12, 0)).abbr, "EDT");
+    }
+
+    #[test]
+    fn timezone_options_follow_the_host_tzdata_walk() {
+        let _g = crate::util::CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // python's available_timezones(): TZif files only, no right/ or posix/ at the root, no
+        // posixrules, no symlinked directories, and no text files
+        let dir = std::env::temp_dir().join(format!("time-options-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Test")).unwrap();
+        std::fs::create_dir_all(dir.join("right/Test")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("Test/Zone"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        std::fs::write(dir.join("right/Test/Zone"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        std::fs::write(dir.join("posixrules"), tzif_bytes(&[], &[(0, false, "UTC")], "UTC0")).unwrap();
+        std::fs::write(dir.join("zone.tab"), "# tzdata text, not TZif\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("Test"), dir.join("LinkDir")).unwrap();
+        let saved = std::env::var_os("PYTHONTZPATH");
+        std::env::set_var("PYTHONTZPATH", &dir);
+        let options = timezone_options();
+        match saved {
+            Some(v) => std::env::set_var("PYTHONTZPATH", v),
+            None => std::env::remove_var("PYTHONTZPATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = options.as_object().unwrap();
+        assert_eq!(opts["Test/Zone"], json!("Set your timezone to Test/Zone"));
+        assert_eq!(opts["local"], json!("Use your device's local timezone"));
+        assert!(!opts.contains_key("right/Test/Zone"));
+        assert!(!opts.contains_key("posixrules"));
+        assert!(!opts.contains_key("zone.tab"));
+        assert!(!opts.keys().any(|k| k.starts_with("LinkDir")));
     }
 }
