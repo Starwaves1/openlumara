@@ -48,6 +48,9 @@ class Channel:
         self.commands = core.commands.Commands(self)
         self._last_cmd_was_temporary = False
 
+        self.queued_message = None # used for mid-stream steering of the AI's next action
+        self.sending_message = False # used to track whether the channel is currently sending/streaming a message
+        
         self.context = core.context.Context(self) # each channel has its own context window
         # the path to a channel's chat is: channel -> context -> chat
 
@@ -57,6 +60,8 @@ class Channel:
         self.turncollector = core.turns.TurnCollector(self)
         self.tool_loader = core.tool_loader.ToolLoader(self)
         self.tool_loader.register_meta_tools()
+        self.force_disable_tools = False
+        self.override_tools = None
 
         # used to track whether to preserve reasoning
         # for only the current "agentic turn"
@@ -100,6 +105,10 @@ class Channel:
         called when the entire framework has fully initialized
         (when the message "[CORE] Startup complete" shows up)
         """
+        pass
+
+    async def on_system_prompt(self):
+        """called when building the system prompt. return a string from this to set a channel-specific system prompt"""
         pass
 
     async def _shutdown(self):
@@ -232,7 +241,8 @@ class Channel:
         that display the streamed tokens directly to the user,
         so that the user doesn't have to wait for a request to finish
         """
-        pass
+        async for token in stream:
+            pass
 
     async def push(self, message, defer=True):
         """push a message to the push queue, which will instantly display it in all channels"""
@@ -253,6 +263,111 @@ class Channel:
             await self.context.chat.messages.add(message)
 
         await self.push_queue.put((message, defer))
+
+    def _queued_descriptor(self, queued_message):
+        """converts a queued steering message to plaintext"""
+        text = self._extract_content(queued_message)
+        if not text:
+            filenames = [f for f in (queued_message.get("_metadata") or {}).get("filenames", []) if f]
+            text = ", ".join(filenames) if filenames else "[attachment]"
+        return {"content": text, "is_cmd": False}
+
+    def _merge_user_messages(self, existing, new_message):
+        """
+        merge two chat completions user messages into one.
+        text merges with a newline, multimodal content merges as blocks.
+        """
+        if not existing:
+            return new_message
+
+        def to_blocks(content):
+            if isinstance(content, list):
+                return content
+            return [{"type": "text", "text": content or ""}]
+
+        existing_content = existing.get("content")
+        new_content = new_message.get("content")
+
+        if isinstance(existing_content, str) and isinstance(new_content, str):
+            existing["content"] = existing_content + "\n" + new_content
+        else:
+            existing["content"] = (
+                to_blocks(existing_content)
+                + [{"type": "text", "text": "\n"}]
+                + to_blocks(new_content)
+            )
+
+        # merge attachment metadata so previews keep working
+        new_meta = new_message.get("_metadata")
+        if new_meta:
+            meta = existing.setdefault("_metadata", {"filenames": []})
+            meta["filenames"] = meta.get("filenames", []) + new_meta.get("filenames", [])
+
+        return existing
+
+    async def queue_steering_message(self, message, files=None, commands_authorized=False):
+        """
+        called by send()/send_stream() (and channels) when a message arrives
+        while a turn is already in progress.
+
+        commands cannot be merged into a user message, so they run right
+        away. anything else becomes a chat completions user message dict
+        and merges into self.queued_message: consecutive steering stacks up
+        inside that single message. it gets injected at the next toolcall
+        round boundary (drain_queued_message), or answered immediately as a
+        fresh request if the chain has already ended (see the continuation
+        loops in send()/send_stream()).
+
+        returns a {"content": str, "is_cmd": bool} descriptor with the full
+        merged queue state for channel UI's (None if nothing was queued).
+        """
+        # legacy dict handling, same as _send_preprocess()
+        if isinstance(message, dict):
+            message = message.get("content", "")
+
+        cmd_prefix = core.config.get("core", "cmd_prefix").strip().lower()
+        if isinstance(message, str) and message.strip().lower().startswith(cmd_prefix):
+            try:
+                await self.commands.process_input(message, authorized=commands_authorized)
+            except Exception as e:
+                self.log(self.name, f"Error while executing steering command: {core.detail_error(e)}")
+            return None
+
+        new_message = await self._process_multimodal(message=message, files=files)
+        if new_message is None:
+            return None
+
+        # no awaits between here and the assignment, so two steering
+        # messages racing in can never clobber each other
+        self.queued_message = self._merge_user_messages(self.queued_message, new_message)
+        return self._queued_descriptor(self.queued_message)
+
+    async def drain_queued_message(self):
+        """
+        inject the queued steering message into the active context.
+
+        called by ToolcallManager.process() at round boundaries of the
+        agentic loop: after every tool response of the current round has
+        landed in context and before the next request is composed. That is
+        the only safe point - the OpenAI format requires tool messages to
+        immediately follow their assistant tool_calls message, so a user
+        message can never be injected between a call and its response.
+
+        Returns a list of {"content": str, "is_cmd": bool} descriptors
+        (0 or 1 entries) so channels can update their steering queue.
+        """
+        if self.queued_message is None:
+            return []
+
+        queued = self.queued_message
+        self.queued_message = None
+
+        # defer=False: push() adds it to context synchronously (so it is
+        # part of the next round's context.get()) and displays it in the
+        # channel immediately, mid-chain
+        await self.push(queued, defer=False)
+
+        return [self._queued_descriptor(queued)]
 
     # --------------------
     # Helper methods
@@ -580,9 +695,10 @@ class Channel:
         self.agentic_loop_start = len(await self.context.chat.messages.get()) - 1
 
         # reconnect if needed
-        result = await self.manager.API.attempt_connect()
-        if result is not True:
-            return {"type": "error", "content": str(result)}
+        try:
+            await self.manager.API.attempt_connect()
+        except core.api.APIError as e:
+            return {"type": "error", "content": str(e)}
 
         # build the context window
         context = await self.context.get(system_prompt=True, end_prompt=True)
@@ -638,13 +754,38 @@ class Channel:
 
     async def send(self, message: str, files: list = None, commands_authorized=False, add_to_context=True, **kwargs):
         """sends a message to the AI from within the current channel"""
+        
+        if self.sending_message:
+            await self.queue_steering_message(message, files=files, commands_authorized=commands_authorized)
+            return
 
         # reset push defer flag
         self._chain_idle.clear()
+        
+        # set send flag
+        self.sending_message = True
+        
         try:
-            return await self._send_inner(message, files=files, commands_authorized=commands_authorized, add_to_context=add_to_context, **kwargs)
+            result = await self._send_inner(message, files=files, commands_authorized=commands_authorized, add_to_context=add_to_context, **kwargs)
+
+            while self.queued_message is not None:
+                queued = self.queued_message
+                self.queued_message = None
+                result = await self._send_inner(
+                    queued.get("content"),
+                    files=None,
+                    commands_authorized=commands_authorized,
+                    add_to_context=add_to_context,
+                    tools=self.override_tools,
+                    **kwargs
+                )
+
+            return result
         finally:
             self._chain_idle.set()
+            self.sending_message = False
+            if self.queued_message is not None:
+                await self.drain_queued_message()
 
     async def _send_inner(self, message: str, files: list = None, commands_authorized=False, add_to_context=True, **kwargs):
         # preprocessing (API connection logic, command processing, user message module hooks, etc)
@@ -660,12 +801,12 @@ class Channel:
                 return {"role": "assistant", "content": processed["content"]}
 
         # request the AI response and add it to context
-        response = await self.manager.API.send(processed["context"], **kwargs)
-
+        try:
+            response = await self.manager.API.send(processed["context"], use_tools=(not self.force_disable_tools), tools=self.override_tools, **kwargs)
         # handle any errors
-        if isinstance(response, core.api.APIError):
-            self.log("api", response)
-            return {"role": "assistant", "content": str(response)}
+        except core.api.APIError as e:
+            self.log("api", e)
+            return {"role": "assistant", "content": str(e)}
 
         # make a copy of the response message and edit it
         assistant_message = dict(response)
@@ -695,15 +836,42 @@ class Channel:
     async def send_stream(self, message: str, files: list = None, commands_authorized=False, add_to_context=True, **kwargs):
         """sends a message to the AI from within the current channel, streaming version"""
 
+        if self.sending_message:
+            # queue the message as a steering message
+            await self.queue_steering_message(message, files=files, commands_authorized=commands_authorized)
+            return
+            
         # reset push defer flag
         self._chain_idle.clear()
+        
+        # set send flag
+        self.sending_message = True
+        
         try:
-            async for token in self._send_stream_inner(message, files=files, commands_authorized=commands_authorized, add_to_context=add_to_context, **kwargs):
+            async for token in self._send_stream_inner(message, files=files, commands_authorized=commands_authorized, add_to_context=add_to_context, use_tools=(not self.force_disable_tools), tools=self.override_tools, **kwargs):
                 yield token
+
+            while self.queued_message is not None:
+                queued = self.queued_message
+                self.queued_message = None
+
+                async for token in self._send_stream_inner(
+                    queued.get("content"),
+                    files=None,
+                    commands_authorized=commands_authorized,
+                    add_to_context=add_to_context,
+                    emit_user_message=False,
+                    steering_descriptor=self._queued_descriptor(queued),
+                    **kwargs
+                ):
+                    yield token
         finally:
             self._chain_idle.set()
+            self.sending_message = False
+            if self.queued_message is not None:
+                await self.drain_queued_message()
 
-    async def _send_stream_inner(self, message: str, files: list = None, commands_authorized=False, add_to_context=True, **kwargs):
+    async def _send_stream_inner(self, message: str, files: list = None, commands_authorized=False, add_to_context=True, emit_user_message=True, steering_descriptor=None, **kwargs):
         # preprocessing (API connection logic, command processing, user message module hooks, etc)
         # this also adds the user's message to context, so we don't need to do that in this function
         processed = await self._send_preprocess(message, files, commands_authorized)
@@ -727,10 +895,17 @@ class Channel:
                 yield await self.throw_stream_error(processed["content"])
                 return
 
+        # preprocessing added the merged message to context,
+        # so it is now safe for channel UI's to pop it from their
+        # steering queue and resync their view of the chat
+        if steering_descriptor is not None:
+            yield {"type": "queue_flushed", "content": [steering_descriptor], "end_of_chain": True}
+
         user_message = processed.get("user_message") #alias for readability
 
         # yield user message as a special token for display in UI's (because user message can be modified by module hooks)
-        yield {"type": "user_message", "content": user_message}
+        if emit_user_message:
+            yield {"type": "user_message", "content": user_message}
         
         # estimate tokens used for user message
         user_message_token_estimation = 0
@@ -1085,6 +1260,24 @@ class Channel:
                     async for out in emit_step_text(step):
                         yield out
 
+            elif event_type == "step_delta":
+                delta = event.get("content")
+                st = step_state.get((delta or {}).get("step") or 0)
+                if st is not None:
+                    async for out in emit_step_text(st["step_obj"]):
+                        yield out
+
+            elif event_type == "final_delta":
+                delta = event.get("content") or {}
+                sn = delta.get("step") or 0
+                final_text[sn] = final_text.get(sn, "") + (delta.get("text") or "")
+                st = step_state.get(sn)
+                step_obj = (st or {}).get("step_obj")
+                if step_obj is None:
+                    step_obj = {"step": sn, "content": "", "reasoning_content": ""}
+                async for out in emit_step_text(step_obj):
+                    yield out
+
             elif event_type == "final":
                 # re-render every step whose live final text changed
                 touched = set(final_text)
@@ -1110,7 +1303,8 @@ class Channel:
         groups incoming tokens into step events using the
         TurnCollector defined in core/turns.py
 
-        yields {"type": "token"}, {"type": "step"}, and {"type": "final"} objects
+        yields {"type": "token"}, {"type": "step"}, {"type": "step_delta"},
+        {"type": "final"} and {"type": "final_delta"} objects
         see TurnCollector.group_stream for the full description!
 
         this used to be exclusive to the webUI, but i've ported it over to the core, so that it

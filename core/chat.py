@@ -68,6 +68,10 @@ class Chat:
         sysprompt_middle = []
         sysprompt_bottom = []
 
+        chan_prompt = await self.channel.on_system_prompt()
+        if chan_prompt:
+            sysprompt_top.append(f"# Current channel: {self.channel.name}\n{chan_prompt}")
+
         for module_name, module in self.channel.manager.modules.items():
             if not core.config.get("model").get("use_tools", False) and module_name not in core.modules.nonagentic:
                 # skip most prompts if tools are turned off
@@ -84,11 +88,18 @@ class Chat:
             ):
                 char_modules_exempt.append("writing_style")
 
+            characters_mod = self.channel.manager.modules.get("characters")
+            if characters_mod:
+                for enabled_module in (characters_mod.config.get("enabled_modules") or []):
+                    enabled_name = str(enabled_module).strip().lower()
+                    if enabled_name and enabled_name not in char_modules_exempt:
+                        char_modules_exempt.append(enabled_name)
+
             if active_character and module_name not in char_modules_exempt and "characters" in self.channel.manager.modules.keys():
                 # if a character is currently active, display ONLY the character system prompt
-                char_disable_agent_prompts = self.channel.manager.modules["characters"].config.get("disable_agent_prompts_when_character_active")
+                char_mode = self.channel.manager.modules["characters"].character_mode(active_character)
 
-                if char_disable_agent_prompts:
+                if char_mode != "Assistant":
                     continue
 
             try:

@@ -1,8 +1,15 @@
-aiohttp
-msgpack
-pyyaml
-json-repair
-partial-json-parser
-regex
-pypdf
-python-ulid
+# core openlumara dependencies
+# don't put module dependencies here!
+# -------
+# note to self for when someone later tries to again suggest removing version pinning:
+# version pinning is essential for security and prevents supply chain attacks
+aiohttp==3.14.5
+msgpack==1.2.4
+pyyaml==6.0.3
+json-repair==0.64.2
+partial-json-parser==0.2.1.1.post7
+regex==2026.9.29
+pypdf==6.21.2
+python-ulid==4.0.1
+prompt-toolkit==3.0.53
+rich==15.0.0

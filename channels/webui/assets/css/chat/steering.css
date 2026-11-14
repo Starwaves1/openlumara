@@ -1,0 +1,61 @@
+.steering-queue {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    width: var(--chat-content-width, 100%);
+    margin: 8px auto 6px;
+    /* grows endlessly as the user keeps steering: nothing is truncated */
+}
+
+.steering-queue-header {
+    font-size: 0.65em;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    opacity: 0.5;
+    padding-left: 2px;
+}
+
+.steering-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    max-width: min(70%, 480px);
+    padding: 4px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px dashed color-mix(in srgb, var(--accent, #b57edc) 45%, transparent);
+    background: color-mix(in srgb, var(--accent, #b57edc) 8%, transparent);
+    font-size: 0.8em;
+    line-height: 1.4;
+    animation: steeringIn 0.2s ease-out;
+    flex-shrink: 0;
+}
+
+.steering-arrow {
+    color: var(--accent, #b57edc);
+    animation: steeringPulse 1.5s ease-in-out infinite;
+    flex-shrink: 0;
+}
+
+.steering-text {
+    /* full text, always: merged steering messages show every line, and the
+       pill grows with them */
+    white-space: pre-line;
+    word-break: break-word;
+}
+
+@keyframes steeringIn {
+    from {
+        opacity: 0;
+        transform: translateX(-6px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes steeringPulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}

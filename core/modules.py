@@ -1,17 +1,21 @@
 import os
+import regex as re
 import ast
 import core
 import inspect
 import sys
+import shutil
 import subprocess
 import asyncio
 import importlib
 import importlib.util
+import tomllib
 
+# get the correct importlib stuff
 try:
-    from importlib.metadata import version, PackageNotFoundError
+    from importlib.metadata import version, distributions, PackageNotFoundError
 except ImportError:
-    from importlib_metadata import version, PackageNotFoundError
+    from importlib_metadata import version, distributions, PackageNotFoundError
 
 # modules that should have their prompts inserted even when tools are off
 nonagentic = ("characters", "writing_style", "time")
@@ -35,6 +39,8 @@ def _extract_deps_from_file(file_path):
         with open(file_path, 'r', encoding="utf-8") as f:
             tree = ast.parse(f.read())
 
+        # there has GOT to be a cleaner way..
+        # this is awful syntax lol
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 for item in node.body:
@@ -50,33 +56,48 @@ def _extract_deps_from_file(file_path):
         log("core", f"could not parse dependencies from {file_path}: {e}")
     return []
 
+def _pip_prefix():
+    """use uv's pip interface when available, plain pip otherwise"""
+    uv = shutil.which("uv")
+    if uv:
+        return [uv, "pip"], True
+    return [sys.executable, "-m", "pip"], False
+
 def _install_deps(module_name, packages, manager):
-    """install pip packages"""
+    """install packages using uv (or pip as fallback)"""
     if not packages:
         return
-    manager.log("core", f"installing dependencies for {module_name}: {', '.join(packages)}")
+
+    prefix, using_uv = _pip_prefix()
+    manager.log("core", f"installing dependencies for {module_name} with {'uv' if using_uv else 'pip'}: {', '.join(packages)}")
+
+    cmd = [*prefix, "install", "--quiet"]
+    if using_uv:
+        cmd += ["--python", sys.executable]
+    cmd += packages
 
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + packages,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
         manager.log(module_name, f"dependency install failed: {core.detail_error(e)}")
 
 def _uninstall_deps(module_name, packages, manager):
-    """uninstall pip packages"""
+    """uninstall packages using uv (or pip as fallback)"""
     if not packages:
         return
-    manager.log("core", f"uninstalling dependencies for {module_name}: {', '.join(packages)}")
+
+    prefix, using_uv = _pip_prefix()
+    manager.log("core", f"uninstalling dependencies for {module_name} with {'uv' if using_uv else 'pip'}: {', '.join(packages)}")
+
+    cmd = [*prefix, "uninstall", "--quiet"]
+    if using_uv:
+        cmd += ["--python", sys.executable]
+    else:
+        cmd += ["-y"]
+    cmd += packages
 
     try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "uninstall", "-y", "--quiet"] + packages,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
         manager.log(module_name, f"dependency uninstall failed: {core.detail_error(e)}")
 
@@ -108,7 +129,7 @@ def _get_module_file_path(package, module_name):
     return None
 
 def discover_module_names(package):
-    """list module/channel names from the filesystem without importing them (folder-only layout)"""
+    """list module/channel names from the filesystem without importing them"""
     names = []
     if not hasattr(package, '__path__'):
         return names
@@ -116,10 +137,12 @@ def discover_module_names(package):
     for sub_path in package.__path__:
         if not os.path.isdir(sub_path):
             continue
+
         try:
             entries = sorted(os.listdir(sub_path))
         except OSError:
             continue
+
         for entry_name in entries:
             if entry_name.startswith(('_', '.')):
                 continue
@@ -127,6 +150,7 @@ def discover_module_names(package):
                 continue
             if entry_name not in names:
                 names.append(entry_name)
+
     return sorted(names)
 
 def import_entry(package, module_name, reload=False):
@@ -141,10 +165,11 @@ def import_entry(package, module_name, reload=False):
     existing = sys.modules.get(full_name)
     if existing is not None:
         if getattr(existing, "__file__", None):
-            # already a properly-loaded module; reload from disk if requested
+            # already a loaded module, so reload it instead
             if reload:
                 importlib.reload(existing)
             return existing
+
         # namespace package (e.g. someone did `import channels.webui.api` first): promote it in-place
         existing.__path__ = [mod_dir]
         spec = importlib.util.spec_from_file_location(
@@ -152,12 +177,14 @@ def import_entry(package, module_name, reload=False):
         )
         existing.__spec__ = spec
         existing.__file__ = module_file
+
         try:
             spec.loader.exec_module(existing)
         except Exception:
             # don't leave a half-initialized module behind, or later calls would treat it as fully loaded
             del sys.modules[full_name]
             raise
+
         setattr(package, module_name, existing)
         return existing
 
@@ -166,6 +193,7 @@ def import_entry(package, module_name, reload=False):
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[full_name] = module
+
     try:
         spec.loader.exec_module(module)
     except Exception:
@@ -208,19 +236,48 @@ class _EntryFileFinder:
 if not any(isinstance(f, _EntryFileFinder) for f in sys.meta_path):
     sys.meta_path.insert(len(sys.path_hooks), _EntryFileFinder())
 
+def _get_base_dependencies():
+    """dependencies openlumara's core always needs, from pyproject.toml"""
+    try:
+        with open(core.get_path("pyproject.toml"), "rb") as f:
+            return tomllib.load(f).get("project", {}).get("dependencies", [])
+    except Exception:
+        return []
+
+def _dep_name(dep):
+    """package name from a requirement string, e.g. 'python-telegram-bot>=1.0[e2e]' -> 'python-telegram-bot'"""
+    return re.split(r"[<>=!~;\[\s]", dep, maxsplit=1)[0].strip().lower().replace("_", "-")
+
 def _check_missing_deps(deps):
     """return list of dependencies that are not installed (using pip package names)"""
     missing = []
     for dep in deps:
-        # extract the base package name (e.g. 'python-telegram-bot' from 'python-telegram-bot>=1.0')
-        pkg_name = dep.split('>=')[0].split('==')[0].split('<')[0].split('>')[0].strip()
-        # strip stuff like [e2e] from the dependency
-        pkg_name = pkg_name.split('[')[0].strip()
         try:
-            version(pkg_name)
+            version(_dep_name(dep))
         except PackageNotFoundError:
             missing.append(dep)
     return missing
+
+def _installed_requirements():
+    """map of installed package name -> the names it requires (extras and markers included)"""
+    requires = {}
+    for dist in distributions():
+        name = dist.metadata["Name"]
+        if name:
+            requires[_dep_name(name)] = [_dep_name(req) for req in (dist.requires or [])]
+    return requires
+
+def _requirement_closure(roots, requires):
+    """every installed package reachable from roots through their requirements"""
+    reached = set()
+    stack = [root for root in roots if root in requires]
+    while stack:
+        name = stack.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        stack.extend(dep for dep in requires.get(name, ()) if dep in requires)
+    return reached
 
 async def install_module_deps(package, module_name, manager):
     """install dependencies for a module if missing"""
@@ -242,26 +299,30 @@ async def install_module_deps(package, module_name, manager):
 
 def _deps_of_enabled(section, package_name):
     """gather declared dependencies from every enabled module/channel in a config section"""
+    try:
+        package = importlib.import_module(package_name)
+        enabled = core.config.get(section, "enabled", [])
+    except Exception:
+        # a missing or broken package only costs us this section's protections
+        return []
+
     deps = []
-    for mod_name in core.config.get(section, "enabled", []):
-        file_path = _get_module_file_path(importlib.import_module(package_name), mod_name)
+    for mod_name in enabled:
+        file_path = _get_module_file_path(package, mod_name)
         if file_path:
             deps.extend(_extract_deps_from_file(file_path))
     return deps
 
 async def uninstall_module_deps(package, module_name, manager, exclude=None):
-    """uninstall dependencies for a module, but only those that are actually installed
-    and no longer needed by any enabled module or by openlumara itself"""
+    """uninstall dependencies for a module together with the packages they pulled in,
+    but only those that no enabled module and no base dependency still needs"""
     # figure out which dependencies are still required by other enabled modules
     if exclude is None:
         exclude = set()
-        try:
-            exclude.update(_deps_of_enabled("modules", "modules"))
-            exclude.update(_deps_of_enabled("user_modules", "user_modules"))
-            exclude.update(_deps_of_enabled("channels", "channels"))
-            exclude.update(_deps_of_enabled("user_channels", "user_channels"))
-        except Exception:
-            pass  # proceed without exclusion if config/package lookup fails
+        exclude.update(_deps_of_enabled("modules", "modules"))
+        exclude.update(_deps_of_enabled("user_modules", "user_modules"))
+        exclude.update(_deps_of_enabled("channels", "channels"))
+        exclude.update(_deps_of_enabled("user_channels", "user_channels"))
 
     file_path = _get_module_file_path(package, module_name)
     if not file_path:
@@ -271,23 +332,16 @@ async def uninstall_module_deps(package, module_name, manager, exclude=None):
     if not deps:
         return False
 
-    # installed = declared deps that are present on this system
-    missing = _check_missing_deps(deps)
-    installed = [dep for dep in deps if dep not in missing]
+    # recursively walk to uninstall any transient dependencies (dependencies of dependencies)
+    # for dependencies that are marked for uninstall
+    installed = _installed_requirements()
+    keep = _requirement_closure(
+        {_dep_name(dep) for dep in exclude} | {_dep_name(dep) for dep in _get_base_dependencies()},
+        installed,
+    )
+    removable = _requirement_closure({_dep_name(dep) for dep in deps}, installed) - keep
 
-    # keep deps that other enabled modules still need
-    installed = [dep for dep in installed if dep not in exclude]
-
-    # keep deps from requirements.txt (dependencies that openlumara ALWAYS needs)
-    base_deps = []
-    requirementstxt = core.get_path("requirements.txt")
-    if os.path.exists(requirementstxt):
-        with open(requirementstxt, 'r', encoding="utf-8") as f:
-            base_deps = [dep.strip() for dep in f.read().split("\n") if dep.strip()]
-
-    installed = [dep for dep in installed if dep not in base_deps]
-
-    if installed:
+    if removable:
         try:
             # import via the folder loader so we can find the uninstall hook
             mod = import_entry(package, module_name)
@@ -330,7 +384,7 @@ async def uninstall_module_deps(package, module_name, manager, exclude=None):
                 if hasattr(instance, 'on_uninstall'):
                     await instance.on_uninstall()
 
-        await asyncio.to_thread(_uninstall_deps, module_name, installed, manager)
+        await asyncio.to_thread(_uninstall_deps, module_name, sorted(removable), manager)
         return True
 
 

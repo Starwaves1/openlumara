@@ -9,10 +9,14 @@ let STREAM_STORE = {
     // stores the final message after the stream has finished
     finalMessage: [],
 
+    // steering message queue
+    queued: [],
+
     async clear() {
         this.turn = [];
         this.userMsg = null;
         this.processing = {};
         this.modelLoad = null;
+        this.queued = [];
     }
 }

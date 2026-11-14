@@ -1,0 +1,2 @@
+# windows batch files are checked out with CRLF, which is what cmd expects
+*.bat text eol=crlf

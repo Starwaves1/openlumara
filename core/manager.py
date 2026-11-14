@@ -7,7 +7,8 @@ import time
 import asyncio
 import json_repair
 import inspect
-import re
+import importlib
+import regex as re
 
 global_instance = None
 
@@ -33,6 +34,7 @@ class Manager:
         self.coding_mode = False
 
         self._restart_requested = False
+        self._hard_restart_requested = False
         self._prevent_double_shutdown = False
 
         self.log_buffer = []
@@ -274,29 +276,27 @@ class Manager:
             disabled_modules = core.config.get("modules", "disabled", [])
             disabled_user_modules = core.config.get("user_modules", "disabled", [])
 
+            # every section is checked, so that even when nothing in it is enabled,
+            # it still cleans up loose dependencies
+            removals = (
+                ("channels", disabled_channels),
+                ("user_channels", disabled_user_channels),
+                ("modules", disabled_modules),
+                ("user_modules", disabled_user_modules),
+            )
+
             system_changed = False
-            if enabled_channels:
-                for chan_name in disabled_channels:
-                    uninstalled = await core.modules.uninstall_module_deps(channels, chan_name, self)
-                    if uninstalled and not system_changed:
-                        system_changed = True
+            for package_name, names in removals:
+                if not names:
+                    continue
 
-            if enabled_user_channels:
-                for chan_name in disabled_user_channels:
-                    uninstalled = await core.modules.uninstall_module_deps(user_channels, chan_name, self)
-                    if uninstalled and not system_changed:
-                        system_changed = True
-
-            if enabled_modules:
-                for mod_name in disabled_modules:
-                    uninstalled = await core.modules.uninstall_module_deps(modules, mod_name, self)
-                    if uninstalled and not system_changed:
-                        system_changed = True
-
-            if enabled_user_modules:
-                for mod_name in disabled_user_modules:
-                    uninstalled = await core.modules.uninstall_module_deps(user_modules, mod_name, self)
-                    if uninstalled and not system_changed:
+                try:
+                    package = importlib.import_module(package_name)
+                except Exception:
+                    # the user_* folders only exist after creation
+                    continue
+                for name in names:
+                    if await core.modules.uninstall_module_deps(package, name, self):
                         system_changed = True
 
             if system_changed:
@@ -351,12 +351,19 @@ class Manager:
 
         if self._restart_requested:
             return "restart"
+        elif self._hard_restart_requested:
+            return "hard_restart"
 
         return None
 
-    async def restart(self):
-        self.log("core", "Restarting server..")
-        self._restart_requested = True
+    async def restart(self, hard=False):
+        hard_str = "Hard " if hard else ""
+        self.log("core", f"{hard_str}Restarting server..")
+        if not hard:
+            self._restart_requested = True
+        else:
+            self._hard_restart_requested = True
+
         await self.shutdown()
 
     async def shutdown(self):

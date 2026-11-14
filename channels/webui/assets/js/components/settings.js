@@ -153,9 +153,9 @@ function settingsModal() {
 
         async saveAndClose() {
             await Alpine.store('settings').saveSettings();
-            // a failed save keeps the modal (and the prompt) open; the
-            // store error banner shows what went wrong
-            if (Alpine.store('settings').error) return;
+
+            const store = Alpine.store('settings');
+            if (store.error || store.saveError) return;
             await Alpine.store('ui').closeModal();
         },
 
@@ -233,7 +233,13 @@ function settingsModal() {
                         currentValue = currentValue[key]?.value;
                     }
                     
-                    if (currentValue !== expectedValue) return false;
+                    // -- AI GENERATED CODE (Qwen3.8 Flash Next) :: (2026-11-07) harness:openlumara status:reviewed
+                    // an array expected value means "any of these values" (e.g. {"mode": ["Pure", "Full System Prompt"]})
+                    if (Array.isArray(expectedValue)) {
+                        if (!expectedValue.includes(currentValue)) return false;
+                    } else if (currentValue !== expectedValue) {
+                        return false;
+                    }
                 }
                 return true;
             }

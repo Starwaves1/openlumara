@@ -238,6 +238,18 @@
 
 <!-- input field -->
 <div id="input">
+    <!-- steering queue: messages sent while the AI is busy -->
+    <template x-if="$store.stream.state !== 'idle' && $store.stream.queued.length > 0">
+        <div class="steering-queue">
+            <div class="steering-queue-header">steering</div>
+            <template x-for="(msg, qIndex) in $store.stream.queued" :key="'steer-'+qIndex">
+                <div class="steering-item">
+                    <span class="steering-text" x-text="msg.content"></span>
+                </div>
+            </template>
+        </div>
+    </template>
+
     <div class="input-wrapper">
         {% include 'chat/input.html' %}
     </div>

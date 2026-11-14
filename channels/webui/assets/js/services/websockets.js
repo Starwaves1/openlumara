@@ -14,6 +14,8 @@ let sendQueue = [];
 
 let streamFinalizing = false;
 
+
+
 async function connectWebSocket() {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const token = window.apiToken || '';
@@ -238,6 +240,99 @@ async function handleWebSocketMessage(data) {
             break;
         }
 
+        case "turn_step_delta": {
+            // deltas are used for reasoning and content,
+            // but the stream frequently re-syncs by receiving the full step content so far
+            // in the turn_step event
+            // 
+            // we use deltas here so that the network isn't constantly sending
+            // huge objects that contain all step data..
+            // instead the full step data only gets sent every 128 tokens
+            // 
+            // this is required for the stream not to bog down,
+            // and it saves tremendously on network use
+            const delta = data.delta;
+            if (!delta || stream.turn.length <= 0) break;
+
+            const step = stream.turn.steps.find(s => s.step === delta.step);
+            if (!step) break;
+
+            for (const a of delta.append || []) {
+                if (a.field === "reasoning_content") {
+                    step.reasoning_content = (step.reasoning_content || "") + a.text;
+                } else if (a.field === "tool_response") {
+                    const tool = (step.tool_calls || []).find(t => t.id === a.id);
+                    if (tool) {
+                        const meta = tool._metadata || (tool._metadata = {});
+                        meta.response = (meta.response || "") + a.text;
+                    }
+                }
+            }
+
+            stream.processing = {};
+            stream.modelLoad = null;
+            AudioManager.stopProcessingSound();
+            AudioManager.play("token");
+            if (!responseSoundPlayed) {
+                AudioManager.play("response_start");
+                responseSoundPlayed = true;
+            }
+
+            await ui.scrollToBottom();
+            break;
+        }
+
+        case "turn_final_delta": {
+            const delta = data.delta;
+            if (!delta || stream.turn.length <= 0) break;
+
+            const finals = stream.turn.final_messages;
+            const last = finals && finals[finals.length - 1];
+            if (!last) break;
+
+            last.content = (last.content || "") + delta.text;
+
+            stream.processing = {};
+            stream.modelLoad = null;
+            AudioManager.stopProcessingSound();
+            AudioManager.play("token");
+            if (!responseSoundPlayed) {
+                AudioManager.play("response_start");
+                responseSoundPlayed = true;
+            }
+
+            await ui.scrollToBottom();
+            break;
+        }
+
+        case "queue_queued":
+            stream.queued = data.messages ?? [];
+            break;
+
+        case "queue_flushed":
+            (data.messages ?? []).forEach(msg => {
+                const idx = stream.queued.findIndex(q => q.content === msg.content);
+                if (idx !== -1) { stream.queued.splice(idx, 1); }
+            });
+            AudioManager.play("token");
+
+            if (data.end_of_chain) {
+                const hist = chat.turnHistory;
+                if (hist.length > 0 && hist[hist.length - 1]?.live === true) {
+                    // its content comes back from the reloaded history
+                    hist.pop();
+                }
+
+                stream.turn = { role: "assistant", live: true, steps: [], final_messages: [] };
+                await chat.reloadChat();
+                chat.turnHistory.push(stream.turn);
+                stream.userMsg = null;
+                await ui.forceScrollToBottom();
+            }
+            // no scroll needed for mid-chain pops: the queue is pinned
+            // above the input bar
+            break;
+
         case "push":
             // it's a push messsage (like a scheduler reminder)
             if (stream.state !== 'idle' || streamFinalizing) {
@@ -345,6 +440,12 @@ async function handleWebSocketMessage(data) {
                 await ui.forceScrollToBottom();
             }
 
+            break;
+
+        case "refresh_page":
+            // -- AI GENERATED CODE (Qwen3-Coder Next) :: (11-06-2026) harness:openlumara
+            // webui settings changed on the server: reload so they apply
+            window.location.reload();
             break;
 
         case "chat_switched":

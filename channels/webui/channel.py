@@ -21,11 +21,13 @@ import core
 
 # system
 import os
+import sys
 import asyncio
 import urllib.parse
 
 # security libraries
 import secrets
+import hashlib
 
 # webui stuff
 import fastapi
@@ -49,13 +51,14 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
     _ws_stream_index = -1
 
     dependencies = [
-        "fastapi",
-        "starlette>=1.0.1",
-        "itsdangerous",
-        "websockets",
-        "jinja2",
-        "uvicorn",
-        "python-multipart"
+        "fastapi==0.162.0",
+        "starlette==1.10.0",
+        "itsdangerous==2.2.0",
+        "websockets==17.3",
+        "jinja2==3.1.6",
+        "uvicorn==0.54.0",
+        "python-multipart==0.0.32",
+        "markupsafe==3.0.4"
     ]
 
     settings = {
@@ -63,8 +66,8 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
             "type": "select",
             "options": {
                 "local": "Allows only the device OpenLumara is running on to access the WebUI (sets hostname to `localhost`)",
-                "internet": "Allows any device to access the WebUI (sets hostname to `0.0.0.0`)",
-                "custom": "Use the custom hostname defined below"
+                "internet": "Allows any device to access the WebUI (sets hostname to `0.0.0.0`). For safety, this can only be used with logins enabled!",
+                "custom": "Use the custom hostname defined below. For safety, this can only be used with logins enabled!"
             },
             "default": "local"
         },
@@ -75,6 +78,12 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
         "port": {
             "description": "What port to run the WebUI on. Set this to 80 to be able to access it like a normal website, and anything else to access it on that port (for example http://yourdomain.org:3000)",
             "default": 3000
+        },
+        "trusted_networks": {
+            # defaults include common local networks, and tailscale (100.64.0.0/10)
+            "default": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"],
+            "description": "Because logins are disabled, you need protection from outside intruders (think of this like a firewall). Specify a list of IP ranges that are allowed to request private data from the webui's API. Clients in these ranges get full access while those coming from outside your network are refused. Set it to just your LAN's range (such as `192.168.0.0/24`) to tighten it, or to [] to only ever allow the machine itself.",
+            "depends": {"require_login": False}
         },
         "enable_chat_header": {
             "description": "Whether to enable the header at the top of a chat. Disabling this removes access to all graphical controls, and strips the interface down to a very basic chat. You might want this for public instances!",
@@ -133,11 +142,11 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
             "default": False
         },
         "username": {
-            "default": "admin",
+            "default": "",
             "depends": "require_login"
         },
         "password": {
-            "default": "admin",
+            "default": "",
             "depends": "require_login"
         },
         "login_lifetime": {
@@ -224,16 +233,63 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
             return False
         return origin_port in (None, self.port)
 
+    @property
+    def auth_enforced(self) -> bool:
+        """Login is only enforced when require_login is on AND both the
+        username and password are set. Empty credentials disable the gate
+        entirely: a login form nobody can ever pass would only lock out
+        the operator, so an unset login is treated as no login.
+        (Defaults are empty, so a default config never has working creds.)"""
+        if not self.config.get("require_login", False):
+            return False
+        return bool(self.config.get("username")) and bool(self.config.get("password"))
+
+    # -- AI GENERATED CODE (Qwen3-Coder Next) :: (11-06-2026) harness:openlumara
+    @property
+    def credentials_fingerprint(self) -> str:
+        """SHA-256 over the configured username+password, mixed with the
+        per-install session secret. Embedded into the session at login and
+        checked on every request/ws-handshake: the moment the credentials
+        change, the fingerprint changes and all previously issued sessions
+        are dead immediately -- the 'change my password to kick them out'
+        incident response actually works now."""
+        creds = "|".join((
+            self.session_secret_value,
+            str(self.config.get("username") or ""),
+            str(self.config.get("password") or ""),
+        ))
+        return hashlib.sha256(f"webui-creds|{creds}".encode("utf-8")).hexdigest()
+
     async def _verify_credentials(self, username: str, password: str) -> bool:
-        """Verify credentials securely using timing-safe comparison."""
-        correct_username = self.config.get("username")
-        correct_password = self.config.get("password")
+        """Verify credentials securely using timing-safe comparison.
+
+        Unusable config (either expected credential empty) always fails --
+        this specifically stops compare_digest("", "") from succeeding if
+        only one of the two fields were ever filled in."""
+        correct_username = self.config.get("username") or ""
+        correct_password = self.config.get("password") or ""
+        if not correct_username or not correct_password:
+            return False
+        username = username or ""
+        password = password or ""
 
         if not secrets.compare_digest(username, correct_username):
             # Dummy comparison to prevent timing attacks
             secrets.compare_digest(password, correct_password)
             return False
         return secrets.compare_digest(password, correct_password)
+
+    async def on_system_prompt(self):
+        return """
+WebUI layout:
+- Sidebar: chat search box, tag filter button, chat list grouped by date modified, new chat button
+- Chat window:
+    - header: title | blank space | model dropdown | settings button (gear icon, opens settings dialog) | chat history export button (download icon) | clear chat button (trashcan icon)
+    - messages area, contains current chat's messages
+    - input bar: upload button | input field | send/stop button
+
+You can render HTML and SVG directly in the user's browser by writing it raw, as plain text flowing between your paragraphs - markup written this way renders live. Reserve ``` fences exclusively for source code the user should read as text.
+""".strip()
 
     async def on_ready(self):
         # ---- security stuff
@@ -288,8 +344,6 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
         # stores logs from channel.log()
         self.logs = []
 
-        self.username = self.config.get("username", "admin")
-        self.password = self.config.get("password", "admin")
         self.login_attempts = {}
 
         # initialize the websocket manager
@@ -303,6 +357,17 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
         )
 
     async def run(self):
+        if self.config.get("network_mode") == "internet" and not self.auth_enforced:
+            msg = """
+WebUI startup aborted! Setting are insecure:
+
+network mode is 'internet' but no login is configured.
+Set require_login to true with a username and password, or change network_mode back to 'local'
+Edit the config file for this, or use /config
+            """.strip()
+            self.log("webui", msg)
+            return
+
         self.log("webui", f"Starting WebUI on {self.url}")
 
         # serve the app using uvicorn
@@ -326,6 +391,9 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
         await self.server.serve()
 
     async def on_push(self, message):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return
+
         await self.websocket_manager.broadcast({
             "type": "push",
             "content": message
@@ -335,7 +403,22 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
         user_message_confirmed = False
         index = self._ws_stream_index
 
-        async for event in self.turncollector.group_stream(stream):
+        restart_grouping = False
+
+        async def grouped_events():
+            nonlocal restart_grouping
+            while True:
+                restart_grouping = False
+                grouped = self.turncollector.group_stream(stream)
+                async for event in grouped:
+                    yield event
+                    if restart_grouping:
+                        break
+                await grouped.aclose()
+                if not restart_grouping:
+                    return
+
+        async for event in grouped_events():
             payload = utils.serialize_for_json(event)
 
             if event.get("type") == "token":
@@ -354,6 +437,15 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
                         except Exception as e:
                             self.log(self.name, f"error sending user message: {core.detail_error(e)}")
                             return
+                    case "queue_flushed":
+                        await self.websocket_manager.broadcast({
+                            "type": "queue_flushed",
+                            "messages": token.get("content") or [],
+                            "end_of_chain": bool(token.get("end_of_chain", False))
+                        })
+
+                        if token.get("end_of_chain"):
+                            restart_grouping = True
                     case "error":
                         # an error ends the turn: go straight back to idle
                         await self.websocket_manager.set_stream_state("idle")
@@ -439,6 +531,30 @@ class Webui(core.channel.Channel, ui_extensions.UiExtensionsMixin):
                 await self.websocket_manager.broadcast({
                     "type": "turn_final",
                     "messages": messages
+                })
+
+            elif event.get("type") == "step_delta":
+                delta = payload.get("content")
+                if delta is None:
+                    continue
+
+                self.websocket_manager.apply_step_delta(delta)
+
+                await self.websocket_manager.broadcast({
+                    "type": "turn_step_delta",
+                    "delta": delta
+                })
+
+            elif event.get("type") == "final_delta":
+                delta = payload.get("content")
+                if delta is None:
+                    continue
+
+                self.websocket_manager.apply_final_delta(delta)
+
+                await self.websocket_manager.broadcast({
+                    "type": "turn_final_delta",
+                    "delta": delta
                 })
 
     def on_log(self, category, message):

@@ -90,25 +90,34 @@ for cand in python3.13 python3.12 python3 python; do
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-    say "python ${MIN_PY}+ not found - attempting to install it..."
-    pkg_install || warn "package manager install failed or too old - trying uv fallback..."
+    if command -v uv >/dev/null 2>&1; then
+        # uv ships a standalone CPython, no package manager needed
+        say "python ${MIN_PY}+ not found - using uv to install it..."
+        uv python install "$MIN_PY"
+        UV_PY="$(uv python find "$MIN_PY")"
+        py_ok "$UV_PY" || die "uv installed python but it does not work - please install Python ${MIN_PY} manually."
+        PYTHON_BIN="$UV_PY"
+    else
+        say "python ${MIN_PY}+ not found - attempting to install it..."
+        pkg_install || warn "package manager install failed or too old - trying uv fallback..."
 
-    # re-check after distro install
-    for cand in python3.13 python3.12 python3 python; do
-        if py_ok "$cand"; then PYTHON_BIN="$cand"; break; fi
-    done
-fi
+        # re-check after distro install
+        for cand in python3.13 python3.12 python3 python; do
+            if py_ok "$cand"; then PYTHON_BIN="$cand"; break; fi
+        done
 
-if [ -z "$PYTHON_BIN" ]; then
-    # universal fallback: uv installs a standalone CPython 3.12 anywhere
-    say "falling back to uv to install python ${MIN_PY}..."
-    fetch https://astral.sh/uv/install.sh | sh
-    PATH="$HOME/.local/bin:$PATH"
-    command -v uv >/dev/null 2>&1 || die "uv install failed - please install Python ${MIN_PY} manually, then re-run this script."
-    uv python install 3.12
-    UV_PY="$(uv python find 3.12)"
-    py_ok "$UV_PY" || die "uv installed python but it does not work - please install Python ${MIN_PY} manually."
-    PYTHON_BIN="$UV_PY"
+        if [ -z "$PYTHON_BIN" ]; then
+            # universal fallback: uv installs a standalone CPython anywhere
+            say "falling back to uv to install python ${MIN_PY}..."
+            fetch https://astral.sh/uv/install.sh | sh
+            PATH="$HOME/.local/bin:$PATH"
+            command -v uv >/dev/null 2>&1 || die "uv install failed - please install Python ${MIN_PY} manually, then re-run this script."
+            uv python install "$MIN_PY"
+            UV_PY="$(uv python find "$MIN_PY")"
+            py_ok "$UV_PY" || die "uv installed python but it does not work - please install Python ${MIN_PY} manually."
+            PYTHON_BIN="$UV_PY"
+        fi
+    fi
 fi
 
 say "using $PYTHON_BIN ($($PYTHON_BIN -c 'import platform; print(platform.python_version())'))"
@@ -129,7 +138,7 @@ else
 fi
 
 cd "$INSTALL_DIR"
-say "installing dependencies into ./venv (this can take a minute)..."
+say "installing dependencies (this can take a minute)..."
 sh ./install.sh < /dev/null || die "dependency install failed - see output above. retry with: sh $INSTALL_DIR/install.sh"
 
 echo

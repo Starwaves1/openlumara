@@ -597,11 +597,8 @@ CHAT_STORE = {
 
     async send(text) {
         stream = Alpine.store('stream');
-        if (stream.state !== 'idle') {
-            // don't allow sending during a stream
-            // (TODO: allow nudging (interrupting the stream and sending a new message))
-            return;
-        }
+
+        const wasSteering = stream.state !== 'idle';
 
         // record the sent text in the input history before clearing the box
         this.pushInputHistory(text);
@@ -640,7 +637,9 @@ CHAT_STORE = {
         // (and keep any attached files) so the user can retry
         if (success === false) {
             this.user_input = text;
-            Alpine.store("stream").state = "idle";
+            if (!wasSteering) {
+                Alpine.store("stream").state = "idle";
+            }
             return;
         }
 
@@ -654,7 +653,14 @@ CHAT_STORE = {
       const turn = this.turnHistory[turnIndex];
       const msg = turn?.messages?.[turn.messages?.length - 1]; // last message in the turn
       if (!msg) return;
-      navigator.clipboard.writeText(msg.content)
+
+      // if the message had multimedia in it, extract only the text bit
+      const filenames = msg._metadata?.filenames || [];
+      const text = Array.isArray(msg.content)
+        ? msg.content.filter((b, i) => b?.type === 'text' && b.text && !filenames[i]).map(b => b.text).join('\n\n')
+        : msg.content;
+
+      navigator.clipboard.writeText(text)
         .then(() => {
             return true;
         })

@@ -1,5 +1,6 @@
-#!/bin/bash
-# resolve this script's real location
+#!/bin/sh
+# install.sh symlinks this script into ~/.local/bin as `openlumara`, so follow
+# the link back to the repository before touching any relative path
 target="$0"
 while [ -L "$target" ]; do
     link=$(readlink "$target")
@@ -10,11 +11,16 @@ while [ -L "$target" ]; do
 done
 cd "$(dirname "$target")" || exit 1
 
-# first run? set up the venv via install.sh, then continue
-if [ ! -x "venv/bin/python" ]; then
-    sh ./install.sh || exit 1
+# shared helpers for venv management
+. tools/venv.sh
+
+# uv manages the environment when available, plain venv + pip otherwise
+if have_uv; then
+    # build the environment on first run only: syncing on every start puts
+    # back the dependencies the app uninstalls for disabled modules
+    [ -x .venv/bin/python ] || uv_sync || exit 1
+    exec uv run --frozen --no-sync main.py "$@"
 fi
 
-# aaand run!
-source venv/bin/activate
-exec python main.py "$@"
+ensure_venv || exit 1
+exec .venv/bin/python main.py "$@"

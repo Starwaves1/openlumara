@@ -16,7 +16,9 @@ def register(app, channel):
     async def settings_load():
         """Returns the complete, render-ready settings structure (categories, field types, schemas and current values merged)"""
         module_info, core_sections = settings_structure.get_module_info()
-        structure = settings_structure.build_settings_structure(core.config.config, module_info, core_sections)
+        # the Your Skills tab only makes sense while the skills module is loaded
+        skills_enabled = "skills" in channel.manager.modules
+        structure = settings_structure.build_settings_structure(core.config.config, module_info, core_sections, skills_enabled=skills_enabled)
 
         return utils.api_result({
             "categories": structure,
@@ -34,9 +36,10 @@ def register(app, channel):
     @app.get("/api/models")
     async def models_get():
         """Returns a list of all available AI models"""
-        result = await channel.manager.API.list_models()
-        if isinstance(result, core.api.APIError):
-            return utils.api_result(str(result), success=False)
+        try:
+            result = await channel.manager.API.list_models()
+        except core.api.APIError as e:
+            return utils.api_result(str(e), success=False)
 
         return utils.api_result(result)
 
@@ -65,6 +68,33 @@ def register(app, channel):
         # the frontend sends the category tree it got from settings/load,
         # with edited values, rebuild the raw config dict from it
         flattened = settings_structure.flatten_categories(data.get("categories", {}))
+        new_webui = ((flattened.get("channels") or {}).get("settings") or {}).get("webui") or {}
+
+        if new_webui.get("require_login"):
+            blank = [f for f in ("username", "password") if not (new_webui.get(f) or "").strip()]
+            if blank:
+                if len(blank) == 2:
+                    detail = "both username and password are still blank. Please fill in both fields"
+                else:
+                    detail = f"{blank[0]} is still blank. Please fill it in"
+                return utils.api_result(
+                    f"Logins are enabled but {detail}, or turn logins off.",
+                    success=False,
+                )
+
+        new_mode = new_webui.get("network_mode", "local")
+        if new_mode in ("internet", "custom"):
+            login_ok = (
+                bool(new_webui.get("require_login"))
+                and bool((new_webui.get("username") or "").strip())
+                and bool(new_webui.get("password"))
+            )
+            if not login_ok:
+                return utils.api_result(
+                    f"network mode '{new_mode}' exposes the WebUI beyond this machine, so a login is required. "
+                    "Please enable 'Require login' and fill in a username and password, or switch the network mode back to local.",
+                    success=False,
+                )
 
         # snapshot the pre-save config so we can tell the frontend whether
         # the changes need a server restart or an API reconnect
@@ -98,6 +128,12 @@ def register(app, channel):
         # reload all webui extensions
         channel.setup_ui_extensions()
 
+        # if the webui's own settings changed, tell every connected client to refresh the page
+        old_webui = (old_config.get("channels") or {}).get("settings" or {}).get("webui") or {}
+        new_webui = (flattened.get("channels") or {}).get("settings" or {}).get("webui") or {}
+        if old_webui != new_webui:
+            await channel.websocket_manager.broadcast({"type": "refresh_page"})
+
         await channel.websocket_manager.push_context_update()
 
         return utils.api_result({
@@ -108,9 +144,10 @@ def register(app, channel):
     @app.post("/api/reconnect")
     async def reconnect():
         """Disconnects and then reconnects the API."""
-        result = await channel.manager.API.reconnect()
-        if isinstance(result, core.api.APIError):
-            return utils.api_result(str(result), success=False)
+        try:
+            await channel.manager.API.reconnect()
+        except core.api.APIError as e:
+            return utils.api_result(str(e), success=False)
 
         await channel.websocket_manager.push_context_update()
 

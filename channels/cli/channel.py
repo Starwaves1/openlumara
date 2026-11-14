@@ -577,6 +577,9 @@ class Cli(core.channel.Channel):
 
         self._token_usage = await self.context.get_total_tokens()
 
+    async def on_system_prompt(self):
+        return "This channel does not support markdown."
+
     async def _get_input(self):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, input, "user> ")
@@ -654,6 +657,17 @@ class Cli(core.channel.Channel):
                     repaint()
                 elif event_type == "final":
                     view.set_final(event.get("content") or [])
+                    repaint()
+                elif event_type in ("step_delta", "final_delta"):
+                    # since we already have the latest content due to
+                    # python passing objects as references,
+                    # we can just repaint and the new content shows up
+                    if event_type == "step_delta" and (event.get("content") or {}).get("step") not in view.steps:
+                        continue
+                    if event_type == "final_delta" and not view.final_messages:
+                        continue
+                    
+                    view.dirty += 1
                     repaint()
                 else:
                     token = event.get("content") or {}

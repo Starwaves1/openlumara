@@ -3,6 +3,7 @@ FastAPI creator: middleware, sessions, asset mounts and the module extension API
 """
 import os
 import hashlib
+import ipaddress
 
 import fastapi
 import fastapi.staticfiles
@@ -34,7 +35,9 @@ ADMIN_ONLY_ENDPOINTS = [
     "/api/system/context_size",
     
     "/api/libraries/status",
-    "/api/libraries/sync",
+    "/api/libraries/stage",
+    "/api/libraries/progress",
+    "/api/libraries/cancel",
     "/api/libraries/install",
     "/api/libraries/update",
     "/api/libraries/uninstall",
@@ -52,9 +55,71 @@ async def create_fastapi(channel):
         response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         return response
 
+    # -- AI GENERATED CODE (Qwen3.8 Flash Next) :: (11-06-2026) harness:openlumara
+    # who counts as "this machine" for the crucial-endpoint gate: loopback
+    # always (can never be removed), plus any CIDR in the trusted_networks
+    # setting (defaults to the private ranges). Unparseable entries are
+    # skipped; a non-list value trusts nothing beyond loopback.
+    def _client_is_trusted(request):
+        host = request.client.host if request.client else None
+        if not host:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        if ip.is_loopback:
+            return True
+        nets = channel.config.get("trusted_networks", None)
+        if nets is None:
+            nets = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+        if not isinstance(nets, (list, tuple)):
+            return False
+        for entry in nets:
+            try:
+                if ip in ipaddress.ip_network(str(entry), strict=False):
+                    return True
+            except ValueError:
+                continue
+        return False
+
     # add authorization, cookies, and so on (middleware)
     @app.middleware("http")
     async def auth_middleware(request: fastapi.Request, call_next):
+        # we use a custom header to protect against leaking data using simple GET requests coming from injected HTML
+        # for example <img src="http://localhost:3005/api/settings/load">
+        if request.url.path.startswith("/api") and request.headers.get("x-openlumara") != "1":
+            return fastapi.responses.JSONResponse(
+                status_code=403,
+                content={"data": "Missing request header", "success": False}
+            )
+
+        # -- AI GENERATED CODE (Qwen3.8 Flash Next) :: (11-06-2026) harness:openlumara
+        # crucial endpoints are only for trusted callers unless they prove
+        # who they are with a real login: requests from outside loopback and
+        # the trusted_networks ranges are refused here even with auth
+        # disabled. uvicorn runs with proxy_headers=True +
+        # forwarded_allow_ips="127.0.0.1", so same-machine tunnels
+        # (cloudflared/Caddy/nginx) get their client IP rewritten from
+        # X-Forwarded-For and count as remote, while LAN hosts can never
+        # forge their way in through XFF. a local process can only ever
+        # forge itself INTO the trusted class, never a remote one out of it.
+        if (
+            request.url.path in ADMIN_ONLY_ENDPOINTS
+            and not _client_is_trusted(request)
+            and not (
+                request.session.get("authenticated", False)
+                and request.session.get("creds_fp") == channel.credentials_fingerprint
+            )
+        ):
+            return fastapi.responses.JSONResponse(
+                status_code=403,
+                content={
+                    "data": "These endpoints are only reachable from this machine, or after logging in",
+                    "success": False,
+                }
+            )
+
         if not channel.config.get("enable_admin_settings", True):
             if request.url.path in ADMIN_ONLY_ENDPOINTS:
                 return fastapi.responses.JSONResponse(
@@ -62,16 +127,25 @@ async def create_fastapi(channel):
                     content={"data": "Admin settings are disabled", "success": False}
                 )
 
-        # Skip auth check if login isn't required
-        if not channel.config.get("require_login", False):
+        # Skip auth check if login isn't required. Note that login is only
+        # ENFORCEABLE when both credentials are actually set (auth_enforced):
+        # with empty credentials nobody can log in, so nobody gets locked out.
+        if not channel.auth_enforced:
             return await call_next(request)
         
         # Skip auth for login page and assets
         if request.url.path in ["/login", "/logout"] or str(request.url.path).startswith("/assets/"):
             return await call_next(request)
         
-        # Check session for API and other routes
-        if not request.session.get("authenticated", False):
+        # Check session for API and other routes.
+        # -- AI GENERATED CODE (Qwen3-Coder Next) :: (11-06-2026) harness:openlumara
+        # A session only stays valid while its credential fingerprint matches
+        # the configured username/password: changing credentials instantly
+        # revokes every previously issued session, everywhere, no restart.
+        if (
+            not request.session.get("authenticated", False)
+            or request.session.get("creds_fp") != channel.credentials_fingerprint
+        ):
             # For API requests, return 401
             if str(request.url.path).startswith("/api"):
                 return fastapi.responses.JSONResponse(
@@ -98,23 +172,75 @@ async def create_fastapi(channel):
         same_site="strict"
     )
 
+    # -- AI GENERATED CODE (Qwen3-Coder Next) :: (11-06-2026) harness:openlumara
+    # Auto-Secure cookie flag: when the request arrived over https (uvicorn
+    # rewrites the scheme from X-Forwarded-Proto for proxies listed in
+    # forwarded_allow_ips), append Secure to any Set-Cookie on the way out.
+    # Plain http localhost keeps working without any extra setting.
+    # This middleware must be registered AFTER SessionMiddleware so that it
+    # runs outside it and sees the session cookie being set.
+    @app.middleware("http")
+    async def secure_cookie_middleware(request: fastapi.Request, call_next):
+        response = await call_next(request)
+        if request.url.scheme == "https":
+            cookies = response.headers.getlist("set-cookie")
+            if cookies:
+                updated = []
+                for cookie in cookies:
+                    attrs = [a.strip().lower() for a in cookie.split(";")]
+                    if "secure" not in attrs:
+                        cookie += "; Secure"
+                    updated.append(cookie)
+                del response.headers["set-cookie"]
+                for cookie in updated:
+                    response.headers.append("set-cookie", cookie)
+        return response
+
     # serve asset files (formerly /static) using fastAPI's mount()
     app.mount("/assets", fastapi.staticfiles.StaticFiles(directory=channel.assets_path), name="assets")
 
     # serve module-provided assets (<module>/webui/assets/) under /ext-assets/.
     @app.get("/ext-assets/{module_name}/{asset_path:path}")
     async def ext_module_assets(module_name: str, asset_path: str):
+        module = channel.manager.modules.get(module_name)
+        if module is not None and channel._ui_extension_enabled(module):
+            mounts = getattr(module, "asset_mounts", None) or {}
+            norm = str(asset_path).replace("\\", "/").lstrip("/")
+            for prefix, root in mounts.items():
+                prefix = str(prefix).strip("/").lower()
+                root = os.path.expanduser(str(root)) if root else ""
+                if not prefix or not root or not os.path.isdir(root):
+                    continue
+                if norm == prefix or norm.startswith(prefix + "/"):
+                    rel = norm[len(prefix):].lstrip("/")
+                    root_real = os.path.realpath(root)
+                    full_path = os.path.realpath(os.path.join(root, rel))
+                    if not full_path.startswith(root_real + os.sep) or not os.path.isfile(full_path):
+                        raise fastapi.HTTPException(status_code=404, detail="Asset not found")
+                    # -- AI GENERATED CODE (Qwen3.8 Flash Next) :: (11-10-2026) harness:openlumara
+                    # no Cache-Control meant heuristic browser caching: an
+                    # edited asset could stay stale in the webview long past
+                    # a reload (the ?v= bump ritual). no-cache revalidates
+                    # every use; FileResponse's ETag/Last-Modified answer
+                    # with a cheap 304 while unchanged.
+                    return fastapi.responses.FileResponse(
+                        full_path, headers={"Cache-Control": "no-cache"})
+
+        # default: <module>/webui/assets/
         module_dir = channel._ui_asset_dirs().get(module_name)
         if module_dir is None:
             raise fastapi.HTTPException(status_code=404, detail="Unknown module or no assets")
-            
+
         module_root = os.path.realpath(module_dir)
         full_path = os.path.realpath(os.path.join(module_dir, asset_path))
-        
+
         if not full_path.startswith(module_root + os.sep) or not os.path.isfile(full_path):
             raise fastapi.HTTPException(status_code=404, detail="Asset not found")
-            
-        return fastapi.responses.FileResponse(full_path)
+
+        # (see the asset_mounts branch above: no-cache forces revalidation,
+        # so module assets never serve stale after an edit)
+        return fastapi.responses.FileResponse(
+            full_path, headers={"Cache-Control": "no-cache"})
 
     def _ui_api_lookup(module_name, route_path, method):
         """resolve /api/ext/<module>/<path> to a bound handler.

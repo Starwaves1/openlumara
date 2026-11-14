@@ -3,6 +3,7 @@ import json
 import json_repair
 import asyncio
 import copy
+import inspect
 
 class ToolcallManager:
     def __init__(self, channel):
@@ -91,7 +92,7 @@ class ToolcallManager:
 
         return toolcall_request
 
-    async def process(self, assistant_message, push=False):
+    async def process(self, assistant_message, context=None, push=False):
         """
         process tool calls from an API response..
         assistant_content is the "normal" non-toolcall content, the text that the AI wants to say that's not toolcalls
@@ -110,8 +111,20 @@ class ToolcallManager:
 
         repaired_tool_calls = self._repair_tool_calls(assistant_message["tool_calls"])
 
+        # target either the channel's context or a custom context array
+        if context is None:
+            raw_add = self.channel.context.chat.messages.add
+        else:
+            raw_add = context.append
+
+        async def ctx_add(msg, _fn=raw_add):
+            result = _fn(msg)
+            if inspect.isawaitable(result):
+                await result
+            return result
+
         # add it to context
-        await self.channel.context.chat.messages.add(assistant_message)
+        await ctx_add(assistant_message)
 
         # push if needed
         if push:
@@ -126,7 +139,6 @@ class ToolcallManager:
             # a cancel that arrives mid-batch must not
             # fire the remaining tools first.
             if self.channel.manager.API.cancel_request:
-                await self.channel.push("toolcalling chain cancelled", defer=False)
                 return
 
             tool_name = tool_call_dict['function']['name']
@@ -135,12 +147,24 @@ class ToolcallManager:
             # check for meta tools (like tools_load) if dynamic tool loading is enabled
             dynamic_loading = core.config.get("model", "dynamic_tool_loading", default=True)
             if tool_name in tool_loader.meta_tool_names:
+                if self.channel.override_tools and dynamic_loading:
+                    rejected_msg = json.dumps({
+                        "content": "Tool loading is unavailable right now: only a fixed set of tools is accessible.",
+                        "status": "error"
+                    })
+                    await ctx_add({
+                        "role": "tool",
+                        "tool_call_id": tool_call_dict['id'],
+                        "content": rejected_msg
+                    })
+                    yield {"type": "tool", "tool_call_id": tool_call_dict['id'], "content": rejected_msg}
+                    continue
                 if not dynamic_loading:
                     rejected_msg = json.dumps({
                         "content": "Dynamic tool loading is disabled. The meta tool (tools_load) is not available. You have access to all available tools without needing to load them.",
                         "status": "error"
                     })
-                    await self.channel.context.chat.messages.add({
+                    await ctx_add({
                         "role": "tool",
                         "tool_call_id": tool_call_dict['id'],
                         "content": rejected_msg
@@ -176,7 +200,7 @@ class ToolcallManager:
                             "status": "error"
                         })
 
-                    await self.channel.context.chat.messages.add({
+                    await ctx_add({
                         "role": "tool",
                         "tool_call_id": tool_call_dict['id'],
                         "content": rejected_msg
@@ -187,7 +211,7 @@ class ToolcallManager:
                 # check for disabled tools and block calls to them
                 if method_name in module_instance.disabled_tools:
                     rejected_msg = json.dumps({"content": "That tool has been disabled by the user.", "status": "error"})
-                    await self.channel.context.chat.messages.add({
+                    await ctx_add({
                         "role": "tool",
                         "tool_call_id": tool_call_dict['id'],
                         "content": rejected_msg
@@ -196,7 +220,11 @@ class ToolcallManager:
                     continue
 
                 # check if tool is loaded
-                if tool_name not in self.channel.manager.tool_names:
+                if self.channel.override_tools:
+                    loaded_names = [t["function"]["name"] for t in self.channel.override_tools]
+                else:
+                    loaded_names = self.channel.manager.tool_names
+                if tool_name not in loaded_names:
                     if not dynamic_loading:
                         rejected_msg = json.dumps({
                             "content": f"Tool {tool_name} is not available. This tool may be disabled or unavailable.",
@@ -207,11 +235,13 @@ class ToolcallManager:
                             "content": f"Tool {tool_name} is not loaded. Load it first by calling tools_load with module_names=[\"{tool_name.split('_')[0]}\"], then call it again.",
                             "status": "error"
                         })
-                    await self.channel.context.chat.messages.add({
+
+                    await ctx_add({
                         "role": "tool",
                         "tool_call_id": tool_call_dict['id'],
                         "content": rejected_msg
                     })
+
                     yield {"type": "tool", "tool_call_id": tool_call_dict['id'], "content": rejected_msg}
                     continue
 
@@ -227,7 +257,10 @@ class ToolcallManager:
                     return await func_callable(**tool_args)
 
                 tool_task = asyncio.create_task(_run_tool())
-                func_response = await asyncio.wait_for(tool_task, timeout=timeout_val)
+                if not getattr(func_callable, "_bypass_timeout", False):
+                    func_response = await asyncio.wait_for(tool_task, timeout=timeout_val)
+                else:
+                    func_response = await tool_task
 
             except asyncio.TimeoutError as e:
                 # actually cancel the running task so it doesn't continue in the background
@@ -268,11 +301,19 @@ class ToolcallManager:
             }
 
             yield {"type": "tool", "tool_call_id": tool_call_dict['id'], "content": func_response_str}
-            await self.channel.context.chat.messages.add(tool_response)
+            await ctx_add(tool_response)
 
         if self.channel.manager.API.cancel_request:
             await self.channel.push("toolcalling chain cancelled", defer=False)
             return
+
+        if self.channel.queued_message is not None:
+            flushed = await self.channel.drain_queued_message()
+            if flushed:
+                # let channels know that the steering message was sent
+                # mid-chain. content is a list of {"content": str,
+                # "is_cmd": bool} dicts
+                yield {"type": "queue_flushed", "content": flushed}
 
         final_content = []
         final_reasoning = []
@@ -286,7 +327,7 @@ class ToolcallManager:
 
         try:
             async for token in self.channel.manager.API.send_stream(
-                await self.channel.context.get(system_prompt=True, end_prompt=False),
+                (context if context else await self.channel.context.get(system_prompt=True, end_prompt=False)),
                 tools=self.channel.manager.tools
             ):
                 token_type = token.get("type")
@@ -315,7 +356,8 @@ class ToolcallManager:
 
                     async for sub_token in self.process(
                         toolcall_request,
-                        push=push
+                        push=push,
+                        context=context
                     ):
                         yield sub_token
 
@@ -335,7 +377,7 @@ class ToolcallManager:
                 if final_reasoning:
                     final_msg["reasoning_content"] = "".join(final_reasoning)
 
-                await self.channel.context.chat.messages.add(final_msg)
+                await ctx_add(final_msg)
         except Exception as e:
             self.channel.log_error(f"Error while handling tool calls", e)
             await self.channel.push(
